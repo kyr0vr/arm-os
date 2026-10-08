@@ -1,0 +1,7 @@
+-- trap: slice out of range
+
+to main gives u8
+    new s string = "abc"
+    new n u64 = 5
+    new t = s[1 until n]
+    give 0

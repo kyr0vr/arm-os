@@ -1,0 +1,7 @@
+-- trap: index out of range
+
+to main gives u8
+    new a [4] u8
+    new i u64 = 4
+    a[i] = 1
+    give 0

@@ -1,0 +1,4 @@
+-- error: 300 does not fit in `u8`
+
+to main gives u8
+    give 300

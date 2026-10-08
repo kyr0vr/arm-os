@@ -1,0 +1,6 @@
+-- release
+-- exit: 44
+
+to main gives u8
+    new x u8 = 200
+    give x + 100

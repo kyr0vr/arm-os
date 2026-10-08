@@ -1,0 +1,79 @@
+-- expect: 7 -3 10 2 1
+-- expect: 255 0 200 232
+-- expect: 127 -128 100
+-- expect: 4294967295 18446744073709551615
+-- expect: 1024 -4 -4 4611686018427387903
+-- expect: 13 5 9
+-- expect: 255 128 -1 65535 1
+-- expect: 1 0 1 1 0 1
+
+use io
+
+to show (v i64)
+    io.print_i64(v)
+    io.put(' ')
+
+to showu (v u64)
+    io.print_u64(v)
+    io.put(' ')
+
+to main gives u8
+    new a i64 = 5
+    new b i64 = 2
+    show(a + b)
+    show(b - a)
+    show(a * b)
+    show(a / b)
+    show(a % b)
+    io.line("")
+
+    new x u8 = 250
+    showu((x +% 5) as u64)
+    showu((x +% 6) as u64)
+    showu((x -% 50) as u64)
+    showu((x *% 4) as u64)
+    io.line("")
+
+    new s i8 = 100
+    show((s +| 100) as i64)
+    show((s - 100 -| 100 -| 100) as i64)
+    show((s +| 0) as i64)
+    io.line("")
+
+    new w u32 = 0xFFFF_FFFF
+    showu(w as u64)
+    new zero u64 = 0
+    showu(zero -% 1)
+    io.line("")
+
+    new one u64 = 1
+    showu(one << 10)
+    new m16 i64 = -16
+    show(m16 >> 2)
+    show(m16 / 4)
+    showu(0x7FFF_FFFF_FFFF_FFFF as u64 >> 1)
+    io.line("")
+
+    new raw u32 = 0b1101_0101
+    showu(raw[7:4] as u64)
+    showu(raw[3:0] as u64)
+    showu((raw & 0xF0 | 0x09)[3:0] as u64)
+    io.line("")
+
+    new neg i8 = -1
+    showu(neg as u8 as u64)
+    showu((neg as u8 & 0x80) as u64)
+    show(neg as i64)
+    showu(neg as u16 as u64)
+    showu(raw[0] as u64)
+    io.line("")
+
+    new t = a > b
+    showu(t as u64)
+    showu((a is b) as u64)
+    showu((a is not b) as u64)
+    showu((x > 200) as u64)
+    showu((neg > 0) as u64)
+    showu((not (a < b)) as u64)
+    io.line("")
+    give 0

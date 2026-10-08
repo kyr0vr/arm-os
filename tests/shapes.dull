@@ -1,0 +1,87 @@
+-- expect: 3 4 25
+-- expect: 30 40
+-- expect: 7 9 1
+-- expect: 99 1 2
+-- expect: 20 16 4
+
+use io
+
+shape point
+    x i32
+    y i32
+
+shape line
+    a point
+    b point
+    tag u8
+
+shape node
+    value u64
+    next ptr node
+
+to len2 (p ptr point) gives i32
+    give p.x * p.x + p.y * p.y
+
+to scale (p ptr point, k i32)
+    p.x = p.x * k
+    p.y *= k
+
+to main gives u8
+    new p point
+    p.x = 3
+    p.y = 4
+    io.print_i64(p.x as i64)
+    io.put(' ')
+    io.print_i64(p.y as i64)
+    io.put(' ')
+    io.print_i64(len2(addr of p) as i64)
+    io.line("")
+
+    scale(addr of p, 10)
+    io.print_i64(p.x as i64)
+    io.put(' ')
+    io.print_i64(p.y as i64)
+    io.line("")
+
+    new l line
+    l.a = p
+    l.b.x = 7
+    l.b.y = 9
+    l.a.x = 1
+    io.print_i64(l.b.x as i64)
+    io.put(' ')
+    io.print_i64(l.b.y as i64)
+    io.put(' ')
+    io.print_i64(l.a.x as i64)
+    io.line("")
+
+    new n3 node
+    new n2 node
+    new n1 node
+    n1.value = 99
+    n1.next = addr of n2
+    n2.value = 1
+    n2.next = addr of n3
+    n3.value = 2
+    new cur ptr node = addr of n1
+    new count u32 = 0
+    while count < 3
+        io.print_u64(cur.value)
+        if count < 2
+            io.put(' ')
+        cur = cur.next
+        count += 1
+    io.line("")
+
+    new pts [4] point
+    pts[2].y = 5
+    new q ptr point = addr of pts[0]
+    q[2].x = 6
+    io.print_u64(size_of(line))
+    io.put(' ')
+    io.print_u64(size_of(node))
+    io.put(' ')
+    deref q = pts[2]
+    io.print_u64((q.x + q.y - 7) as u64)
+    io.line("")
+    give 0

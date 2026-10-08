@@ -1,0 +1,31 @@
+-- expect: 832040
+-- expect: 36
+-- expect: abc 3
+-- exit: 3
+
+use io as out
+
+to fib (n u32) gives u64
+    if n < 2
+        give n as u64
+    give fib(n - 1) + fib(n - 2)
+
+to eight (a u8, b u16, c u32, d u64, e i8, f i16, g i32, h i64) gives i64
+    give a as i64 + b as i64 + c as i64 + d as i64 + e as i64 + f as i64 + g as i64 + h
+
+to show_pair (s string, n u64) gives u64
+    out.print(s)
+    out.put(' ')
+    out.print_u64(n)
+    out.line("")
+    give n
+
+to trunc (v u64) gives u8
+    give v as u8
+
+to main gives u8
+    out.print_u64(fib(30))
+    out.line("")
+    out.print_i64(eight(1, 2, 3, 4, 5, 6, 7, 8))
+    out.line("")
+    give "abc" -> show_pair(3) -> trunc

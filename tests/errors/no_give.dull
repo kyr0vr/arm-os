@@ -1,0 +1,4 @@
+-- error: must give a `u8`
+
+to main gives u8
+    give

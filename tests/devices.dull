@@ -1,0 +1,38 @@
+-- expect: 0x00000000000000a5
+-- expect: 0x0000000000000ca5
+-- expect: 5 12 1
+-- expect: 0x00000000000003a5
+
+use io
+
+new regs [4] u32
+new base u64
+
+device fake at base
+    ctrl   at 0x0 u32
+        enable is bit 0
+        mode   is bits 3:1
+    status at 0x4 u32
+        level  is bits 11:8
+    data   at 0x8 u32
+
+to main gives u8
+    base = (addr of regs) as u64
+    fake.ctrl = 0xA5
+    io.print_hex(regs[0] as u64)
+    io.line("")
+    fake.status.level = 0xC
+    regs[1] = regs[1] | 0xA5
+    io.print_hex(regs[1] as u64)
+    io.line("")
+    io.print_u64(fake.ctrl[3:0] as u64 & 0x7)
+    io.put(' ')
+    io.print_u64(fake.status.level as u64)
+    io.put(' ')
+    io.print_u64(fake.ctrl.enable as u64)
+    io.line("")
+    fake.status.level = 3
+    fake.status.level += 0
+    io.print_hex(fake.status as u64)
+    io.line("")
+    give 0

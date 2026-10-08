@@ -1,0 +1,10 @@
+-- error: cannot be passed by value
+
+shape p
+    x u8
+
+to f (v p)
+    give
+
+to main gives u8
+    give 0

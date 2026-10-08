@@ -1,0 +1,11 @@
+-- expect: hello from DULL
+-- expect: 42
+-- exit: 7
+
+use io
+
+to main gives u8
+    io.line("hello from DULL")
+    io.print_u64(42)
+    io.put('\n')
+    give 7

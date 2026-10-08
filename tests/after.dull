@@ -1,0 +1,38 @@
+-- expect: body
+-- expect: second
+-- expect: first
+-- expect: loop 1
+-- expect: end of pass
+-- expect: loop 2
+-- expect: end of pass
+-- expect: early
+-- expect: cleanup
+-- expect: 5
+
+use io
+
+to say (s string)
+    io.line(s)
+
+to early (flag bool) gives u32
+    after say("cleanup")
+    if flag
+        say("early")
+        give 5
+    give 6
+
+to main gives u8
+    if true
+        after say("first")
+        after say("second")
+        say("body")
+    for each i in 1 through 5
+        after say("end of pass")
+        io.print("loop ")
+        io.print_u64(i)
+        io.line("")
+        if i is 2
+            stop
+    io.print_u64(early(true) as u64)
+    io.line("")
+    give 0

@@ -1,0 +1,7 @@
+-- error: needs two numbers of the same type
+
+to main gives u8
+    new a u8 = 1
+    new b u32 = 2
+    new c = a + b
+    give 0

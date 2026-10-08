@@ -1,0 +1,6 @@
+-- error: this value is not used
+
+to main gives u8
+    new a u8 = 1
+    a + 1
+    give 0

@@ -1,0 +1,4 @@
+-- error: tabs are not allowed
+
+to main gives u8
+	give 0

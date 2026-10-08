@@ -1,0 +1,4 @@
+-- error: unknown name `nope`
+
+to main gives u8
+    give nope

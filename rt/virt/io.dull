@@ -1,0 +1,48 @@
+-- Console output for QEMU `virt`: its PL011 UART.
+
+device uart at 0x0900_0000
+    data  at 0x00 u32
+    flags at 0x18 u32
+        tx_full is bit 5
+
+to put (b u8)
+    hold until uart.flags.tx_full is 0
+    uart.data = b as u32
+
+to print (text string)
+    for each ch in text
+        put(ch)
+
+to line (text string)
+    print(text)
+    put('\n')
+
+to print_u64 (v u64)
+    new digits [20] u8
+    new n u64 = 0
+    if v is 0
+        put('0')
+        give
+    while v > 0
+        digits[n] = (v % 10) as u8 + '0'
+        v = v / 10
+        n += 1
+    while n > 0
+        n -= 1
+        put(digits[n])
+
+to print_i64 (v i64)
+    if v < 0
+        put('-')
+        print_u64((0 -% v) as u64)
+    else
+        print_u64(v as u64)
+
+to print_hex (v u64)
+    print("0x")
+    for each i in 0 until 16
+        new nib = ((v >> (60 - i * 4)) & 0xF) as u8
+        if nib < 10
+            put('0' + nib)
+        else
+            put('a' + nib - 10)

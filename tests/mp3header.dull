@@ -1,0 +1,35 @@
+-- expect: 128000 44100 417
+-- expect: not a frame
+
+use io
+
+fixed kbps  [16] u32 = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 0]
+fixed rates [4]  u32 = [44100, 48000, 32000, 0]
+
+shape frame
+    bitrate     u32
+    sample_rate u32
+    padded      bool
+    length      u32
+
+to read_frame (raw u32, f ptr frame) gives bool
+    if raw[31:21] is not 0x7FF
+        give false
+    f.bitrate     = kbps[raw[15:12]] * 1000
+    f.sample_rate = rates[raw[11:10]]
+    f.padded      = raw[9] is 1
+    f.length      = 144 * f.bitrate / f.sample_rate + (f.padded as u32)
+    give true
+
+to main gives u8
+    new f frame
+    if read_frame(0xFFFB_9064, addr of f)
+        io.print_u64(f.bitrate as u64)
+        io.put(' ')
+        io.print_u64(f.sample_rate as u64)
+        io.put(' ')
+        io.print_u64(f.length as u64)
+        io.line("")
+    if not read_frame(0x1234_5678, addr of f)
+        io.line("not a frame")
+    give 0

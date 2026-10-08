@@ -1,0 +1,44 @@
+-- expect: 1 2 3 5 8 13 21 34
+-- expect: 1
+-- expect: 4950 4096
+
+use io
+
+to sort (s span i32)
+    for each i in 1 until s.len
+        new v = s[i]
+        new j = i
+        while j > 0 and s[j - 1] > v
+            s[j] = s[j - 1]
+            j -= 1
+        s[j] = v
+
+to is_sorted (s span i32) gives bool
+    for each i in 1 until s.len
+        if s[i - 1] > s[i]
+            give false
+    give true
+
+to main gives u8
+    new a [8] i32 = [21, 3, 34, 1, 13, 2, 8, 5]
+    new s = a as span i32
+    sort(s)
+    for each v in a
+        io.print_i64(v as i64)
+        io.put(' ')
+    io.line("")
+    io.print_u64(is_sorted(s) as u64)
+    io.line("")
+
+    -- a frame bigger than 4 KB exercises the long-offset paths
+    new big [4096] u8
+    new sum u64 = 0
+    for each i in 0 until 100
+        big[i * 40] = i as u8
+    for each i in 0 until 100
+        sum += big[i * 40] as u64
+    io.print_u64(sum)
+    io.put(' ')
+    io.print_u64(big.len)
+    io.line("")
+    give 0

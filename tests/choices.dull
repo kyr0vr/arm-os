@@ -1,0 +1,32 @@
+-- expect: aac
+-- expect: 2 64
+-- expect: hi there
+
+use io
+
+choice codec
+    mp3
+    aac
+    h264
+
+fixed max_files = 64
+fixed greeting = "hi there"
+new current codec = codec.aac
+new counter u32 = 2
+
+to name (c codec) gives string
+    if c is codec.mp3
+        give "mp3"
+    if c is codec.aac
+        give "aac"
+    give "h264"
+
+to main gives u8
+    io.line(name(current))
+    new limit u32 = max_files
+    io.print_u64(counter as u64 * (current as u32) as u64)
+    io.put(' ')
+    io.print_u64(limit as u64)
+    io.line("")
+    io.line(greeting)
+    give 0

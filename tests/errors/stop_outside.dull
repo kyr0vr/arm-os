@@ -1,0 +1,5 @@
+-- error: `stop` outside a loop
+
+to main gives u8
+    stop
+    give 0

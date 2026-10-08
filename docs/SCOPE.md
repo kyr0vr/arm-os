@@ -5,7 +5,7 @@ Raspberry Pi 5, built from the ground up: our own language, compiler, assembler,
 linker, kernel, drivers, file system, codecs and GUI. No borrowed toolchain in the
 final product.
 
-Status: **draft v0** (2026-10-08). Nothing is built yet.
+Status: **draft v0** (2026-10-08). Phase 0 is done: the stage-0 compiler and its test suite are in `stage0/` and `tests/`.
 
 ---
 
@@ -30,7 +30,8 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
 | Target | Raspberry Pi 5 (BCM2712, 4x Cortex-A76, AArch64) |
 | Ground-up level | **Level C**: own language + compiler + assembler + linker, then self-hosting |
 | Self-hosting | Early: right after the kernel core (phase 5). The compiler compiles itself **on the PC**; compiling on ArmOS is a stretch goal after "done". |
-| Stage-0 compiler | **Python**. Supports only the DULL subset the real compiler needs. Kept in the repo as the from-nothing bootstrap after it is retired. |
+| Running DULL tools on the PC | DULL compiles to AArch64, so the self-hosted compiler runs on the PC inside **QEMU** (`virt` machine), reading and writing files through semihosting. |
+| Stage-0 compiler | **Python** — built (phase 0 done, see `stage0/`). Supports only the DULL subset the real compiler needs. Kept in the repo as the from-nothing bootstrap after it is retired. |
 | Language style | Flow-right pipes (`->`) with plain-word structure; `=` assigns. See [LANGUAGE.md](LANGUAGE.md) |
 | Language name | **DULL** — Decidedly Unremarkable Low-level Language; files are `.dull` |
 | Video subset | H.264 High profile (8-bit 4:2:0, up to level 4.1) + AAC-LC in MP4, **1080p30**; an ffmpeg recipe converts anything else |
@@ -103,7 +104,7 @@ Each phase ends with something visible on the Pi or the PC.
 
 | # | Phase | Exit criterion |
 |---|---|---|
-| 0 | **Stage-0 compiler** in Python: functions, ints, pointers, shapes, spans, if/while, `device`, `asm` | Compiles a test program to `.s` that GNU `as` accepts (temporary crutch) |
+| 0 | **Stage-0 compiler** in Python: functions, ints, pointers, shapes, spans, if/while, `device`, `asm` | ✅ Test programs compile, assemble (clang/lld via `ziglang`, a temporary crutch) and run correctly on an emulated Cortex-A76 |
 | 1 | **Alive** | Pi 5 prints "ArmOS" over serial and fills the screen with a color |
 | 2 | **Own assembler + linker** | Phase 1 image rebuilt with zero outside tools; byte-compare against GNU output |
 | 3 | **Serial chainloader** | New kernels load over the cable; no more SD swaps per build |

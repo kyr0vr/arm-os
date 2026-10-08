@@ -1,0 +1,42 @@
+-- expect: 5 hello
+-- expect: ell
+-- expect: 4 10
+-- expect: wor
+-- expect: 3
+
+use io
+
+to sum (s span u32) gives u32
+    new t u32 = 0
+    for each v in s
+        t += v
+    give t
+
+to count_l (s string) gives u64
+    new n u64 = 0
+    for each c in s
+        if c is 'l'
+            n += 1
+    give n
+
+to main gives u8
+    new s string = "hello"
+    io.print_u64(s.len)
+    io.put(' ')
+    io.line(s)
+    io.line(s[1 until 4])
+
+    new arr [4] u32 = [1, 2, 3, 4]
+    new sp = arr as span u32
+    io.print_u64(sp.len)
+    io.put(' ')
+    io.print_u64(sum(sp) as u64)
+    io.line("")
+
+    new w string = "hello world"
+    new part = w[6 until 9]
+    io.line(part)
+    sp[0] = 0
+    io.print_u64(count_l(w) + (arr[0] as u64))
+    io.line("")
+    give 0

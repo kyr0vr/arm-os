@@ -1,0 +1,6 @@
+-- trap: division by zero
+
+to main gives u8
+    new a u32 = 10
+    new b u32 = 0
+    give (a / b) as u8

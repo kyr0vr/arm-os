@@ -1,0 +1,27 @@
+-- expect: el 1
+-- expect: 42 7
+-- expect: done
+
+use io
+
+to main gives u8
+    new el u64 = read_sysreg(CurrentEL) >> 2
+    io.print("el ")
+    io.print_u64(el)
+    io.line("")
+
+    new a u64 = 40
+    new b u32 = 5
+    asm
+        "add {a}, {a}, #2"
+        "add {b}, {b}, #2"
+    io.print_u64(a)
+    io.put(' ')
+    io.print_u64(b as u64)
+    io.line("")
+    dsb()
+    isb()
+    write_sysreg(tpidr_el1, 123)
+    if read_sysreg(tpidr_el1) is 123
+        io.line("done")
+    give 0

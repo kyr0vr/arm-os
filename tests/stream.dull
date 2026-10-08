@@ -1,0 +1,30 @@
+-- expect: 2 6 10 14
+-- expect: done
+
+use io
+
+new left u32 = 8
+
+to next_chunk gives maybe u32
+    if left is 0
+        give nothing
+    left -= 1
+    give 8 - left
+
+to keep_odd (v u32) gives maybe u32
+    if v % 2 is 0
+        give nothing
+    give v
+
+to double (v u32) gives u32
+    give v * 2
+
+to show (v u32)
+    io.print_u64(v as u64)
+    io.put(' ')
+
+to main gives u8
+    stream next_chunk() -> keep_odd -> double -> show
+    io.line("")
+    io.line("done")
+    give 0

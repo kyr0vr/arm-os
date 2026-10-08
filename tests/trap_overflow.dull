@@ -1,0 +1,6 @@
+-- trap: integer overflow
+
+to main gives u8
+    new x u8 = 200
+    new y u8 = x + 100
+    give y

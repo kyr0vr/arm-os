@@ -1,0 +1,7 @@
+-- error: is fixed and cannot change
+
+fixed limit u32 = 4
+
+to main gives u8
+    limit = 5
+    give 0

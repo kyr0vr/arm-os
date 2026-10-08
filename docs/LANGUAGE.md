@@ -1,9 +1,9 @@
-# DULL — Spec v0.1
+# DULL — Spec v0.2
 
 *Decidedly Unremarkable Low-level Language* — the systems language ArmOS is written in.
 
-Source files use the `.dull` extension. Status: **draft v0.1** (2026-10-08) — everything
-here may change once real code is written in it. Changes since v0 are listed in §19.
+Source files use the `.dull` extension. Status: **draft v0.2** (2026-10-08) — everything
+here may change once real code is written in it. Changes are listed in §19.
 
 ---
 
@@ -98,7 +98,7 @@ on core asm use as
 | `bool` | `true` / `false`, one byte |
 | `fix 16.16` | fixed-point: 16 integer bits, 16 fraction bits (any split, total 8/16/32/64) |
 | `[N] T` | fixed-size array of N elements |
-| `span T` | pointer + length view of memory |
+| `span T` | pointer + length view of memory; fields `.ptr` and `.len` (§10a) |
 | `string` | a `span u8` holding UTF-8 |
 | `ptr T` | raw pointer to T |
 | `N lanes of T` | SIMD vector, e.g. `8 lanes of u16` (maps to one 128-bit NEON register) |
@@ -209,6 +209,10 @@ skip                         -- continue
 after free(buf)              -- run this when the enclosing block exits
 ```
 
+A range between two plain numbers (`0 until 10`) counts in `u64`, the same type as
+`.len`. Otherwise the counter takes the type of the bounds, which must match.
+The loop variable cannot be assigned.
+
 `after` statements run when their block exits by any route — falling off the end,
 `give`, `stop`, `skip` or an `else give`. Several run in reverse order.
 
@@ -275,6 +279,9 @@ p[3]                         -- element 3 past p
 q.field                      -- fields auto-dereference through a ptr to a shape
 ```
 
+`p + n` and `p - n` move a pointer by `n` **elements**, like `p[n]`. For byte
+arithmetic convert to `u64` first.
+
 No bounds checks on `ptr`. **Spans** are bounds-checked in debug builds.
 Memory is managed by hand; the kernel provides allocators as ordinary functions.
 There is no borrow checker, on purpose. Safety comes from cheap tools instead:
@@ -283,6 +290,22 @@ There is no borrow checker, on purpose. Safety comes from cheap tools instead:
 - a debug allocator that fills freed memory with junk and guards each allocation
 - unmapped guard pages around every stack
 - `after` for cleanup that cannot be forgotten on an early exit
+
+## 10a. Spans, slices and arrays
+
+```
+new s string = "hello world"
+s.len                        -- 11 (u64)
+s.ptr                        -- ptr u8 to the first byte
+s[6 until 9]                 -- "wor": a new span over the same memory
+new a [4] u32 = [1, 2, 3, 4]
+a.len                        -- 4, a constant
+new view = a as span u32     -- a span over a stored array
+```
+
+A slice `s[lo until hi]` covers elements `lo` up to but not including `hi`. In debug
+builds an out-of-range slice traps. `.ptr` and `.len` of a stored span can be assigned,
+which is how a span over raw memory is made.
 
 ## 11. Devices
 
@@ -372,6 +395,7 @@ stays the same.
 | `read_sysreg(NAME)` / `write_sysreg(NAME, v)` | `mrs` / `msr`, e.g. `read_sysreg(CurrentEL)` |
 | `dsb()` `dmb()` `isb()` | barriers (full system) |
 | `wfe()` `wfi()` `sev()` | wait for event / interrupt, send event |
+| `size_of(T)` | the size of type `T` in bytes, as a constant |
 
 ## 15. Modules
 
@@ -427,7 +451,17 @@ unwrap      = logic_or [ "else" ( "give" [ expr ] | "stop" | "skip" | logic_or )
 2. Should `hold until` take an optional timeout (`hold until x within 1000 us`)?
 3. Strings: is `string` = `span u8` enough, or do we want an owned string type?
 
-## 19. Changes in v0.1
+## 19. Changes
+
+### v0.2 — found while building the stage-0 compiler
+
+- Spans have `.ptr` and `.len`; slices `s[lo until hi]`; arrays have a constant `.len`;
+  `a as span T` views a stored array (§10a).
+- A range of two plain numbers counts in `u64` (§8).
+- Pointer `+`/`-` move by elements (§10).
+- `size_of(T)` built-in (§14).
+
+### v0.1
 
 - `asm` operand binding (`{name}`) moved into v0, plus built-ins for system registers,
   barriers and waits (§14).
