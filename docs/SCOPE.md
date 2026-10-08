@@ -1,6 +1,6 @@
 # ArmOS — Scope
 
-*A Rather Mundane Operating System.* A personal, for-fun operating system for the
+*A Rather Mundane Operating System.* A hobby operating system for the
 Raspberry Pi 5, built from the ground up: our own language, compiler, assembler,
 linker, kernel, drivers, file system, codecs and GUI. No borrowed toolchain in the
 final product.
@@ -13,10 +13,11 @@ Status: **draft v0** (2026-10-08). Nothing is built yet.
 
 ArmOS is done when, on a real Pi 5, from power-on:
 
-1. It boots into a **GUI launcher** with three functions: **Text**, **Music**, **Video**.
+1. It boots into a **GUI launcher** with three functions: **Text**, **Music**, **Video**,
+   driven by a **USB keyboard** plugged into the Pi.
 2. **Text** opens and reads `.txt` files from the SD card (scrolling, a real font).
 3. **Music** plays `.mp3` files with sound out of the monitor over HDMI.
-4. **Video** plays `.mp4` files (H.264 video + AAC audio) in sync.
+4. **Video** plays `.mp4` files (H.264 video + AAC audio) at **1080p30**, in sync.
 5. Every byte of code that runs was produced by **our own toolchain**, and that
    toolchain's compiler is written in our own language and compiles itself.
 
@@ -31,9 +32,9 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
 | Self-hosting | The compiler compiles itself **on the PC**. Compiling on ArmOS is a stretch goal after "done". |
 | Language style | Flow-right pipes (`->`) with plain-word structure; `=` assigns. See [LANGUAGE.md](LANGUAGE.md) |
 | Language name | **DULL** — Decidedly Unremarkable Low-level Language; files are `.dull` |
-| Video subset | H.264 + AAC-LC in MP4, **720p30 target**; an ffmpeg recipe converts anything else (pending confirmation) |
-| Audio out | HDMI audio (the Pi 5 has no headphone jack) |
-| Input | **Open** — serial keys from the PC for v1, or a USB keyboard required for done (see §8) |
+| Video subset | H.264 High profile (8-bit 4:2:0, up to level 4.1) + AAC-LC in MP4, **1080p30**; an ffmpeg recipe converts anything else |
+| Audio out | HDMI audio to the monitor's speakers (the Pi 5 has no headphone jack) |
+| Input | **USB keyboard** is required for done. Serial input from the PC is the stand-in until the USB stack lands. |
 | Repo | `kyr0vr/arm-os` |
 
 ## 3. Hardware facts that shape the plan
@@ -60,11 +61,15 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
 - **Emulation.** QEMU has no Pi 5 machine. We develop against QEMU `virt` (AArch64,
   GICv2/v3, PL011) behind a thin board layer, and run on the real Pi regularly.
 
-## 4. Hardware on hand
+## 4. Development hardware
 
-- Raspberry Pi 5, monitor, microSD card, SD reader for the PC, assorted wiring.
-- **To confirm:** a 3.3 V serial path to the JST debug header (Debug Probe or JST-SH cable).
-- **To confirm:** the monitor has speakers or an audio-out jack.
+- Raspberry Pi 5 with the official 27 W USB-C power supply
+- microSD card + an SD card reader for the PC
+- HDMI monitor with speakers (micro-HDMI to HDMI cable)
+- USB keyboard
+- **Raspberry Pi Debug Probe** — USB to 3.3 V UART, ships with the 3-pin JST-SH cable that
+  fits the Pi 5 debug header. Any 3.3 V USB-serial adapter plus a JST-SH 1.0 mm 3-pin
+  cable also works. Never a 5 V adapter.
 
 ## 5. Architecture
 
@@ -87,7 +92,7 @@ image, later our own executable format for apps).
 generic timer, physical page allocator, heap, 4-core SMP, scheduler, EL0 user mode,
 syscalls.
 
-**Drivers**: PL011 UART, framebuffer, SDHCI, HDMI audio, (later) PCIe → RP1 → xHCI → HID.
+**Drivers**: PL011 UART, framebuffer, SDHCI, PCIe → RP1 → xHCI → USB HID, HDMI audio.
 
 **Userland**: compositor + launcher, text reader, MP3 player, MP4 player, font renderer.
 
@@ -105,50 +110,42 @@ Each phase ends with something visible on the Pi or the PC.
 | 5 | **Text console** | Bitmap font, scrolling console on HDMI, keyboard input over serial |
 | 6 | **Storage** | SDHCI driver + FAT32 read; list and print a `.txt` from the card |
 | 7 | **Processes** | EL0 apps, syscalls, scheduler; the console is an app |
-| 8 | **GUI + Text** | Compositor, launcher with Text/Music/Video tiles, **Text reader done** |
-| 9 | **Audio** | HDMI audio plays a test tone; MP3 decoder; **Music done** |
-| 10 | **Video** | MP4 demux, AAC, H.264 (I/P/B, CABAC, deblock), NEON, A/V sync; **Video done** |
-| 11 | **Self-host** | The compiler, rewritten in its own language, compiles itself byte-identically |
-| 12 | *(stretch / or required — see §8)* **USB input** | PCIe + RP1 + xHCI + HID: a USB keyboard drives the GUI |
+| 8 | **GUI + Text** | Compositor, launcher with Text/Music/Video tiles, **Text reader done** (serial keys) |
+| 9 | **USB input** | PCIe root complex → RP1 → xHCI → USB HID: a USB keyboard drives the GUI |
+| 10 | **Audio** | HDMI audio plays a test tone; MP3 decoder; **Music done** |
+| 11 | **Video** | MP4 demux, AAC, H.264 (I/P/B, CABAC, deblock), NEON, 4-core decode, A/V sync; **Video done** |
+| 12 | **Self-host** | The compiler, rewritten in DULL, compiles itself byte-identically |
 
-Phases 0–8 are a solid, showable milestone. Phase 10 is where most of the time goes.
+Phases 0–8 are a solid, showable milestone. Phase 11 is where most of the time goes.
 
-Phase 11 can move earlier; the later it lands, the more code is written in the
+Phase 9 can run in parallel with 10 and 11: USB and media share no code. Phase 12 can move earlier; the later it lands, the more code is written in the
 language before the compiler is rewritten in it — which is a feature: by then we
 know what the language really needs.
 
 ## 7. Risks, ranked
 
-1. **H.264 in software** — the single largest piece of code. Mitigation: a defined
-   subset, the ffmpeg recipe, and NEON lanes in the language from early on.
+1. **H.264 at 1080p30 in software** — the single largest piece of code, and it has to
+   be fast: roughly 62 million pixels a second across four cores. Mitigation: a defined
+   subset, the ffmpeg recipe, NEON lanes in the language from early on, slice- or
+   row-parallel decode, and hand-written `asm` for the hottest loops.
 2. **HDMI audio** — sparse documentation outside Linux source. Mitigation: start it
    right after storage, as a spike, before the MP3 decoder exists.
-3. **RP1/USB** — months by itself. Mitigation: serial input until the end.
-4. **Optimizer quality** — a naive compiler may be too slow for 720p decode.
+3. **RP1/USB** — months by itself, and RP1's register documentation is partial.
+   Mitigation: serial input as a stand-in, the Linux `rp1` and `xhci` drivers as reference.
+4. **Optimizer quality** — a naive compiler will be too slow for 1080p decode.
    Mitigation: inline `asm` and lane types so hot loops can be hand-tuned.
 5. **Debugging blind** — mitigated by the debug UART from phase 1 and QEMU `virt` + GDB.
 
 ## 8. Open questions
 
-1. **Input for "done"**: serial-driven GUI okay, or must a USB keyboard/mouse work?
-2. **Video target**: 720p30 + ffmpeg recipe, or 1080p?
-3. **Serial wiring**: what exactly is on hand for the JST debug header?
-4. **Monitor audio**: speakers or audio-out?
-5. **Stage-0 host language**: recommendation is **Python** — it is thrown away at
-   phase 11, so speed of writing beats speed of running.
+1. **Stage-0 host language**: recommendation is **Python** — it is thrown away at
+   phase 12, so speed of writing beats speed of running.
+2. **Mouse**: keyboard-only GUI for done, or a mouse too? (Same USB stack, small extra.)
 
 ## 9. The language name
 
-ArmOS is **A Rather Mundane Operating System**. The language is equally unexciting: **DULL** was chosen on 2026-10-08. The other candidates, kept for the record:
-
-| Name | Stands for |
-|---|---|
-| **BLAND** | Basic Language for ARM, Nothing Dazzling |
-| **TEPID** | The Entirely Passable Implementation Dialect |
-| **PLAIN** | Practical Language for ARM, Infrequently Noticed |
-| **BEIGE** | Basic Everyday Instructions, Generally Efficient |
-| **NORM** | Not Overly Remarkable Machine-code |
-| **ARML** | A Rather Mundane Language (the direct sibling of ArmOS) |
+ArmOS is **A Rather Mundane Operating System**. Its language is equally unexciting:
+**DULL**, the *Decidedly Unremarkable Low-level Language*. See [LANGUAGE.md](LANGUAGE.md).
 
 ## 10. Out of scope (for "done")
 
