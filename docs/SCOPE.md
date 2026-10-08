@@ -29,7 +29,8 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
 |---|---|
 | Target | Raspberry Pi 5 (BCM2712, 4x Cortex-A76, AArch64) |
 | Ground-up level | **Level C**: own language + compiler + assembler + linker, then self-hosting |
-| Self-hosting | The compiler compiles itself **on the PC**. Compiling on ArmOS is a stretch goal after "done". |
+| Self-hosting | Early: right after the kernel core (phase 5). The compiler compiles itself **on the PC**; compiling on ArmOS is a stretch goal after "done". |
+| Stage-0 compiler | **Python**. Supports only the DULL subset the real compiler needs. Kept in the repo as the from-nothing bootstrap after it is retired. |
 | Language style | Flow-right pipes (`->`) with plain-word structure; `=` assigns. See [LANGUAGE.md](LANGUAGE.md) |
 | Language name | **DULL** — Decidedly Unremarkable Low-level Language; files are `.dull` |
 | Video subset | H.264 High profile (8-bit 4:2:0, up to level 4.1) + AAC-LC in MP4, **1080p30**; an ffmpeg recipe converts anything else |
@@ -102,25 +103,28 @@ Each phase ends with something visible on the Pi or the PC.
 
 | # | Phase | Exit criterion |
 |---|---|---|
-| 0 | **Stage-0 compiler** in a host language (throwaway): functions, ints, pointers, if/while, `device`, `asm` | Compiles a test program to `.s` that GNU `as` accepts (temporary crutch) |
+| 0 | **Stage-0 compiler** in Python: functions, ints, pointers, shapes, spans, if/while, `device`, `asm` | Compiles a test program to `.s` that GNU `as` accepts (temporary crutch) |
 | 1 | **Alive** | Pi 5 prints "ArmOS" over serial and fills the screen with a color |
 | 2 | **Own assembler + linker** | Phase 1 image rebuilt with zero outside tools; byte-compare against GNU output |
 | 3 | **Serial chainloader** | New kernels load over the cable; no more SD swaps per build |
 | 4 | **Kernel core** | Timer interrupts tick, MMU on, page allocator and heap pass tests, all 4 cores say hello |
-| 5 | **Text console** | Bitmap font, scrolling console on HDMI, keyboard input over serial |
-| 6 | **Storage** | SDHCI driver + FAT32 read; list and print a `.txt` from the card |
-| 7 | **Processes** | EL0 apps, syscalls, scheduler; the console is an app |
-| 8 | **GUI + Text** | Compositor, launcher with Text/Music/Video tiles, **Text reader done** (serial keys) |
-| 9 | **USB input** | PCIe root complex → RP1 → xHCI → USB HID: a USB keyboard and mouse drive the GUI |
-| 10 | **Audio** | HDMI audio plays a test tone; MP3 decoder; **Music done** |
-| 11 | **Video** | MP4 demux, AAC, H.264 (I/P/B, CABAC, deblock), NEON, 4-core decode, A/V sync; **Video done** |
-| 12 | **Self-host** | The compiler, rewritten in DULL, compiles itself byte-identically |
+| 5 | **Self-host** | The compiler, rewritten in DULL, compiles itself byte-identically; stage 0 is retired |
+| 6 | **Text console** | Bitmap font, scrolling console on HDMI, keyboard input over serial |
+| 7 | **Storage** | SDHCI driver + FAT32 read; list and print a `.txt` from the card |
+| 8 | **Processes** | EL0 apps, syscalls, scheduler; the console is an app |
+| 9 | **GUI + Text** | Compositor, launcher with Text/Music/Video tiles, **Text reader done** (serial keys) |
+| 10 | **USB input** | PCIe root complex → RP1 → xHCI → USB HID: a USB keyboard and mouse drive the GUI |
+| 11 | **Audio** | HDMI audio plays a test tone; MP3 decoder; **Music done** |
+| 12 | **Video** | MP4 demux, AAC, H.264 (I/P/B, CABAC, deblock), NEON, 4-core decode, A/V sync; **Video done** |
 
-Phases 0–8 are a solid, showable milestone. Phase 11 is where most of the time goes.
+Phases 0–9 are a solid, showable milestone. Phase 12 is where most of the time goes.
 
-Phase 9 can run in parallel with 10 and 11: USB and media share no code. Phase 12 can move earlier; the later it lands, the more code is written in the
-language before the compiler is rewritten in it — which is a feature: by then we
-know what the language really needs.
+Self-hosting comes right after the kernel core: by then the boot code and kernel
+basics, written in DULL, have shaken out the language, and from phase 6 on every
+line of ArmOS is built by the DULL compiler. Stage 0 stays in the repo so DULL can
+always be rebuilt from nothing.
+
+Phase 10 can run in parallel with 11 and 12: USB and media share no code.
 
 ## 7. Risks, ranked
 
@@ -138,8 +142,7 @@ know what the language really needs.
 
 ## 8. Open questions
 
-1. **Stage-0 host language**: recommendation is **Python** — it is thrown away at
-   phase 12, so speed of writing beats speed of running.
+None blocking. Language-level questions live in [LANGUAGE.md §18](LANGUAGE.md#18-open-questions).
 
 ## 9. The language name
 
