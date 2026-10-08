@@ -14,7 +14,7 @@ Status: **draft v0** (2026-10-08). Nothing is built yet.
 ArmOS is done when, on a real Pi 5, from power-on:
 
 1. It boots into a **GUI launcher** with three functions: **Text**, **Music**, **Video**,
-   driven by a **USB keyboard** plugged into the Pi.
+   driven by a **USB keyboard and mouse** plugged into the Pi.
 2. **Text** opens and reads `.txt` files from the SD card (scrolling, a real font).
 3. **Music** plays `.mp3` files with sound out of the monitor over HDMI.
 4. **Video** plays `.mp4` files (H.264 video + AAC audio) at **1080p30**, in sync.
@@ -34,7 +34,7 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
 | Language name | **DULL** — Decidedly Unremarkable Low-level Language; files are `.dull` |
 | Video subset | H.264 High profile (8-bit 4:2:0, up to level 4.1) + AAC-LC in MP4, **1080p30**; an ffmpeg recipe converts anything else |
 | Audio out | HDMI audio to the monitor's speakers (the Pi 5 has no headphone jack) |
-| Input | **USB keyboard** is required for done. Serial input from the PC is the stand-in until the USB stack lands. |
+| Input | **USB keyboard and mouse** are required for done. Serial input from the PC is the stand-in until the USB stack lands. |
 | Repo | `kyr0vr/arm-os` |
 
 ## 3. Hardware facts that shape the plan
@@ -66,7 +66,7 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
 - Raspberry Pi 5 with the official 27 W USB-C power supply
 - microSD card + an SD card reader for the PC
 - HDMI monitor with speakers (micro-HDMI to HDMI cable)
-- USB keyboard
+- USB keyboard and mouse
 - **Raspberry Pi Debug Probe** — USB to 3.3 V UART, ships with the 3-pin JST-SH cable that
   fits the Pi 5 debug header. Any 3.3 V USB-serial adapter plus a JST-SH 1.0 mm 3-pin
   cable also works. Never a 5 V adapter.
@@ -111,7 +111,7 @@ Each phase ends with something visible on the Pi or the PC.
 | 6 | **Storage** | SDHCI driver + FAT32 read; list and print a `.txt` from the card |
 | 7 | **Processes** | EL0 apps, syscalls, scheduler; the console is an app |
 | 8 | **GUI + Text** | Compositor, launcher with Text/Music/Video tiles, **Text reader done** (serial keys) |
-| 9 | **USB input** | PCIe root complex → RP1 → xHCI → USB HID: a USB keyboard drives the GUI |
+| 9 | **USB input** | PCIe root complex → RP1 → xHCI → USB HID: a USB keyboard and mouse drive the GUI |
 | 10 | **Audio** | HDMI audio plays a test tone; MP3 decoder; **Music done** |
 | 11 | **Video** | MP4 demux, AAC, H.264 (I/P/B, CABAC, deblock), NEON, 4-core decode, A/V sync; **Video done** |
 | 12 | **Self-host** | The compiler, rewritten in DULL, compiles itself byte-identically |
@@ -140,7 +140,6 @@ know what the language really needs.
 
 1. **Stage-0 host language**: recommendation is **Python** — it is thrown away at
    phase 12, so speed of writing beats speed of running.
-2. **Mouse**: keyboard-only GUI for done, or a mouse too? (Same USB stack, small extra.)
 
 ## 9. The language name
 
