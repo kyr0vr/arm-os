@@ -1,7 +1,8 @@
-# ArmOS Language — Spec v0
+# DULL — Spec v0
 
-Working name: **TBD** (see [SCOPE.md §9](SCOPE.md#9-name-candidates-for-the-language)).
-This document calls it "the language". Status: **draft v0** (2026-10-08) — everything
+*Decidedly Unremarkable Low-level Language* — the systems language ArmOS is written in.
+
+Source files use the `.dull` extension. Status: **draft v0** (2026-10-08) — everything
 here may change once real code is written in it.
 
 ---
@@ -309,7 +310,7 @@ operand binding — `asm` blocks use the AArch64 calling convention by hand.
 
 ## 15. Modules
 
-One file is one module. `use name` brings in `name.<ext>` from the same folder or
+One file is one module. `use name` brings in `name.dull` from the same folder or
 the library path; its top-level names are reached as `name.thing`.
 
 ```
@@ -354,9 +355,8 @@ pipe        = logic_or { "->" call_target } ;
 
 ## 18. Open questions
 
-1. Name and file extension.
-2. Do pipes into streams (§7) ship in v1, or does the media pipeline use plain calls?
-3. Generics: none in v0. Needed for containers later? (Probably a small template form.)
-4. Should `hold until` take an optional timeout (`hold until x within 1000 us`)?
-5. Strings: is `string` = `span u8` enough, or do we want an owned string type?
-6. How should `asm` bind operands to variables (v1)?
+1. Do pipes into streams (§7) ship in v1, or does the media pipeline use plain calls?
+2. Generics: none in v0. Needed for containers later? (Probably a small template form.)
+3. Should `hold until` take an optional timeout (`hold until x within 1000 us`)?
+4. Strings: is `string` = `span u8` enough, or do we want an owned string type?
+5. How should `asm` bind operands to variables (v1)?

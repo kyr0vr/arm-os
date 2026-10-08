@@ -30,7 +30,7 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
 | Ground-up level | **Level C**: own language + compiler + assembler + linker, then self-hosting |
 | Self-hosting | The compiler compiles itself **on the PC**. Compiling on ArmOS is a stretch goal after "done". |
 | Language style | Flow-right pipes (`->`) with plain-word structure; `=` assigns. See [LANGUAGE.md](LANGUAGE.md) |
-| Language name | **Open** — wants a backronym in the spirit of ArmOS (see §9) |
+| Language name | **DULL** — Decidedly Unremarkable Low-level Language; files are `.dull` |
 | Video subset | H.264 + AAC-LC in MP4, **720p30 target**; an ffmpeg recipe converts anything else (pending confirmation) |
 | Audio out | HDMI audio (the Pi 5 has no headphone jack) |
 | Input | **Open** — serial keys from the PC for v1, or a USB keyboard required for done (see §8) |
@@ -136,23 +136,19 @@ know what the language really needs.
 4. **Monitor audio**: speakers or audio-out?
 5. **Stage-0 host language**: recommendation is **Python** — it is thrown away at
    phase 11, so speed of writing beats speed of running.
-6. **Language name** (§9).
 
-## 9. Name candidates for the language
+## 9. The language name
 
-ArmOS is **A Rather Mundane Operating System**. The language should be equally unexciting.
+ArmOS is **A Rather Mundane Operating System**. The language is equally unexciting: **DULL** was chosen on 2026-10-08. The other candidates, kept for the record:
 
 | Name | Stands for |
 |---|---|
-| **DULL** | Decidedly Unremarkable Low-level Language |
 | **BLAND** | Basic Language for ARM, Nothing Dazzling |
 | **TEPID** | The Entirely Passable Implementation Dialect |
 | **PLAIN** | Practical Language for ARM, Infrequently Noticed |
 | **BEIGE** | Basic Everyday Instructions, Generally Efficient |
 | **NORM** | Not Overly Remarkable Machine-code |
 | **ARML** | A Rather Mundane Language (the direct sibling of ArmOS) |
-
-Source file extension follows the name (`.dull`, `.bland`, ...).
 
 ## 10. Out of scope (for "done")
 
