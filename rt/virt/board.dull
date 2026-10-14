@@ -14,9 +14,10 @@ fixed gic_cpu  u64 = 0x0801_0000
 fixed cores u64 = 4
 fixed ram_end u64 = 0x4700_0000       -- RAM from 0x4000_0000; the pretend screen sits above this
 
--- The shell reads these keys; once they have run out and nothing is left to do, the
--- test is over (there is no keyboard in the test).
-fixed script string = "help\nmem\nuptime\ncpu\necho hello from armos\nnot-a-command\nhelp\nhelp\necho the console scrolled\ndisk\nls\nls docs\ncat hello.txt\ncat a longer file name.txt\ncat docs/notes.txt\ncat big.txt\ncat nope.txt\nhello one two three\nps\nspin a 3 &\nspin b 3 &\nps\nsleep 2000\ncrash\necho the shell is still here\napps/hello.app from the SD card\nexit\nuptime\n"
+-- The apps read these keys (the launcher, the text reader, then the shell); once
+-- they have run out and nothing is left to do, the test is over (there is no
+-- keyboard in the test).
+fixed script string = "\x02\x1b[C\r1\x03\x1b[B\x1b[B\x1b[B\x1b[B\r\x04  G\x05q\x1b[H\r\x1b[B\r\x07q\x08qq4help\nmem\nuptime\ncpu\necho hello from armos\nnot-a-command\nhelp\nhelp\necho the console scrolled\ndisk\nls\nls docs\ncat hello.txt\ncat a longer file name.txt\ncat docs/notes.txt\ncat big.txt\ncat nope.txt\nhello one two three\nps\nspin a 3 &\nspin b 3 &\nps\nsleep 2000\ncrash\necho the shell is still here\napps/hello.app from the SD card\n\x06exit\n"
 new script_pos u64
 
 to probe
@@ -46,7 +47,15 @@ to memory_mib gives u64
 to cpu_mhz gives u64
     give 0
 
-to poll_key gives maybe u8
+-- One scripted key, but only when an app is waiting for one (`wanted`), so the
+-- script runs the same way every time. Bytes 2-7 in the script are not keys: they
+-- save the screen as build/kernel_virt/screen<n>.raw at that moment.
+to poll_key (wanted bool) gives maybe u8
+    if not wanted
+        give nothing
+    while script_pos < script.len and script[script_pos] >= 2 and script[script_pos] <= 7
+        save_raw(fb.ram_screen, 1920 * 1080 * 4, script[script_pos] as u32)
+        script_pos += 1
     if script_pos >= script.len
         give nothing
     new k = script[script_pos]
@@ -86,6 +95,9 @@ to semihost (op u64, block ptr u64) gives u64
 
 -- Write the screen to build/kernel_virt/screen<which>.raw (BGRA bytes, 1920x1080).
 to save_screen (s ptr fb.screen, which u32)
+    save_raw(s.base as u64, (s.pitch as u64) * (s.height as u64), which)
+
+to save_raw (base u64, size u64, which u32)
     new path string = "build/kernel_virt/screen0.raw\0"
     path.ptr[24] = '0' + (which as u8)
     new block [3] u64
@@ -96,8 +108,8 @@ to save_screen (s ptr fb.screen, which u32)
     if h as i64 < 0
         give
     block[0] = h
-    block[1] = s.base as u64
-    block[2] = (s.pitch as u64) * (s.height as u64)
+    block[1] = base
+    block[2] = size
     semihost(0x05, addr of block[0])
     block[0] = h
     semihost(0x02, addr of block[0])

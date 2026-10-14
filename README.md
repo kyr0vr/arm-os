@@ -24,10 +24,16 @@ The boot screen (the arrow through the A is the progress bar; every fact on the 
 
 ![console](docs/brand/console-1080p.png)
 
+After boot, the launcher (Text, Music, Video, Console) and the text reader, also drawn by ArmOS itself:
+
+![launcher](docs/brand/launcher-1080p.png)
+
+![text reader](docs/brand/text-reader-1080p.png)
+
 Type at the console over the serial cable: `python -m serial.tools.miniterm COM4 115200`.
 
 The shell can read the SD card: `disk` shows the card and its file system, `ls [folder]` lists files and `cat file` prints one (`help` lists the rest).
 
-The shell is an app, like everything outside the kernel: it starts other apps by name (`hello`, `spin a 5 &` in the background), and `ps` / `kill` manage them. See [apps/](apps/README.md) for writing one.
+Arrow keys (or 1-4) and Enter over the serial cable drive the launcher until USB input arrives in phase 10; the Console tile opens the shell. The shell is an app, like everything outside the kernel: it starts other apps by name (`hello`, `spin a 5 &` in the background), and `ps` / `kill` manage them. See [apps/](apps/README.md) for writing one.
 
 The console font, ArmOS Mono, is baked from Cascadia Mono and Cascadia Code (SIL Open Font License 1.1, see [fonts/](fonts/)).

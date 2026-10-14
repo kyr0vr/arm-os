@@ -19,11 +19,14 @@ RESERVED = 32
 FATS = 2
 SPC = 1                          # sectors per cluster
 
+ESSAY = b'On Mundane Things\n\nMost of what a computer does all day is unremarkable. It waits for a key, it copies some bytes from one place to another, it draws the same letters it drew a moment ago, and then it waits again. Nobody writes songs about this, and that is fine: the unremarkable parts are the ones that have to work every single time.\n\nAn operating system is mostly a collection of these small promises. The disk will give back what was written to it. A program that misbehaves will be stopped without taking the others down with it. The screen will show the program you are using and not the one you closed. Each promise is boring on its own; kept together, they are what lets anything interesting happen on top.\n\nThis file has long paragraphs on purpose, so the reader has to wrap them at the edge of the screen, breaking between words rather than in the middle of one. A word that is far too long to fit on any line at all, like Pneumonoultramicroscopicsilicovolcanoconiosis-and-then-some-more-letters-to-make-sure-it-really-does-not-fit-anywhere-on-one-line-of-the-reader, has to be cut wherever the line runs out.\n\n\tA tab, and the end.\n'  # long lines, for word wrapping
+
 FILES = {
     "hello.txt": b"Hello from a FAT32 disk!\nThis is ArmOS reading a file.\n",
     "A Longer File Name.txt": b"Long file names work too.\n",
     "docs/notes.txt": b"".join(b"note %03d: a rather mundane line of text\n" % i for i in range(60)),
     "big.txt": b"".join(b"line %05d of a big file that crosses many clusters\n" % i for i in range(400)),
+    "docs/essay.txt": ESSAY,
 }
 
 

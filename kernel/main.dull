@@ -1,10 +1,11 @@
--- The ArmOS kernel. Phase 8: processes.
+-- The ArmOS kernel. Phase 9: the GUI.
 --
 -- Brings the machine up step by step and checks each step: exception level,
 -- exceptions, memory, the MMU and caches, interrupts and the timer, all four cores.
 -- The boot screen shows it happening (the arrow through the A is the progress bar,
--- and the facts beside it are read from the hardware). Then the first app, the shell,
--- starts at EL0 and the kernel only answers system calls and interrupts from then on.
+-- and the facts beside it are read from the hardware). Then the first app, the
+-- launcher, starts at EL0 and the kernel only answers system calls and interrupts
+-- (and shows whichever app is in front) from then on.
 -- Builds for the Raspberry Pi 5 (rt/pi5) and QEMU (rt/virt).
 
 use io
@@ -61,7 +62,7 @@ to main
     io.line("")
     io.line("========================================")
     io.line(" ArmOS - a rather mundane operating system")
-    io.line(" phase 8: processes")
+    io.line(" phase 9: the GUI")
     io.line("========================================")
 
     -- exception level
@@ -163,4 +164,4 @@ to main
     board.save_screen(addr of screen, 0)
     tty.start(addr of canvas, addr of screen, have_canvas)
     io.line("")
-    proc.start("shell")
+    proc.start("launcher")

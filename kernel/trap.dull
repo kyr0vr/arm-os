@@ -8,6 +8,7 @@ use gic
 use timer
 use proc
 use syscall
+use gui
 
 fixed elr_slot u64 = 31
 fixed brk_class u64 = 0x3C
@@ -28,13 +29,13 @@ to handle (frame ptr u64, entry u64) gives ptr u64
         if id < 1020
             gic.done(iar)
         if is_timer and proc.running
-            give proc.tick(frame)
+            give gui.settle(proc.tick(frame))
         give frame
     new esr = read_sysreg(esr_el1)
     if entry is 8                         -- an app: a system call, or a fault
         if esr[31:26] is svc_class
-            give syscall.handle(frame)
-        give proc.crashed(frame, esr, read_sysreg(far_el1))
+            give gui.settle(syscall.handle(frame))
+        give gui.settle(proc.crashed(frame, esr, read_sysreg(far_el1)))
     if entry is 4 and esr[31:26] is brk_class
         breakpoints += 1
         frame[elr_slot] = frame[elr_slot] + 4

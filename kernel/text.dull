@@ -15,6 +15,7 @@ shape canvas
 fixed regular u8 = 0
 fixed bold u8 = 1
 fixed small u8 = 2
+fixed large u8 = 3
 
 -- A canvas the size of the screen (gives false if there is no memory for it).
 to make (c ptr canvas, w u32, h u32) gives bool
@@ -68,11 +69,15 @@ to blend (c ptr canvas, x u32, y u32, color u32, a u32)
 to advance_of (style u8) gives u32
     if style is small
         give font.small_advance
+    if style is large
+        give font.large_advance
     give font.advance
 
 to height_of (style u8) gives u32
     if style is small
         give font.small_height
+    if style is large
+        give font.large_height
     give font.height
 
 -- One character with its top-left corner at (x, y).
@@ -85,6 +90,9 @@ to glyph (c ptr canvas, x u32, y u32, ch u8, style u8, color u32)
     if style is small
         stride = font.small_stride
         h = font.small_height
+    else if style is large
+        stride = font.large_stride
+        h = font.large_height
     new base = index * (h as u64) * stride
     for each row in 0 until h
         for each b in 0 until stride
@@ -94,6 +102,8 @@ to glyph (c ptr canvas, x u32, y u32, ch u8, style u8, color u32)
                 packed = font.bold[k]
             else if style is small
                 packed = font.small[k]
+            else if style is large
+                packed = font.large[k]
             else
                 packed = font.regular[k]
             if packed is 0

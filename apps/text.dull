@@ -1,0 +1,434 @@
+-- Text: the ArmOS text reader. Browse the SD card's folders and .txt files, open
+-- one, and read it word-wrapped to the screen, a line or a page at a time.
+
+use sys
+use gfx
+use keys
+use line
+use mem
+use vec
+
+fixed bg u32 = 0x12_12_11
+fixed slot u32 = 0x22_21_1F
+fixed slot_lit u32 = 0x30_2E_29
+fixed edge u32 = 0x3A_37_31
+fixed putty u32 = 0xE6_DB_C1
+fixed amber u32 = 0xFF_9A_1F
+fixed muted u32 = 0x8C_84_6F
+fixed dim u32 = 0x5A_55_4A
+fixed deep u32 = 0xE0_56_1B
+
+fixed margin u32 = 120
+fixed footer_y u32 = 980
+
+-- ---------------------------------------------------------------- the folder list
+
+fixed max_entries u64 = 200
+fixed list_y u32 = 180
+fixed row_h u32 = 52
+fixed list_rows u32 = 14
+
+new folder line.line           -- "" is the top of the card
+new names [200] line.line
+new is_dir [200] bool
+new sizes [200] u32
+new count u64
+new selected u64
+new list_top u64
+new disk_ok bool
+
+to lower (c u8) gives u8
+    if c >= 'A' and c <= 'Z'
+        give c + 32
+    give c
+
+to is_txt (s string) gives bool
+    if s.len < 5
+        give false
+    new e = s[s.len - 4 until s.len]
+    give e[0] is '.' and lower(e[1]) is 't' and lower(e[2]) is 'x' and lower(e[3]) is 't'
+
+to same (a string, b string) gives bool
+    if a.len is not b.len
+        give false
+    for each i in 0 until a.len
+        if a[i] is not b[i]
+            give false
+    give true
+
+-- Read the folder: subfolders first, then .txt files (hidden ones left out).
+to load_folder
+    count = 0
+    selected = 0
+    list_top = 0
+    new entry [176] u8
+    disk_ok = true
+    for each pass in 0 until 2 as u64
+        new index u64 = 0
+        repeat
+            new r = sys.dir(line.text(addr of folder), index, addr of entry[0], 176)
+            if r < 0
+                if index is 0
+                    disk_ok = false
+                stop
+            if r is 0
+                stop
+            index += 1
+            new words = (addr of entry[0]) as ptr u32
+            new length = deref ((addr of entry[8]) as ptr u64)
+            new name string
+            name.ptr = addr of entry[16]
+            name.len = length
+            new dir = words[0] & sys.attr_dir is not 0
+            if name.len is 0 or name[0] is '.' or same(name, "System Volume Information")
+                skip
+            if (pass is 0 and not dir) or (pass is 1 and (dir or not is_txt(name)))
+                skip
+            if count < max_entries
+                line.clear(addr of names[count])
+                line.add(addr of names[count], name)
+                is_dir[count] = dir
+                sizes[count] = words[1]
+                count += 1
+
+to size_text (bytes u64, into ptr line.line)
+    if bytes < 1024
+        line.number(into, bytes)
+        line.add(into, " B")
+    else if bytes < 1024 * 1024
+        line.number(into, bytes / 1024)
+        line.byte(into, '.')
+        line.number(into, (bytes % 1024) * 10 / 1024)
+        line.add(into, " KB")
+    else
+        line.number(into, bytes / (1024 * 1024))
+        line.byte(into, '.')
+        line.number(into, (bytes % (1024 * 1024)) * 10 / (1024 * 1024))
+        line.add(into, " MB")
+
+to folder_icon (x u32, y u32, color u32)
+    gfx.round_rect(x, y + 4, 14, 8, 3, color)
+    gfx.round_rect(x, y + 8, 30, 22, 4, color)
+
+to file_icon (x u32, y u32, color u32, back u32)
+    gfx.round_rect(x + 3, y, 24, 30, 4, color)
+    gfx.round_rect(x + 6, y + 3, 18, 24, 2, back)
+    for each k in 0 until 3 as u32
+        gfx.fill(x + 9, y + 9 + k * 6, 12, 2, color)
+
+to draw_title (title string, sub string)
+    gfx.fill(0, 0, gfx.width, list_y - 20, bg)
+    new x = gfx.text(margin, 56, title, gfx.large, amber)
+    gfx.text(x + 28, 72, sub, gfx.regular, muted)
+    gfx.fill(margin, 140, gfx.width - margin * 2, 2, edge)
+
+to key_cap (x u32, y u32, label string) gives u32
+    new w = gfx.text_width(label, gfx.small) + 28
+    gfx.round_rect(x, y, w, 40, 10, edge)
+    gfx.round_rect(x + 2, y + 2, w - 4, 36, 8, slot)
+    gfx.text(x + 14, y + 6, label, gfx.small, putty)
+    give x + w
+
+to hint (x u32, label string, what string) gives u32
+    new past = key_cap(x, footer_y, label)
+    give gfx.text(past + 14, footer_y + 6, what, gfx.small, muted) + 40
+
+to draw_list
+    new sub line.line
+    line.add(addr of sub, "SD card /")
+    line.add(addr of sub, line.text(addr of folder))
+    draw_title("Text", line.text(addr of sub))
+    gfx.fill(0, list_y - 20, gfx.width, footer_y - list_y + 20, bg)
+    if not disk_ok
+        gfx.text(margin, list_y + 20, "No file system found on the SD card.", gfx.regular, deep)
+    else if count is 0
+        gfx.text(margin, list_y + 20, "No folders or .txt files here.", gfx.regular, muted)
+    if selected < list_top
+        list_top = selected
+    if selected >= list_top + list_rows as u64
+        list_top = selected + 1 - list_rows as u64
+    for each r in 0 until list_rows as u64
+        new i = list_top + r
+        if i >= count
+            stop
+        new y = list_y + (r as u32) * row_h
+        new lit = i is selected
+        new back = bg
+        if lit
+            back = slot_lit
+            gfx.round_rect(margin - 20, y, gfx.width - margin * 2 + 40, row_h - 6, 12, slot_lit)
+            gfx.round_rect(margin - 20, y + 10, 5, row_h - 26, 2, amber)
+        new ink = muted
+        if lit
+            ink = amber
+        if is_dir[i]
+            folder_icon(margin + 4, y + 8, ink)
+        else
+            file_icon(margin + 4, y + 8, ink, back)
+        new name_color = putty
+        new style = gfx.regular
+        if lit
+            name_color = amber
+            style = gfx.bold
+        new nx = gfx.text(margin + 60, y + 9, line.text(addr of names[i]), style, name_color)
+        if is_dir[i]
+            gfx.text(nx, y + 9, "/", style, name_color)
+        else
+            new s line.line
+            size_text(sizes[i] as u64, addr of s)
+            new t = line.text(addr of s)
+            gfx.text(gfx.width - margin - gfx.text_width(t, gfx.small), y + 11, t, gfx.small, muted)
+    if count > list_rows as u64
+        new l line.line
+        line.number(addr of l, selected + 1)
+        line.add(addr of l, " of ")
+        line.number(addr of l, count)
+        new t = line.text(addr of l)
+        gfx.text(gfx.width - margin - gfx.text_width(t, gfx.small), 76, t, gfx.small, dim)
+    gfx.fill(0, footer_y - 20, gfx.width, gfx.height - footer_y + 20, bg)
+    new x = hint(margin, "Up/Down", "choose")
+    x = hint(x, "Enter", "open")
+    x = hint(x, "Backspace", "up a folder")
+    hint(x, "q", "back to the launcher")
+    gfx.present_all()
+
+to child_path (i u64, into ptr line.line)
+    line.clear(into)
+    line.add(into, line.text(addr of folder))
+    if folder.len > 0
+        line.byte(into, '/')
+    line.add(into, line.text(addr of names[i]))
+
+to go_up gives bool
+    if folder.len is 0
+        give false
+    new cut u64 = 0
+    for each i in 0 until folder.len
+        if folder.bytes[i] is '/'
+            cut = i
+    folder.len = cut
+    load_folder()
+    give true
+
+-- The list: gives false when it is time to leave the app.
+to browse gives bool
+    draw_list()
+    repeat
+        new k = keys.next()
+        if k is keys.down or k is 'j' as u32
+            if selected + 1 < count
+                selected += 1
+                draw_list()
+        else if k is keys.up or k is 'k' as u32
+            if selected > 0
+                selected -= 1
+                draw_list()
+        else if k is keys.home
+            selected = 0
+            draw_list()
+        else if k is keys.finish and count > 0
+            selected = count - 1
+            draw_list()
+        else if k is keys.enter or k is keys.right
+            if selected < count
+                new p line.line
+                child_path(selected, addr of p)
+                if is_dir[selected]
+                    line.clear(addr of folder)
+                    line.add(addr of folder, line.text(addr of p))
+                    load_folder()
+                else
+                    read(addr of p, sizes[selected] as u64)
+                draw_list()
+        else if k is keys.backspace or k is keys.left
+            if go_up()
+                draw_list()
+        else if k is 'q' as u32 or k is keys.escape
+            give false
+
+-- ---------------------------------------------------------------- reading
+
+fixed body_y u32 = 176
+fixed line_h u32 = 34
+fixed max_file u64 = 0x200_0000        -- 32 MB
+
+new file ptr u8
+new file_size u64
+new starts ptr vec.vec         -- where each screen line begins
+new top u64
+new rows u64
+new cols u64
+
+-- Break the file into screen lines: at line ends, and at the last space before
+-- the right edge (or anywhere, for a word longer than a line).
+to wrap
+    starts = vec.make()
+    vec.push(starts, 0)
+    new col u64 = 0
+    new line_start u64 = 0
+    new last_space u64 = 0
+    new have_space = false
+    for each i in 0 until file_size
+        new c = file[i]
+        if c is '\n'
+            vec.push(starts, i + 1)
+            line_start = i + 1
+            col = 0
+            have_space = false
+            skip
+        if c is '\r'
+            skip
+        if c is ' ' or c is '\t'
+            last_space = i
+            have_space = true
+        col += 1
+        if col > cols
+            new next = i
+            if have_space and last_space >= line_start
+                next = last_space + 1
+            vec.push(starts, next)
+            line_start = next
+            col = i + 1 - next
+            have_space = false
+    if starts.len > 1 and vec.last(starts) >= file_size
+        vec.pop(starts)
+
+to line_count gives u64
+    give starts.len
+
+-- Screen line `n` as display text (tabs as spaces, other control bytes as '?').
+to screen_line (n u64, into ptr line.line)
+    line.clear(into)
+    new a = vec.get(starts, n)
+    new b = file_size
+    if n + 1 < starts.len
+        b = vec.get(starts, n + 1)
+    for each i in a until b
+        new c = file[i]
+        if c is '\n' or c is '\r'
+            skip
+        if c is '\t'
+            c = ' '
+        if c < 32 or c >= 127
+            c = '?'
+        line.byte(into, c)
+
+to draw_page (name string)
+    -- header: the name, where we are, a progress bar
+    draw_title(name, "")
+    new last = top + rows
+    if last > line_count()
+        last = line_count()
+    new l line.line
+    line.add(addr of l, "lines ")
+    line.number(addr of l, top + 1)
+    line.byte(addr of l, '-')
+    line.number(addr of l, last)
+    line.add(addr of l, " of ")
+    line.number(addr of l, line_count())
+    new t = line.text(addr of l)
+    gfx.text(gfx.width - margin - gfx.text_width(t, gfx.small), 76, t, gfx.small, muted)
+    new bar_w = gfx.width - margin * 2
+    new done = bar_w
+    if line_count() > 0
+        done = ((bar_w as u64) * last / line_count()) as u32
+    gfx.fill(margin, 140, done, 2, amber)
+    -- the text
+    gfx.fill(0, body_y - 20, gfx.width, footer_y - body_y, bg)
+    for each r in 0 until rows
+        new n = top + r
+        if n >= line_count()
+            stop
+        new s line.line
+        screen_line(n, addr of s)
+        gfx.text(margin, body_y + (r as u32) * line_h, line.text(addr of s), gfx.regular, putty)
+    -- the scroll bar
+    new track_x = gfx.width - margin + 40
+    new track_h = (rows as u32) * line_h
+    gfx.round_rect(track_x, body_y, 8, track_h, 4, slot)
+    if line_count() > rows
+        new thumb = ((track_h as u64) * rows / line_count()) as u32
+        if thumb < 40
+            thumb = 40
+        new travel = track_h - thumb
+        new offset = ((travel as u64) * top / (line_count() - rows)) as u32
+        gfx.round_rect(track_x, body_y + offset, 8, thumb, 4, amber)
+    else
+        gfx.round_rect(track_x, body_y, 8, track_h, 4, dim)
+    -- keys
+    gfx.fill(0, footer_y - 20, gfx.width, gfx.height - footer_y + 20, bg)
+    new x = hint(margin, "Up/Down", "line")
+    x = hint(x, "Space/b", "page")
+    x = hint(x, "g/G", "start/end")
+    hint(x, "q", "back to the list")
+    gfx.present_all()
+
+to load (path ptr line.line, size u64) gives bool
+    if size > max_file
+        size = max_file
+    file = mem.alloc(size + 1)
+    file_size = 0
+    while file_size < size
+        new want = size - file_size
+        if want > 0x10_0000
+            want = 0x10_0000
+        new n = sys.read(line.text(path), file_size, file + file_size, want)
+        if n <= 0
+            stop
+        file_size += n as u64
+    give true
+
+to read (path ptr line.line, size u64)
+    if not load(path, size)
+        give
+    cols = ((gfx.width - margin * 2) / gfx.advance(gfx.regular)) as u64
+    rows = ((footer_y - 40 - body_y) / line_h) as u64
+    wrap()
+    top = 0
+    new name string
+    name = line.text(path)
+    new cut u64 = 0
+    for each i in 0 until name.len
+        if name[i] is '/'
+            cut = i + 1
+    name = name[cut until name.len]
+    draw_page(name)
+    repeat
+        new k = keys.next()
+        new before = top
+        new end_top u64 = 0
+        if line_count() > rows
+            end_top = line_count() - rows
+        if k is keys.down or k is 'j' as u32 or k is keys.enter
+            top += 1
+        else if k is keys.up or k is 'k' as u32
+            if top > 0
+                top -= 1
+        else if k is keys.page_down or k is ' ' as u32 or k is keys.right
+            top += rows
+        else if k is keys.page_up or k is 'b' as u32 or k is keys.left
+            if top > rows
+                top -= rows
+            else
+                top = 0
+        else if k is keys.home or k is 'g' as u32
+            top = 0
+        else if k is keys.finish or k is 'G' as u32
+            top = end_top
+        else if k is 'q' as u32 or k is keys.escape or k is keys.backspace
+            give
+        if top > end_top
+            top = end_top
+        if top is not before
+            draw_page(name)
+
+-- ---------------------------------------------------------------- start
+
+to main gives u64
+    if not gfx.open()
+        sys.print("text: no screen\n")
+        give 1
+    load_folder()
+    while browse()
+        skip
+    give 0

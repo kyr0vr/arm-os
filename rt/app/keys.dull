@@ -1,0 +1,83 @@
+-- Keys for apps, with the escape sequences a serial terminal sends for arrows and
+-- paging keys turned into single codes. (A USB keyboard will arrive the same way.)
+
+use sys
+
+fixed enter u32 = 13
+fixed backspace u32 = 8
+fixed tab u32 = 9
+fixed escape u32 = 27
+fixed up u32 = 0x101
+fixed down u32 = 0x102
+fixed right u32 = 0x103
+fixed left u32 = 0x104
+fixed home u32 = 0x105
+fixed finish u32 = 0x106             -- End
+fixed page_up u32 = 0x107
+fixed page_down u32 = 0x108
+fixed delete u32 = 0x109
+
+fixed timeout u32 = 0x1FF            -- `within` ran out of time
+fixed none u64 = 256                 -- what the kernel's timed wait gives then
+
+to key_within (ms u64) gives u64
+    give sys.call(18, ms, 0, 0, 0, 0)
+
+-- Wait for the next key.
+to next gives u32
+    give decode(sys.key() as u32)
+
+-- Wait at most `ms` for a key (`timeout` if none came).
+to within (ms u64) gives u32
+    new k = key_within(ms)
+    if k is none
+        give timeout
+    give decode(k as u32)
+
+to decode (k u32) gives u32
+    if k is '\r' as u32 or k is '\n' as u32
+        give enter
+    if k is 127
+        give backspace
+    if k is not escape
+        give k
+    give after_escape()
+
+-- ESC alone, or the start of ESC [ ... / ESC O ...
+to after_escape gives u32
+    new k2 = key_within(60)
+    if k2 is none
+        give escape
+    if k2 is not '[' as u64 and k2 is not 'O' as u64
+        give escape
+    new k3 = sys.key() as u32
+    if k3 is 'A' as u32
+        give up
+    if k3 is 'B' as u32
+        give down
+    if k3 is 'C' as u32
+        give right
+    if k3 is 'D' as u32
+        give left
+    if k3 is 'H' as u32
+        give home
+    if k3 is 'F' as u32
+        give finish
+    if k3 >= '0' as u32 and k3 <= '9' as u32
+        new code = k3 - '0' as u32
+        repeat                       -- ESC [ <number> ~
+            new k4 = sys.key() as u32
+            if k4 < '0' as u32 or k4 > '9' as u32
+                stop
+            code = code * 10 + (k4 - '0' as u32)
+        if code is 1 or code is 7
+            give home
+        if code is 4 or code is 8
+            give finish
+        if code is 3
+            give delete
+        if code is 5
+            give page_up
+        if code is 6
+            give page_down
+    give escape

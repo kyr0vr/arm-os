@@ -10,6 +10,7 @@ use line
 use fat
 use board
 use timer
+use gui
 
 fixed call_exit u64 = 0
 fixed call_write u64 = 1
@@ -29,6 +30,11 @@ fixed call_reboot u64 = 14
 fixed call_args u64 = 15
 fixed call_grow u64 = 16
 fixed call_procs u64 = 17
+fixed call_key_within u64 = 18
+fixed call_surface u64 = 19
+fixed call_text u64 = 20
+fixed call_present u64 = 21
+fixed call_font u64 = 22
 
 fixed bad u64 = 0xFFFF_FFFF_FFFF_FFFF      -- -1
 fixed no_folder u64 = 0xFFFF_FFFF_FFFF_FFFE  -- -2
@@ -77,6 +83,8 @@ to handle (frame ptr u64) gives ptr u64
         give proc.yield(frame)
     if n is call_wait
         give proc.wait(frame, a as u32)
+    if n is call_key_within
+        give proc.read_key_within(frame, a)
     frame[0] = answer(n, a, b, c, d, e)
     new s = proc.me().state
     if s is proc.unused or s is proc.finished              -- it stopped itself
@@ -105,7 +113,7 @@ to answer (n u64, a u64, b u64, c u64, d u64, e u64) gives u64
         new parent = proc.me().pid
         if e is not 0
             parent = 0
-        give proc.spawn(line.text(addr of name), line.text(addr of args), parent) as u64
+        give proc.spawn(line.text(addr of name), line.text(addr of args), parent, e is 0) as u64
     if n is call_kill
         if proc.kill(a as u32)
             give 1
@@ -128,6 +136,19 @@ to answer (n u64, a u64, b u64, c u64, d u64, e u64) gives u64
         give put_line(addr of proc.me().args, a, b)
     if n is call_grow
         give proc.grow(a)
+    if n is call_surface
+        if not ok(a, 8)
+            give 0
+        give gui.make_surface(a as ptr u32)
+    if n is call_text
+        if not ok(b, c)
+            give bad
+        give gui.draw_text(a, b as ptr u8, c, d as u32, e as u8) as u64
+    if n is call_present
+        gui.present(a, b)
+        give 0
+    if n is call_font
+        give gui.font_size(a as u8)
     if n is call_procs
         if a >= proc.slots
             give bad

@@ -63,6 +63,9 @@ shape process
     user_pages u64
     exit_code  u64
     ticks      u64
+    key_timeout bool                   -- waiting for a key, but only until wake_at
+    surface    u64                     -- physical address of its screen surface, 0 if none
+    rank       u64                     -- foreground order: the highest live one is in front
     name       line.line
     args       line.line
 
@@ -73,6 +76,8 @@ new next_pid u32
 new running bool
 new slice_used u64
 new switches u64
+new ranks u64
+new front_changed bool                 -- kernel/gui.dull should look again at what is in front
 
 -- Keys typed but not yet read.
 new keys [1024] u8
@@ -114,6 +119,18 @@ to add_page (p ptr process, va u64) gives u64
     l3[(va >> 12) & 511] = user_page_entry(page as u64)
     p.user_pages += 1
     give page as u64
+
+-- Map the existing physical page `pa` at `va` (it is freed with the process).
+to map_page (p ptr process, va u64, pa u64) gives bool
+    new l2 = p.l2 as ptr u64
+    new i2 = (va >> 21) & 511
+    if l2[i2] is 0
+        new t = pages.alloc() else give false
+        l2[i2] = (t as u64) | table_bits
+    new l3 = (l2[i2] & address_mask) as ptr u64
+    l3[(va >> 12) & 511] = user_page_entry(pa)
+    p.user_pages += 1
+    give true
 
 -- Is all of [va, va + size) mapped for the process?
 to mapped (p ptr process, va u64, size u64) gives bool
@@ -229,8 +246,9 @@ to short_name (path string, into ptr line.line)
 fixed max_file u64 = 0x40_0000        -- 4 MB
 
 -- Start the program `name` (a built-in app, or a file on the SD card) with `args`.
--- Gives its pid, or 0 if it could not start.
-to spawn (name string, args string, parent u32) gives u32
+-- A foreground app goes in front of the screen. Gives its pid, or 0 if it could not
+-- start.
+to spawn (name string, args string, parent u32, foreground bool) gives u32
     new slot u64 = 0
     for each i in 1 until slots
         if table[i].state is unused
@@ -265,6 +283,13 @@ to spawn (name string, args string, parent u32) gives u32
     p.wait_for = 0
     p.ticks = 0
     p.exit_code = 0
+    p.key_timeout = false
+    p.surface = 0
+    p.rank = 0
+    if foreground
+        ranks += 1
+        p.rank = ranks
+        front_changed = true
     short_name(name, addr of p.name)
     line.clear(addr of p.args)
     line.add(addr of p.args, args)
@@ -307,7 +332,7 @@ to start (first string)
     f[spsr] = 5                        -- EL1 on its own stack, interrupts on
     idle.frame = f
     active_l1 = mmu.l1
-    if spawn(first, "", 0) is 0
+    if spawn(first, "", 0, true) is 0
         tty.say("could not start the first app\n", tty.deep)
         board.idle()
     running = true
@@ -341,16 +366,20 @@ to tick (frame ptr u64) gives ptr u64
     if current is not 0
         table[current].ticks += 1
     repeat
-        new k = board.poll_key() else stop
+        new k = board.poll_key(keys_count is 0 and someone_wants_key()) else stop
         if keys_count < 1024
             keys[(keys_head + keys_count) % 1024] = k
             keys_count += 1
-    deliver_keys()
+        deliver_keys()
     new now = timer.now()
     for each i in 1 until slots
         if table[i].state is asleep and now >= table[i].wake_at
             table[i].state = ready
             table[i].frame[0] = 0
+        if table[i].state is wants_key and table[i].key_timeout and now >= table[i].wake_at
+            table[i].state = ready
+            table[i].key_timeout = false
+            table[i].frame[0] = no_key
     if board.input_ended()
         check_finished()
     slice_used += 1
@@ -370,6 +399,13 @@ to deliver_keys
             give
         table[who].frame[0] = take_key() as u64
         table[who].state = ready
+        table[who].key_timeout = false
+
+to someone_wants_key gives bool
+    for each i in 1 until slots
+        if table[i].state is wants_key
+            give true
+    give false
 
 to take_key gives u8
     new k = keys[keys_head]
@@ -392,12 +428,28 @@ to check_finished
 to me gives ptr process
     give addr of table[current]
 
+fixed no_key u64 = 256                 -- what a key wait with a time limit gives at the limit
+
 -- Wait for a key (the answer goes in x0).
 to read_key (frame ptr u64) gives ptr u64
     if keys_count > 0
         frame[0] = take_key() as u64
         give frame
     table[current].state = wants_key
+    table[current].key_timeout = false
+    give park()
+
+-- Wait at most `ms` for a key (no_key if none came).
+to read_key_within (frame ptr u64, ms u64) gives ptr u64
+    if keys_count > 0
+        frame[0] = take_key() as u64
+        give frame
+    if ms is 0
+        frame[0] = no_key
+        give frame
+    table[current].state = wants_key
+    table[current].key_timeout = true
+    table[current].wake_at = timer.now() + ms * timer.frequency() / 1000
     give park()
 
 to sleep (frame ptr u64, ms u64) gives ptr u64
@@ -445,6 +497,8 @@ to finish (slot u64, code u64)
     free_space(p)
     p.exit_code = code
     p.state = finished
+    p.surface = 0
+    front_changed = true
     -- its children no longer have anyone to report to
     for each i in 1 until slots
         if table[i].state is not unused and table[i].parent is p.pid
@@ -463,7 +517,7 @@ to finish (slot u64, code u64)
     for each i in 1 until slots
         if table[i].state is not unused
             give
-    spawn("shell", "", 0)
+    spawn("launcher", "", 0, true)
 
 to exit (code u64) gives ptr u64
     finish(current, code)

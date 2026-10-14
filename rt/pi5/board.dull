@@ -86,7 +86,7 @@ to cpu_mhz gives u64
 -- kernel) reboots into the loader instead.
 new matched u64
 
-to poll_key gives maybe u8
+to poll_key (wanted bool) gives maybe u8
     new word [4] u8 = ['A', 'R', 'M', 'R']
     new b = io.try_get() else give nothing
     if b is word[matched]

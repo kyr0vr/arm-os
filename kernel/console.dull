@@ -14,6 +14,11 @@ new rows u32
 new cx u32
 new cy u32
 new active bool
+new hidden bool                -- an app's surface is in front: draw, but do not show
+
+to show (x u32, y u32, w u32, h u32)
+    if not hidden
+        text.present(canvas, screen, x, y, w, h)
 
 to start (c ptr text.canvas, s ptr fb.screen)
     canvas = c
@@ -25,7 +30,7 @@ to start (c ptr text.canvas, s ptr fb.screen)
     active = true
     text.fill(c, 0, 0, c.width, c.height, fetch.bg)
     draw_cursor(true)
-    text.present_all(c, s)
+    show(0, 0, c.width, c.height)
 
 to cell_x (col u32) gives u32
     give margin + col * fetch.cw
@@ -34,7 +39,7 @@ to cell_y (row u32) gives u32
     give margin + row * fetch.lh
 
 to show_cell (col u32, row u32)
-    text.present(canvas, screen, cell_x(col), cell_y(row), fetch.cw, fetch.lh)
+    show(cell_x(col), cell_y(row), fetch.cw, fetch.lh)
 
 to draw_cursor (visible bool)
     new color = fetch.bg
@@ -57,7 +62,7 @@ to scroll
         for each x in 0 until canvas.width
             dst[x] = src[x]
     text.fill(canvas, 0, bottom - fetch.lh, canvas.width, fetch.lh, fetch.bg)
-    text.present(canvas, screen, 0, top, canvas.width, bottom - top)
+    show(0, top, canvas.width, bottom - top)
 
 to newline
     cx = 0

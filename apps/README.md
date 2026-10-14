@@ -8,6 +8,8 @@ started by its path too (`apps/hello.app`, or just `apps/hello`).
 
 | App | What it does |
 |---|---|
+| `launcher` | The first app: Text, Music, Video and Console tiles |
+| `text` | The text reader: folders and .txt files on the SD card, word-wrapped |
 | `shell` | The shell: reads keys, runs its own commands, starts other apps |
 | `hello` | Says hello, prints its arguments, checks 3 MB of heap |
 | `spin` | `spin <name> <rounds>`: keeps the CPU busy, to show apps taking turns |
@@ -29,6 +31,13 @@ to main gives u64
 `rt/app/sys.dull` wraps every system call (the terminal, keys, time, files on the
 SD card, starting and waiting for apps, more memory). `rt/app/mem.dull` provides
 `mem.alloc`, so `lib/` (vec, buf, map, line, text) works in apps.
+
+Graphical apps use `rt/app/gfx.dull`: `gfx.open()` gets a screen-sized surface, the
+app draws rectangles, rounded rectangles, discs, triangles and quads into it itself
+(anti-aliased), text is drawn by the kernel in ArmOS Mono (25 px, bold, 22 px small,
+46 px large), and `gfx.present` shows a finished area. The app started last is in
+front; when it ends, whatever was under it comes back. `rt/app/keys.dull` turns the
+escape sequences of arrow and paging keys into single codes.
 
 ## The image
 
@@ -52,3 +61,6 @@ the app's memory ends (with `.bss`) and its entry point. Apps are linked at
 | 6 | info(kind, buffer, cap) | 15 | args(buffer, cap) |
 | 7 | spawn(name, args, background) | 16 | grow(bytes) - more heap |
 | 8 | wait(pid) - waits | 17 | process(index, buffer, cap) |
+| 18 | key_within(ms) | 19 | surface(size) - the app's screen surface |
+| 20 | text(x \| y << 16, text, length, color, style) | 21 | present(x \| y << 32, w \| h << 32) |
+| 22 | font(style) - advance \| height << 32 | | |

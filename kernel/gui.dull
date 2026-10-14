@@ -1,0 +1,127 @@
+-- The compositor: which app is on the screen.
+--
+-- A graphical app asks for a surface: a screen-sized picture in its own memory
+-- (physically one block, so the kernel can copy it at any time). It draws into it,
+-- with text drawn by the kernel (`draw_text`, so every app shares one font), and
+-- says when a part is ready (`present`). The foreground app is in front: the most
+-- recently started one that is still running. When it ends, the one under it comes
+-- back - another app's surface, or the text console.
+
+use proc
+use text
+use tty
+use console
+use pages
+
+fixed surface_va u64 = 0x40_3000_0000  -- where an app sees its surface
+
+new shown u64                          -- physical address of the surface on screen (0: the console)
+new fresh u64                          -- a new surface: its app will present it itself
+
+-- The slot of the foreground app (0 if none).
+to front gives u64
+    new best u64 = 0
+    new best_rank u64 = 0
+    for each i in 1 until proc.slots
+        new s = proc.table[i].state
+        if s is not proc.unused and s is not proc.finished and proc.table[i].rank > best_rank
+            best_rank = proc.table[i].rank
+            best = i
+    give best
+
+to canvas_of (pa u64, c ptr text.canvas)
+    c.pixels = pa as ptr u32
+    c.width = tty.screen.width
+    c.height = tty.screen.height
+
+-- After every system call and tick: bring the right thing to the front.
+to settle (frame ptr u64) gives ptr u64
+    if proc.front_changed
+        proc.front_changed = false
+        show_front()
+    give frame
+
+to show_front
+    if not tty.has_screen
+        give
+    new i = front()
+    new want u64 = 0
+    if i is not 0
+        want = proc.table[i].surface
+    if want is shown
+        give
+    shown = want
+    if want is not 0
+        console.hidden = true
+        if want is not fresh
+            new c text.canvas
+            canvas_of(want, addr of c)
+            text.present_all(addr of c, tty.screen)
+        fresh = 0
+    else
+        console.hidden = false
+        if console.active
+            text.present_all(tty.canvas, tty.screen)
+        else
+            console.start(tty.canvas, tty.screen)
+
+-- The calling app's surface: writes its width and height to `size`, gives the
+-- address it is mapped at (0 if there is no screen or no memory).
+to make_surface (size ptr u32) gives u64
+    new p = proc.me()
+    if not tty.has_screen
+        give 0
+    size[0] = tty.screen.width
+    size[1] = tty.screen.height
+    if p.surface is not 0
+        give surface_va
+    new bytes = (tty.screen.width as u64) * (tty.screen.height as u64) * 4
+    new count = (bytes + 4095) / 4096
+    new block = pages.alloc_run(count) else give 0
+    for each k in 0 until count
+        if not proc.map_page(p, surface_va + k * 4096, block as u64 + k * 4096)
+            give 0
+    p.surface = block as u64
+    fresh = p.surface
+    proc.front_changed = true
+    give surface_va
+
+-- Text in ArmOS Mono on the calling app's surface, at x = xy & 0xFFFF, y = xy >> 16.
+-- Gives the x just after it.
+to draw_text (xy u64, bytes ptr u8, count u64, color u32, style u8) gives u32
+    new p = proc.me()
+    new x = (xy & 0xFFFF) as u32
+    if p.surface is 0
+        give x
+    new y = ((xy >> 16) & 0xFFFF) as u32
+    if style > text.large
+        style = text.regular
+    new c text.canvas
+    canvas_of(p.surface, addr of c)
+    new advance = text.advance_of(style)
+    for each i in 0 until count
+        new ch = bytes[i]
+        if ch is not ' '
+            text.glyph(addr of c, x, y, ch, style, color)
+        x += advance
+    give x
+
+-- Copy part of the calling app's surface to the screen, if it is in front.
+-- a = x | y << 32, b = width | height << 32.
+to present (a u64, b u64)
+    new p = proc.me()
+    if p.surface is 0 or p.surface is not shown
+        give
+    new c text.canvas
+    canvas_of(p.surface, addr of c)
+    new x = (a & 0xFFFF_FFFF) as u32
+    new y = (a >> 32) as u32
+    new w = (b & 0xFFFF_FFFF) as u32
+    new h = (b >> 32) as u32
+    text.present(addr of c, tty.screen, x, y, w, h)
+
+-- A font style's character width and line height: advance | height << 32.
+to font_size (style u8) gives u64
+    if style > text.large
+        style = text.regular
+    give (text.advance_of(style) as u64) | ((text.height_of(style) as u64) << 32)

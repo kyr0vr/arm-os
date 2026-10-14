@@ -1,0 +1,273 @@
+-- Drawing for graphical apps. `open` asks the kernel for a screen-sized surface;
+-- shapes are drawn here, straight into it (anti-aliased by sampling each edge pixel
+-- 4 x 4 times), text is drawn by the kernel in ArmOS Mono, and `present` puts a
+-- finished area on the screen.
+
+use sys
+
+fixed regular u8 = 0           -- 25 px
+fixed bold u8 = 1              -- 25 px bold
+fixed small u8 = 2             -- 22 px
+fixed large u8 = 3             -- 46 px bold, for titles
+
+new pixels ptr u32
+new width u32
+new height u32
+new advances [4] u32
+new heights [4] u32
+
+to open gives bool
+    new size [2] u32
+    new va = sys.call(19, (addr of size[0]) as u64, 0, 0, 0, 0)
+    if va is 0
+        give false
+    pixels = va as ptr u32
+    width = size[0]
+    height = size[1]
+    for each s in 0 until 4 as u64
+        new m = sys.call(22, s, 0, 0, 0, 0)
+        advances[s] = (m & 0xFFFF_FFFF) as u32
+        heights[s] = (m >> 32) as u32
+    give true
+
+-- ---------------------------------------------------------------- colors
+
+to rgb (r u32, g u32, b u32) gives u32
+    give (r << 16) | (g << 8) | b
+
+-- `a` over `b` by t/255.
+to mix (a u32, b u32, t u32) gives u32
+    new r = (((a >> 16) & 0xFF) * t + ((b >> 16) & 0xFF) * (255 - t)) / 255
+    new g = (((a >> 8) & 0xFF) * t + ((b >> 8) & 0xFF) * (255 - t)) / 255
+    new bl = ((a & 0xFF) * t + (b & 0xFF) * (255 - t)) / 255
+    give rgb(r, g, bl)
+
+to blend (x u32, y u32, color u32, t u32)
+    if x >= width or y >= height or t is 0
+        give
+    new i = (y as u64) * (width as u64) + (x as u64)
+    if t >= 255
+        pixels[i] = color
+    else
+        pixels[i] = mix(color, pixels[i], t)
+
+-- ---------------------------------------------------------------- rectangles
+
+to fill (x u32, y u32, w u32, h u32, color u32)
+    if x >= width or y >= height
+        give
+    new x1 = x + w
+    if x1 > width
+        x1 = width
+    new y1 = y + h
+    if y1 > height
+        y1 = height
+    for each row in y until y1
+        new line = pixels + (row as u64) * (width as u64)
+        for each col in x until x1
+            line[col] = color
+
+to outline (x u32, y u32, w u32, h u32, t u32, color u32)
+    fill(x, y, w, t, color)
+    fill(x, y + h - t, w, t, color)
+    fill(x, y, t, h, color)
+    fill(x + w - t, y, t, h, color)
+
+-- Coverage (0-16) of pixel (px, py) by a circle at (cx, cy) with radius r, all in
+-- quarter pixels.
+to circle_cover (px i64, py i64, cx i64, cy i64, r i64) gives u32
+    new hits u32 = 0
+    for each sy in 0 until 4 as i64
+        for each sx in 0 until 4 as i64
+            new dx = px * 4 + sx - cx
+            new dy = py * 4 + sy - cy
+            if dx * dx + dy * dy <= r * r
+                hits += 1
+    give hits
+
+-- A rectangle with corners rounded to radius r.
+to round_rect (x u32, y u32, w u32, h u32, r u32, color u32)
+    if r * 2 > w
+        r = w / 2
+    if r * 2 > h
+        r = h / 2
+    fill(x + r, y, w - r * 2, h, color)
+    fill(x, y + r, r, h - r * 2, color)
+    fill(x + w - r, y + r, r, h - r * 2, color)
+    -- the four corners: circles centred r pixels in from each corner
+    new q = (r as i64) * 4
+    for each dy in 0 until r
+        for each dx in 0 until r
+            -- top left pixel (x + dx, y + dy) against the centre (x + r, y + r)
+            new c = circle_cover(dx as i64, dy as i64, q, q, q)
+            new t = c * 255 / 16
+            blend(x + dx, y + dy, color, t)
+            blend(x + w - 1 - dx, y + dy, color, t)
+            blend(x + dx, y + h - 1 - dy, color, t)
+            blend(x + w - 1 - dx, y + h - 1 - dy, color, t)
+
+-- A rounded frame `t` pixels thick.
+to round_frame (x u32, y u32, w u32, h u32, r u32, t u32, color u32, inside u32)
+    round_rect(x, y, w, h, r, color)
+    new inner = r
+    if inner > t
+        inner = r - t
+    else
+        inner = 0
+    round_rect(x + t, y + t, w - t * 2, h - t * 2, inner, inside)
+
+-- ---------------------------------------------------------------- round shapes
+
+-- A filled circle; with `hole` > 0, a ring whose inner radius is `hole`.
+to disc (cx u32, cy u32, r u32, hole u32, color u32)
+    new R = (r as i64) * 4
+    new H = (hole as i64) * 4
+    new ccx = (cx as i64) * 4
+    new ccy = (cy as i64) * 4
+    new x0 = cx - r - 1
+    new y0 = cy - r - 1
+    for each py in y0 until cy + r + 2
+        for each px in x0 until cx + r + 2
+            new hits u32 = 0
+            for each sy in 0 until 4 as i64
+                for each sx in 0 until 4 as i64
+                    new dx = (px as i64) * 4 + sx - ccx
+                    new dy = (py as i64) * 4 + sy - ccy
+                    new d = dx * dx + dy * dy
+                    if d <= R * R and (H is 0 or d >= H * H)
+                        hits += 1
+            if hits > 0
+                blend(px, py, color, hits * 255 / 16)
+
+-- A filled triangle (corners in pixels).
+to triangle (x0 i64, y0 i64, x1 i64, y1 i64, x2 i64, y2 i64, color u32)
+    new minx = x0
+    new maxx = x0
+    new miny = y0
+    new maxy = y0
+    if x1 < minx
+        minx = x1
+    if x2 < minx
+        minx = x2
+    if x1 > maxx
+        maxx = x1
+    if x2 > maxx
+        maxx = x2
+    if y1 < miny
+        miny = y1
+    if y2 < miny
+        miny = y2
+    if y1 > maxy
+        maxy = y1
+    if y2 > maxy
+        maxy = y2
+    if minx < 0
+        minx = 0
+    if miny < 0
+        miny = 0
+    -- edge tests in quarter pixels
+    new ax = x0 * 4
+    new ay = y0 * 4
+    new bx = x1 * 4
+    new by = y1 * 4
+    new qx = x2 * 4
+    new qy = y2 * 4
+    new area = (bx - ax) * (qy - ay) - (by - ay) * (qx - ax)
+    if area is 0
+        give
+    for each py in miny until maxy + 1
+        for each px in minx until maxx + 1
+            new hits u32 = 0
+            for each sy in 0 until 4 as i64
+                for each sx in 0 until 4 as i64
+                    new sx4 = px * 4 + sx
+                    new sy4 = py * 4 + sy
+                    new e0 = (bx - ax) * (sy4 - ay) - (by - ay) * (sx4 - ax)
+                    new e1 = (qx - bx) * (sy4 - by) - (qy - by) * (sx4 - bx)
+                    new e2 = (ax - qx) * (sy4 - qy) - (ay - qy) * (sx4 - qx)
+                    if area > 0 and e0 >= 0 and e1 >= 0 and e2 >= 0
+                        hits += 1
+                    else if area < 0 and e0 <= 0 and e1 <= 0 and e2 <= 0
+                        hits += 1
+            if hits > 0
+                blend(px as u32, py as u32, color, hits * 255 / 16)
+
+-- A filled convex four-sided shape: `corners` holds x0, y0, x1, y1 ... in order
+-- around it.
+to quad (corners ptr i64, color u32)
+    new xs [4] i64
+    new ys [4] i64
+    for each k in 0 until 4 as u64
+        xs[k] = corners[k * 2] * 4
+        ys[k] = corners[k * 2 + 1] * 4
+    new minx = xs[0]
+    new maxx = xs[0]
+    new miny = ys[0]
+    new maxy = ys[0]
+    for each k in 1 until 4 as u64
+        if xs[k] < minx
+            minx = xs[k]
+        if xs[k] > maxx
+            maxx = xs[k]
+        if ys[k] < miny
+            miny = ys[k]
+        if ys[k] > maxy
+            maxy = ys[k]
+    if minx < 0
+        minx = 0
+    if miny < 0
+        miny = 0
+    for each py in miny / 4 until maxy / 4 + 1
+        for each px in minx / 4 until maxx / 4 + 1
+            new hits u32 = 0
+            for each sy in 0 until 4 as i64
+                for each sx in 0 until 4 as i64
+                    new qx = px * 4 + sx
+                    new qy = py * 4 + sy
+                    new pos = 0 as u32
+                    new neg = 0 as u32
+                    for each k in 0 until 4 as u64
+                        new n = (k + 1) % 4
+                        new e = (xs[n] - xs[k]) * (qy - ys[k]) - (ys[n] - ys[k]) * (qx - xs[k])
+                        if e >= 0
+                            pos += 1
+                        if e <= 0
+                            neg += 1
+                    if pos is 4 or neg is 4
+                        hits += 1
+            if hits > 0
+                blend(px as u32, py as u32, color, hits * 255 / 16)
+
+-- ---------------------------------------------------------------- text
+
+-- Text with its top-left corner at (x, y); gives the x just after it.
+to text (x u32, y u32, s string, style u8, color u32) gives u32
+    new xy = (x as u64) | ((y as u64) << 16)
+    give sys.call(20, xy, s.ptr as u64, s.len, color as u64, style as u64) as u32
+
+to text_width (s string, style u8) gives u32
+    give (s.len as u32) * advances[style]
+
+to advance (style u8) gives u32
+    give advances[style]
+
+to line_height (style u8) gives u32
+    give heights[style]
+
+-- Text centred on x.
+to text_centered (cx u32, y u32, s string, style u8, color u32)
+    new w = text_width(s, style)
+    new x u32 = 0
+    if cx > w / 2
+        x = cx - w / 2
+    text(x, y, s, style, color)
+
+-- ---------------------------------------------------------------- the screen
+
+to present (x u32, y u32, w u32, h u32)
+    new a = (x as u64) | ((y as u64) << 32)
+    new b = (w as u64) | ((h as u64) << 32)
+    sys.call(21, a, b, 0, 0, 0)
+
+to present_all
+    present(0, 0, width, height)

@@ -2,8 +2,8 @@
 
 Runs twice: starting at EL1 (QEMU's default) and starting at EL2 (virtualization=on,
 like the Raspberry Pi 5), so the drop to EL1 is exercised too. The kernel draws into
-a pretend screen in RAM; the second run saves it, and this script turns it into
-build/kernel_virt/boot-screen.png and shell-screen.png.
+a pretend screen in RAM; screenshots taken during the run (the boot screen, the
+launcher, the text reader, the shell) become PNGs in build/kernel_virt/.
 
 Usage: python tests/kernel_test.py [--show]
 """
@@ -78,12 +78,17 @@ def to_png(raw, png):
 DISK = os.path.join(ROOT, "build", "disk", "test.img")
 
 
+def amber_pixels(raw):
+    """How many pixels are the ArmOS amber (BGRX bytes)."""
+    return raw.count(bytes([0x1F, 0x9A, 0xFF]))
+
+
 def run(machine, label, show):
     elf, _ = toolchain.build_kernel(os.path.join(ROOT, "rt", "virt"), 0x4008_0000, OUT)
     subprocess.run([sys.executable, os.path.join(ROOT, "tests", "make_fat_image.py"), DISK,
                     "--add", "apps/hello.app", os.path.join(OUT, "apps", "hello.img")],
                    check=True, capture_output=True)
-    for n in (0, 1):
+    for n in range(8):
         p = os.path.join(OUT, f"screen{n}.raw")
         if os.path.exists(p):
             os.remove(p)
@@ -104,18 +109,29 @@ def run(machine, label, show):
     if "spin b: round 1" in out and "spin a: round 3" in out and \
             out.index("spin b: round 1") > out.index("spin a: round 3"):
         missing.append("spin a and spin b taking turns")
-    # after `exit` a new shell started and ran `uptime`
-    if out.count("Uptime: ") < 2:
-        missing.append("a new shell after exit")
     if r.returncode != 0 or missing:
         print(f"FAIL {label}: exit {r.returncode}, missing {missing}")
         if not show:
             print(out)
         return False
-    for n, name in ((0, "boot-screen.png"), (1, "shell-screen.png")):
+    shots = {0: "boot-screen.png", 2: "launcher.png", 3: "text-list.png", 4: "text-reader.png",
+             5: "text-reader-end.png", 7: "text-wrapped.png", 6: "shell-screen.png",
+             1: "back-in-launcher.png"}
+    for n, name in shots.items():
         raw = os.path.join(OUT, f"screen{n}.raw")
-        if os.path.exists(raw):
-            to_png(raw, os.path.join(OUT, name))
+        if not os.path.exists(raw):
+            print(f"FAIL {label}: no {name}")
+            return False
+        to_png(raw, os.path.join(OUT, name))
+    # the GUI screens are pictures: check they are there and differ where they must
+    pics = {n: open(os.path.join(OUT, f"screen{n}.raw"), "rb").read() for n in shots}
+    if pics[1] != pics[2] and amber_pixels(pics[1]) < 1000:
+        print(f"FAIL {label}: the launcher did not come back after the shell")
+        return False
+    for a, b in ((2, 3), (3, 4), (4, 5), (5, 7), (7, 6)):
+        if pics[a] == pics[b]:
+            print(f"FAIL {label}: {shots[a]} and {shots[b]} are the same picture")
+            return False
     print(f"ok   {label}")
     return True
 

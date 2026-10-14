@@ -1,7 +1,7 @@
 """Bake the ArmOS Mono bitmap font into kernel/font.dull.
 
 ArmOS Mono is Cascadia Mono / Cascadia Code (SIL Open Font License 1.1, see fonts/)
-rendered once at the sizes the boot screen uses. The OFL reserves the name
+rendered once at the sizes the boot screen and the apps use. The OFL reserves the name
 "Cascadia Code", so the baked version carries its own name.
 
 Each glyph is a cell `advance` pixels wide (padded to an even width) and `height`
@@ -52,6 +52,7 @@ def main():
     reg = bake("CascadiaMono.ttf", 25)
     bold = bake("CascadiaCode.ttf", 25, bold=True)
     small = bake("CascadiaMono.ttf", 22)
+    large = bake("CascadiaCode.ttf", 46, bold=True)
     assert reg[:3] == bold[:3]
     out = [
         "-- ArmOS Mono: bitmap font baked from Cascadia Mono and Cascadia Code",
@@ -66,6 +67,9 @@ def main():
         f"fixed small_advance u32 = {small[0]}   -- regular, 22 px",
         f"fixed small_height u32 = {small[1]}",
         f"fixed small_stride u64 = {small[2]}",
+        f"fixed large_advance u32 = {large[0]}   -- bold, 46 px (titles)",
+        f"fixed large_height u32 = {large[1]}",
+        f"fixed large_stride u64 = {large[2]}",
         "",
         array("regular", reg[3]),
         "",
@@ -73,12 +77,14 @@ def main():
         "",
         array("small", small[3]),
         "",
+        array("large", large[3]),
+        "",
     ]
     path = os.path.join(ROOT, "kernel", "font.dull")
     with open(path, "w", encoding="utf-8", newline="\n") as fh:
         fh.write("\n".join(out))
     print(f"wrote {path}: 25 px {reg[0]}x{reg[1]}, 22 px {small[0]}x{small[1]}, "
-          f"{len(reg[3]) + len(bold[3]) + len(small[3])} bytes of glyphs")
+          f"46 px {large[0]}x{large[1]}, {len(reg[3]) + len(bold[3]) + len(small[3]) + len(large[3])} bytes of glyphs")
 
 
 if __name__ == "__main__":
