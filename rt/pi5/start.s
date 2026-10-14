@@ -1,9 +1,9 @@
 // Boot code for the Raspberry Pi 5 (BCM2712).
-// The firmware loads kernel_2712.img at 0x80000 and starts core 0 here, usually at
-// EL2 with the MMU off. Sets up a stack and exception vectors, clears .bss and calls
-// the DULL program's `main`. `dull_trap` and CPU exceptions report over the debug UART.
-
-.equ UART_BASE_HI, 0x107d     // UART at 0x10_7d00_1000 (debug header between the HDMI ports)
+// The firmware loads kernel_2712.img (at kernel_address from config.txt) and starts
+// core 0 here, at EL2 with the MMU off. If we are not running at our link address we
+// copy ourselves there first. Then: stack, exception vectors, clear .bss, call the DULL
+// program's `main`. `dull_trap` and CPU exceptions report over the debug UART.
+// The address the firmware first started us at is left in TPIDR_EL1 for diagnostics.
 
 .section .text.boot, "ax"
 .global _start
@@ -12,6 +12,25 @@ _start:
     tst     x0, #0xffff               // core 0 only (Aff0 and Aff1 both 0)
     b.ne    park
 
+    // Everything here is position independent, so it works wherever we were started.
+    adr     x0, _start                // where we are running
+    msr     tpidr_el1, x0
+    ldr     x1, link_start            // where we were linked to run
+    cmp     x0, x1
+    b.eq    relocated
+    ldr     x3, link_bss
+    sub     x3, x3, x1                // image size: code + data, a multiple of 16
+10: ldp     x6, x7, [x0], #16
+    stp     x6, x7, [x1], #16
+    subs    x3, x3, #16
+    b.hi    10b
+    dsb     sy
+    ic      iallu
+    dsb     sy
+    isb
+    ldr     x3, link_relocated
+    br      x3                        // continue in the copy
+relocated:
     adrp    x0, __stack_top
     add     x0, x0, :lo12:__stack_top
     mov     sp, x0
@@ -39,6 +58,11 @@ _start:
 park:
     wfe
     b       park
+
+.balign 8                             // literal loads must be aligned: MMU off means no unaligned access
+link_start:     .xword _start
+link_bss:       .xword __bss_start
+link_relocated: .xword relocated
 
 // uart_puts(x0 = NUL-terminated string). Clobbers x0-x3.
 uart_puts:

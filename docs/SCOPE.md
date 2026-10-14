@@ -5,7 +5,7 @@ Raspberry Pi 5, built from the ground up: our own language, compiler, assembler,
 linker, kernel, drivers, file system, codecs and GUI. No borrowed toolchain in the
 final product.
 
-Status: **draft v0** (2026-10-08). Phases 0 and 1 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
+Status: **draft v0** (2026-10-08). Phases 0, 1 and 3 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
 
 ---
 
@@ -66,6 +66,8 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
   - The mailbox is at `0x10_7c01_3880`. The firmware **ignores the depth tag** and uses `framebuffer_depth` from `config.txt` (default 16); set it to 32.
   - Pixel order 0 means blue is the first byte in memory, so a pixel reads as `0x00RRGGBB`.
   - The firmware only offers a screen if it saw a monitor at boot; `hdmi_force_hotplug=1` drives HDMI regardless.
+  - (Phase 3) The firmware **starts the image at `0x80000` whatever `kernel_address` says**, although its log reports the requested address. The boot code copies itself to its link address when the two differ.
+  - (Phase 3) Rebooting works through the power-management watchdog at `0x10_7d20_0000`.
 - **Emulation.** QEMU has no Pi 5 machine. We develop against QEMU `virt` (AArch64,
   GICv2/v3, PL011) behind a thin board layer, and run on the real Pi regularly.
 
@@ -113,7 +115,7 @@ Each phase ends with something visible on the Pi or the PC.
 | 0 | **Stage-0 compiler** in Python: functions, ints, pointers, shapes, spans, if/while, `device`, `asm` | ✅ Test programs compile, assemble (clang/lld via `ziglang`, a temporary crutch) and run correctly on an emulated Cortex-A76 |
 | 1 | **Alive** | ✅ Pi 5 prints "ArmOS" over serial and paints the screen red / green / blue |
 | 2 | **Own assembler + linker** | Phase 1 image rebuilt with zero outside tools; byte-compare against GNU output |
-| 3 | **Serial chainloader** | New kernels load over the cable; no more SD swaps per build |
+| 3 | **Serial chainloader** | ✅ `tools/build_pi5.py --send COM4` builds a kernel, reboots the Pi into the loader over the cable and runs the new kernel; no SD swaps |
 | 4 | **Kernel core** | Timer interrupts tick, MMU on, page allocator and heap pass tests, all 4 cores say hello |
 | 5 | **Self-host** | The compiler, rewritten in DULL, compiles itself byte-identically; stage 0 is retired |
 | 6 | **Text console** | Bitmap font, scrolling console on HDMI, keyboard input over serial |

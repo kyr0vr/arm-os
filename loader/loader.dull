@@ -67,8 +67,12 @@ to wait_for_magic
 
 to main
     io.line("")
-    io.line("ArmOS serial loader")
-    new limit = (addr of marker) as u64 - 0x10_0000
+    io.print("ArmOS serial loader at ")
+    io.print_hex((addr of marker) as u64)
+    io.print(", started by the firmware at ")
+    io.print_hex(read_sysreg(tpidr_el1))
+    io.line("")
+    new limit = (addr of marker) as u64 -| 0x10_0000
     repeat
         wait_for_magic()
         new size = read_u32()
