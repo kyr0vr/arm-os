@@ -1,0 +1,27 @@
+-- Memory for DULL tools running in QEMU: a bump allocator over all the RAM after
+-- the program. Tools are short-lived, so nothing is ever freed. QEMU's RAM starts
+-- out zeroed, so every block comes back zero-filled. Run QEMU with -m 1G.
+
+elsewhere new __stack_top u8
+
+fixed ram_end u64 = 0x8000_0000         -- 1 GB from 0x4000_0000
+
+new next u64
+new used u64
+
+to alloc (bytes u64) gives ptr u8
+    if next is 0
+        next = ((addr of __stack_top) as u64 + 15) & 0xFFFF_FFFF_FFFF_FFF0
+    new p = next
+    new size = (bytes + 15) & 0xFFFF_FFFF_FFFF_FFF0
+    if p + size > ram_end
+        out_of_memory()
+    next = p + size
+    used += size
+    give p as ptr u8
+
+elsewhere to dull_trap (message ptr u8)
+
+to out_of_memory
+    new msg string = "out of memory\0"
+    dull_trap(msg.ptr)

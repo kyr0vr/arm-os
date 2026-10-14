@@ -1,0 +1,91 @@
+-- A growable byte buffer, for building text.
+
+use mem
+
+shape buf
+    data ptr u8
+    len  u64
+    cap  u64
+
+to grow (b ptr buf, need u64)
+    if b.len + need <= b.cap
+        give
+    new cap = b.cap * 2
+    if cap < 64
+        cap = 64
+    while cap < b.len + need
+        cap = cap * 2
+    new data = mem.alloc(cap)
+    for each i in 0 until b.len
+        data[i] = b.data[i]
+    b.data = data
+    b.cap = cap
+
+to byte (b ptr buf, c u8)
+    grow(b, 1)
+    b.data[b.len] = c
+    b.len += 1
+
+to add (b ptr buf, s string)
+    grow(b, s.len)
+    for each i in 0 until s.len
+        b.data[b.len + i] = s[i]
+    b.len += s.len
+
+to line (b ptr buf, s string)
+    add(b, s)
+    byte(b, '\n')
+
+to number (b ptr buf, v u64)
+    new digits [20] u8
+    new n u64 = 0
+    if v is 0
+        byte(b, '0')
+        give
+    while v > 0
+        digits[n] = (v % 10) as u8 + '0'
+        v = v / 10
+        n += 1
+    while n > 0
+        n -= 1
+        byte(b, digits[n])
+
+to signed (b ptr buf, v i64)
+    if v < 0
+        byte(b, '-')
+        number(b, (0 -% v) as u64)
+    else
+        number(b, v as u64)
+
+-- `v` as lowercase hex with a 0x prefix and no leading zeros (like Python's hex()).
+to hex (b ptr buf, v u64)
+    add(b, "0x")
+    if v is 0
+        byte(b, '0')
+        give
+    new started = false
+    for each i in 0 until 16
+        new nib = ((v >> (60 - i * 4)) & 0xF) as u8
+        if nib is not 0
+            started = true
+        if started
+            if nib < 10
+                byte(b, '0' + nib)
+            else
+                byte(b, 'a' + nib - 10)
+
+-- What has been written so far (shares the buffer's memory).
+to text (b ptr buf) gives string
+    new s string
+    s.ptr = b.data
+    s.len = b.len
+    give s
+
+-- A copy of `s` in fresh memory.
+to copy (s string) gives string
+    new out string
+    out.ptr = mem.alloc(s.len + 1)
+    for each i in 0 until s.len
+        out.ptr[i] = s[i]
+    out.len = s.len
+    give out

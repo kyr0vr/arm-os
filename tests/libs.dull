@@ -1,0 +1,102 @@
+-- expect: same yes no
+-- expect: find 2 last 7 none
+-- expect: buf: n=42 s=-17 h=0xff00 h0=0x0
+-- expect: vec 1000 sum 499500 insert 5,9,6
+-- expect: map 500 get 123 missing ok order a,b,c
+-- expect: file round trip ok 13
+
+use io
+use text
+use buf
+use vec
+use map
+use sys
+
+to main gives u8
+    io.print("same ")
+    io.print(text.same("abc", "abc") and not text.same("abc", "abd") -> pick("yes", "no"))
+    io.print(" ")
+    io.line(text.same("abc", "ab") -> pick("yes", "no"))
+
+    io.print("find ")
+    io.print_u64(text.find("hello", 'l') else 99)
+    io.print(" last ")
+    io.print_u64(text.find_last("hello world", 'o') else 99)
+    io.print(" ")
+    io.line(text.find("abc", 'z') is nothing -> pick("none", "found"))
+
+    new b buf.buf
+    buf.add(addr of b, "buf: n=")
+    buf.number(addr of b, 42)
+    buf.add(addr of b, " s=")
+    buf.signed(addr of b, -17)
+    buf.add(addr of b, " h=")
+    buf.hex(addr of b, 0xFF00)
+    buf.add(addr of b, " h0=")
+    buf.hex(addr of b, 0)
+    io.line(buf.text(addr of b))
+
+    new v = vec.make()
+    for each i in 0 until 1000
+        vec.push(v, i)
+    new sum u64 = 0
+    for each i in 0 until v.len
+        sum += vec.get(v, i)
+    new w = vec.make()
+    vec.push(w, 5)
+    vec.push(w, 6)
+    vec.insert(w, 1, 9)
+    io.print("vec ")
+    io.print_u64(v.len)
+    io.print(" sum ")
+    io.print_u64(sum)
+    io.print(" insert ")
+    io.print_u64(vec.get(w, 0))
+    io.print(",")
+    io.print_u64(vec.get(w, 1))
+    io.print(",")
+    io.print_u64(vec.get(w, 2))
+    io.line("")
+
+    new m = map.make()
+    new names buf.buf
+    for each i in 0 until 500
+        new key buf.buf
+        buf.add(addr of key, "key")
+        buf.number(addr of key, i)
+        map.put(m, buf.text(addr of key), i)
+    new probe buf.buf
+    buf.add(addr of probe, "key123")
+    new o = map.make()
+    map.put(o, "a", 1)
+    map.put(o, "b", 2)
+    map.put(o, "c", 3)
+    map.put(o, "a", 4)
+    io.print("map ")
+    io.print_u64(map.count(m))
+    io.print(" get ")
+    io.print_u64(map.get(m, buf.text(addr of probe)) else 0)
+    io.print(" missing ")
+    io.print(map.get(m, "key500") is nothing -> pick("ok", "bad"))
+    io.print(" order ")
+    io.print(map.key_at(o, 0))
+    io.print(",")
+    io.print(map.key_at(o, 1))
+    io.print(",")
+    io.line(map.key_at(o, 2))
+
+    new path string = "build/tests/libs_probe.txt"
+    new ok = sys.write_file(path, "hello, files!")
+    new back string
+    ok = ok and sys.read_file(path, addr of back)
+    io.print("file round trip ")
+    io.print(ok and text.same(back, "hello, files!") -> pick("ok", "bad"))
+    io.print(" ")
+    io.print_u64(back.len)
+    io.line("")
+    give 0
+
+to pick (cond bool, yes string, no string) gives string
+    if cond
+        give yes
+    give no

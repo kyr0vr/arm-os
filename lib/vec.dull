@@ -1,0 +1,58 @@
+-- A growable list of 64-bit values. Pointers go in as `p as u64` and come out with
+-- `as ptr T` (DULL has no generics yet).
+
+use mem
+
+shape vec
+    data ptr u64
+    len  u64
+    cap  u64
+
+to make gives ptr vec
+    give mem.alloc(size_of(vec)) as ptr vec
+
+to push (v ptr vec, x u64)
+    if v.len is v.cap
+        new cap = v.cap * 2
+        if cap < 8
+            cap = 8
+        new data = mem.alloc(cap * 8) as ptr u64
+        for each i in 0 until v.len
+            data[i] = v.data[i]
+        v.data = data
+        v.cap = cap
+    v.data[v.len] = x
+    v.len += 1
+
+to get (v ptr vec, i u64) gives u64
+    if i >= v.len
+        out_of_range()
+    give v.data[i]
+
+to set (v ptr vec, i u64, x u64)
+    if i >= v.len
+        out_of_range()
+    v.data[i] = x
+
+to last (v ptr vec) gives u64
+    give get(v, v.len - 1)
+
+to pop (v ptr vec) gives u64
+    new x = get(v, v.len - 1)
+    v.len -= 1
+    give x
+
+-- Put `x` at position `i`, moving the rest along.
+to insert (v ptr vec, i u64, x u64)
+    push(v, 0)
+    new j = v.len - 1
+    while j > i
+        v.data[j] = v.data[j - 1]
+        j -= 1
+    v.data[i] = x
+
+elsewhere to dull_trap (message ptr u8)
+
+to out_of_range
+    new msg string = "vec index out of range\0"
+    dull_trap(msg.ptr)

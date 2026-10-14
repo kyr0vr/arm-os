@@ -29,6 +29,7 @@ import toolchain  # noqa: E402
 from dullc import DullError, compile_file  # noqa: E402
 
 RT = os.path.join(ROOT, "rt", "virt")
+LIB = os.path.join(ROOT, "lib")
 BUILD = os.path.join(ROOT, "build", "tests")
 QEMU_CANDIDATES = [
     shutil.which("qemu-system-aarch64"),
@@ -67,8 +68,9 @@ def headers(path):
 
 def run_program(path, h, backend, qemu):
     name = os.path.splitext(os.path.basename(path))[0]
-    elf, _ = toolchain.build(path, RT, 0x4008_0000, BUILD, name, debug=not h["release"], backend=backend)
-    cmd = [qemu, "-M", "virt", "-cpu", "cortex-a76", "-m", "128M", "-display", "none",
+    elf, _ = toolchain.build(path, RT, 0x4008_0000, BUILD, name, debug=not h["release"], backend=backend,
+                             extra_includes=[LIB])
+    cmd = [qemu, "-M", "virt", "-cpu", "cortex-a76", "-m", "1G", "-display", "none",
            "-monitor", "none", "-serial", "stdio", "-semihosting-config",
            "enable=on,target=native", "-kernel", elf]
     try:

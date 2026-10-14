@@ -1,0 +1,54 @@
+-- Small helpers for strings (spans of UTF-8 bytes).
+
+to same (a string, b string) gives bool
+    if a.len is not b.len
+        give false
+    for each i in 0 until a.len
+        if a[i] is not b[i]
+            give false
+    give true
+
+to starts_with (s string, prefix string) gives bool
+    if prefix.len > s.len
+        give false
+    give same(s[0 until prefix.len], prefix)
+
+to ends_with (s string, suffix string) gives bool
+    if suffix.len > s.len
+        give false
+    give same(s[s.len - suffix.len until s.len], suffix)
+
+-- Index of the first `b` in `s`, or nothing.
+to find (s string, b u8) gives maybe u64
+    for each i in 0 until s.len
+        if s[i] is b
+            give i
+    give nothing
+
+-- Index of the last `b` in `s`, or nothing.
+to find_last (s string, b u8) gives maybe u64
+    new i = s.len
+    while i > 0
+        i -= 1
+        if s[i] is b
+            give i
+    give nothing
+
+-- Byte order comparison: negative, zero or positive like C's strcmp.
+to compare (a string, b string) gives i64
+    new n = a.len
+    if b.len < n
+        n = b.len
+    for each i in 0 until n
+        if a[i] is not b[i]
+            give (a[i] as i64) - (b[i] as i64)
+    give (a.len as i64) - (b.len as i64)
+
+to is_digit (c u8) gives bool
+    give c >= '0' and c <= '9'
+
+to is_alpha (c u8) gives bool
+    give (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c is '_'
+
+to is_space (c u8) gives bool
+    give c is ' ' or c is '\t' or c is '\n' or c is '\r'

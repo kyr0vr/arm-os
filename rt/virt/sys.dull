@@ -1,0 +1,113 @@
+-- Talking to the PC from inside QEMU, through Arm semihosting: files, the console,
+-- the command line and exit. This is what lets DULL tools (the compiler itself)
+-- run on the PC. QEMU needs `-semihosting-config enable=on,target=native`.
+
+use mem
+
+fixed sys_open u64 = 0x01
+fixed sys_close u64 = 0x02
+fixed sys_write u64 = 0x05
+fixed sys_read u64 = 0x06
+fixed sys_flen u64 = 0x0C
+fixed sys_cmdline u64 = 0x15
+fixed sys_exit u64 = 0x18
+
+fixed mode_read_binary u64 = 1
+fixed mode_write u64 = 4
+fixed mode_write_binary u64 = 5
+
+new console i64 = -1
+
+to semihost (op u64, block ptr u64) gives u64
+    new r u64 = 0
+    asm
+        "mov x0, {op}"
+        "mov x1, {block}"
+        "hlt #0xf000"
+        "mov {r}, x0"
+    give r
+
+-- A NUL-terminated copy of `text` (semihosting wants C strings).
+to c_string (text string) gives ptr u8
+    new p = mem.alloc(text.len + 1)
+    for each i in 0 until text.len
+        p[i] = text[i]
+    give p
+
+to open (path string, mode u64) gives i64
+    new block [3] u64
+    block[0] = c_string(path) as u64
+    block[1] = mode
+    block[2] = path.len
+    give semihost(sys_open, addr of block[0]) as i64
+
+to close (handle i64)
+    new block [1] u64
+    block[0] = handle as u64
+    semihost(sys_close, addr of block[0])
+
+-- Write all of `data` to an open handle. False if anything was left unwritten.
+to write (handle i64, data string) gives bool
+    if data.len is 0
+        give true
+    new block [3] u64
+    block[0] = handle as u64
+    block[1] = data.ptr as u64
+    block[2] = data.len
+    give semihost(sys_write, addr of block[0]) is 0
+
+to print (text string)
+    if console < 0
+        console = open(":tt", mode_write)
+    write(console, text)
+
+-- The whole file at `path`, into `out`. False if it cannot be read.
+to read_file (path string, out ptr string) gives bool
+    new h = open(path, mode_read_binary)
+    if h < 0
+        give false
+    after close(h)
+    new block [3] u64
+    block[0] = h as u64
+    new size = semihost(sys_flen, addr of block[0])
+    if size as i64 < 0
+        give false
+    new data = mem.alloc(size + 1)
+    if size > 0
+        block[0] = h as u64
+        block[1] = data as u64
+        block[2] = size
+        if semihost(sys_read, addr of block[0]) is not 0
+            give false
+    out.ptr = data
+    out.len = size
+    give true
+
+to write_file (path string, data string) gives bool
+    new h = open(path, mode_write_binary)
+    if h < 0
+        give false
+    after close(h)
+    give write(h, data)
+
+-- The command line QEMU was given (`arg=` entries, joined by spaces).
+to command_line gives string
+    new size u64 = 4096
+    new buf = mem.alloc(size)
+    new block [2] u64
+    block[0] = buf as u64
+    block[1] = size
+    new line string
+    if semihost(sys_cmdline, addr of block[0]) is not 0
+        give line
+    line.ptr = buf
+    line.len = block[1]
+    give line
+
+to exit (code u64)
+    new block [2] u64
+    block[0] = 0x2_0026                 -- ADP_Stopped_ApplicationExit
+    block[1] = code
+    semihost(sys_exit, addr of block[0])
+    repeat
+        wfe()

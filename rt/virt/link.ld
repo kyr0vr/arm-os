@@ -13,6 +13,6 @@ SECTIONS
         __bss_end = .;
     }
     . = ALIGN(16);
-    . += 0x100000;
+    . += 0x400000;
     __stack_top = .;
 }

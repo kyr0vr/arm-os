@@ -1,0 +1,81 @@
+-- A hash map from strings to 64-bit values. Keys are not copied: they must stay
+-- valid (source text and literals do). Remembers insertion order, so walking it
+-- with `key_at` / `value_at` is deterministic.
+
+use mem
+use text
+use vec
+
+shape map
+    slots ptr u64        -- index+1 into the entry lists, 0 for empty
+    slot_count u64
+    keys ptr vec.vec     -- (ptr, len) pairs: 2 values per entry
+    values ptr vec.vec
+
+to make gives ptr map
+    new m = mem.alloc(size_of(map)) as ptr map
+    m.slot_count = 16
+    m.slots = mem.alloc(16 * 8) as ptr u64
+    m.keys = vec.make()
+    m.values = vec.make()
+    give m
+
+to hash (s string) gives u64
+    new h u64 = 0xCBF2_9CE4_8422_2325
+    for each i in 0 until s.len
+        h = (h ^ (s[i] as u64)) *% 0x100_0000_01B3
+    give h
+
+to count (m ptr map) gives u64
+    give m.values.len
+
+to key_at (m ptr map, i u64) gives string
+    new s string
+    s.ptr = vec.get(m.keys, i * 2) as ptr u8
+    s.len = vec.get(m.keys, i * 2 + 1)
+    give s
+
+to value_at (m ptr map, i u64) gives u64
+    give vec.get(m.values, i)
+
+-- The slot holding `key`, or the empty slot where it would go.
+to slot_of (m ptr map, key string) gives u64
+    new mask = m.slot_count - 1
+    new s = hash(key) & mask
+    repeat
+        new e = m.slots[s]
+        if e is 0
+            give s
+        if text.same(key_at(m, e - 1), key)
+            give s
+        s = (s + 1) & mask
+
+to grow (m ptr map)
+    new old = m.slots
+    new old_count = m.slot_count
+    m.slot_count = old_count * 2
+    m.slots = mem.alloc(m.slot_count * 8) as ptr u64
+    for each i in 0 until count(m)
+        m.slots[slot_of(m, key_at(m, i))] = i + 1
+
+to has (m ptr map, key string) gives bool
+    give m.slots[slot_of(m, key)] is not 0
+
+to get (m ptr map, key string) gives maybe u64
+    new e = m.slots[slot_of(m, key)]
+    if e is 0
+        give nothing
+    give vec.get(m.values, e - 1)
+
+to put (m ptr map, key string, value u64)
+    new s = slot_of(m, key)
+    new e = m.slots[s]
+    if e is not 0
+        vec.set(m.values, e - 1, value)
+        give
+    vec.push(m.keys, key.ptr as u64)
+    vec.push(m.keys, key.len)
+    vec.push(m.values, value)
+    m.slots[s] = count(m)
+    if count(m) * 2 > m.slot_count
+        grow(m)

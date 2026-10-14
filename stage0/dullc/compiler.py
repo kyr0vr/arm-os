@@ -1499,7 +1499,7 @@ class FuncGen:
 
     def infer_value_field(self, e):
         bt = self.infer(e.value, None)
-        if isinstance(bt, T.Ptr) and isinstance(bt.inner, T.Shape):
+        if isinstance(bt, T.Ptr) and isinstance(bt.inner, (T.Shape, T.Span)):
             bt = bt.inner
         if isinstance(bt, T.Shape):
             if e.name not in bt.fields:

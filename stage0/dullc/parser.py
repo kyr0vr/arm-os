@@ -540,7 +540,10 @@ class Parser:
                     e = Node("index", line, value=e, index=first)
             elif self.at_sym("."):
                 line = self.take().line
-                name = self.expect_name("a field name")
+                if self.at("KW"):                  # after a dot, `ptr` etc. are field names
+                    name = self.take().value
+                else:
+                    name = self.expect_name("a field name")
                 e = Node("field", line, value=e, name=name)
             else:
                 return e
