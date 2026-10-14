@@ -1,0 +1,555 @@
+-- The linker: assembler objects -> a flat image and a minimal ELF. A port of
+-- stage0/aa64/linker.py; reads the small subset of linker-script syntax our link.ld
+-- files use, and places input sections in pattern order, then file order, like lld.
+
+use mem
+use text
+use buf
+use vec
+use map
+use diag
+use asmtext
+use assembler
+
+-- ---------------------------------------------------------------- the script
+
+-- Commands, in order:
+--   set:     name (or ".") op ("=" or "+=") expr
+--   section: name, noload, align expr ("" if none), inner commands
+-- Inner commands: input pattern list, or set.
+shape command
+    is_section bool
+    name    string
+    op_add  bool               -- `+=`
+    expr    string
+    noload  bool
+    align   string
+    inner   ptr vec.vec        -- ptr command (input patterns use `patterns`)
+    is_input bool
+    patterns ptr vec.vec       -- (ptr, len) pairs
+
+new entry_name string
+
+to fail (m string)
+    diag.fail("link.ld", 0, m)
+
+to new_command gives ptr command
+    give mem.alloc(size_of(command)) as ptr command
+
+-- Remove /* comments */.
+to strip_comments (s string) gives string
+    new out buf.buf
+    new i u64 = 0
+    while i < s.len
+        if s[i] is '/' and i + 1 < s.len and s[i + 1] is '*'
+            i += 2
+            while i + 1 < s.len and not (s[i] is '*' and s[i + 1] is '/')
+                i += 1
+            i += 2
+            skip
+        buf.byte(addr of out, s[i])
+        i += 1
+    give buf.text(addr of out)
+
+new sp u64
+new st string
+
+to ws
+    while sp < st.len and text.is_space(st[sp])
+        sp += 1
+
+to word gives string
+    ws()
+    new j = sp
+    while j < st.len and (asmtext.is_ident(st[j]) or st[j] is '*')
+        j += 1
+    new w = st[sp until j]
+    sp = j
+    give w
+
+to expect_char (c u8)
+    ws()
+    if sp >= st.len or st[sp] is not c
+        new b buf.buf
+        buf.add(addr of b, "expected ")
+        buf.byte(addr of b, c)
+        buf.add(addr of b, " in the linker script")
+        fail(buf.text(addr of b))
+    sp += 1
+
+-- Text up to the next ';'.
+to until_semicolon gives string
+    ws()
+    new j = sp
+    while j < st.len and st[j] is not ';'
+        j += 1
+    new e = asmtext.strip(st[sp until j])
+    sp = j + 1
+    give e
+
+to parse_set (name string) gives ptr command
+    new c = new_command()
+    c.name = name
+    ws()
+    if st[sp] is '+'
+        c.op_add = true
+        sp += 1
+    expect_char('=')
+    c.expr = until_semicolon()
+    give c
+
+to parse_script (script string) gives ptr vec.vec
+    st = strip_comments(script)
+    sp = 0
+    entry_name = "_start"
+    new e = text.find(st, '{') else 0
+    -- ENTRY(name) anywhere before SECTIONS
+    new head = st[0 until e]
+    new en = find_text(head, "ENTRY(")
+    if en is not nothing
+        new a = (en else 0) + 6
+        new b = a
+        while b < head.len and head[b] is not ')'
+            b += 1
+        entry_name = asmtext.strip(head[a until b])
+    sp = e + 1
+    new cmds = vec.make()
+    repeat
+        ws()
+        if sp >= st.len or st[sp] is '}'
+            stop
+        new w = word()
+        if w.len is 0
+            fail("cannot read the linker script")
+        ws()
+        if w[0] is '.' and w.len > 1 and (st[sp] is ':' or st[sp] is '(')
+            vec.push(cmds, parse_section(w) as u64)
+        else
+            vec.push(cmds, parse_set(w) as u64)
+    give cmds
+
+to find_text (s string, needle string) gives maybe u64
+    if needle.len > s.len
+        give nothing
+    for each i in 0 until s.len - needle.len + 1
+        if text.same(s[i until i + needle.len], needle)
+            give i
+    give nothing
+
+to parse_section (name string) gives ptr command
+    new c = new_command()
+    c.is_section = true
+    c.name = name
+    c.inner = vec.make()
+    ws()
+    if st[sp] is '('
+        new close = sp
+        while close < st.len and st[close] is not ')'
+            close += 1
+        c.noload = find_text(st[sp until close], "NOLOAD") is not nothing
+        sp = close + 1
+    expect_char(':')
+    ws()
+    if text.starts_with(st[sp until st.len], "ALIGN(")
+        sp += 6
+        new j = sp
+        while j < st.len and st[j] is not ')'
+            j += 1
+        c.align = asmtext.strip(st[sp until j])
+        sp = j + 1
+    expect_char('{')
+    repeat
+        ws()
+        if sp >= st.len
+            fail("unclosed section in the linker script")
+        if st[sp] is '}'
+            sp += 1
+            stop
+        if st[sp] is '*' and sp + 1 < st.len and st[sp + 1] is '('
+            sp += 2
+            new j = sp
+            while j < st.len and st[j] is not ')'
+                j += 1
+            new input = new_command()
+            input.is_input = true
+            input.patterns = vec.make()
+            new inside = st[sp until j]
+            new k u64 = 0
+            while k < inside.len
+                while k < inside.len and text.is_space(inside[k])
+                    k += 1
+                new m = k
+                while m < inside.len and not text.is_space(inside[m])
+                    m += 1
+                if m > k
+                    vec.push(input.patterns, inside.ptr as u64 + k)
+                    vec.push(input.patterns, m - k)
+                k = m
+            vec.push(c.inner, input as u64)
+            sp = j + 1
+            skip
+        new w = word()
+        if w.len is 0
+            fail("cannot read a section in the linker script")
+        vec.push(c.inner, parse_set(w) as u64)
+    give c
+
+-- ---------------------------------------------------------------- expressions
+
+new symbols ptr map.map            -- script-defined symbols
+
+-- Evaluate a script expression: numbers, `.`, symbols, ALIGN(n), + - * / ( ).
+to eval (e string, dot u64) gives u64
+    -- Rewrite into something asmtext.eval understands: ALIGN(x) and `.` become numbers.
+    new out buf.buf
+    new i u64 = 0
+    while i < e.len
+        if text.starts_with(e[i until e.len], "ALIGN(")
+            new depth u64 = 1
+            new j = i + 6
+            while j < e.len and depth > 0
+                if e[j] is '('
+                    depth += 1
+                else if e[j] is ')'
+                    depth -= 1
+                j += 1
+            new n = eval(e[i + 6 until j - 1], dot)
+            buf.number(addr of out, (dot + n - 1) / n * n)
+            i = j
+            skip
+        if e[i] is '.' and (i + 1 >= e.len or not asmtext.is_ident(e[i + 1])) and (i is 0 or not asmtext.is_ident(e[i - 1]))
+            buf.number(addr of out, dot)
+            i += 1
+            skip
+        if text.is_digit(e[i])
+            new j = i
+            while j < e.len and asmtext.is_ident(e[j])
+                j += 1
+            buf.add(addr of out, e[i until j])
+            i = j
+            skip
+        if asmtext.is_ident_start(e[i]) and e[i] is not '.'
+            new j = i
+            while j < e.len and asmtext.is_ident(e[j])
+                j += 1
+            new found = map.get(symbols, e[i until j])
+            if found is nothing
+                asmtext.fail2("unknown symbol in the linker script: ", e[i until j])
+            buf.number(addr of out, found else 0)
+            i = j
+            skip
+        buf.byte(addr of out, e[i])
+        i += 1
+    give asmtext.eval(buf.text(addr of out)) as u64
+
+-- ---------------------------------------------------------------- linking
+
+shape placed
+    address u64
+    sec     ptr assembler.section
+    obj     ptr assembler.object
+
+new layout ptr vec.vec              -- ptr placed
+new image buf.buf
+new image_base u64
+new image_memsize u64
+new image_entry u64
+new globals ptr map.map
+new taken ptr map.map               -- section pointer (as text) -> 1
+
+to sec_key (s ptr assembler.section) gives string
+    new b buf.buf
+    buf.number(addr of b, s as u64)
+    give buf.text(addr of b)
+
+-- Glob match with `*` (all our patterns need).
+to glob (pattern string, s string) gives bool
+    if pattern.len is 0
+        give s.len is 0
+    if pattern[0] is '*'
+        for each i in 0 through s.len
+            if glob(pattern[1 until pattern.len], s[i until s.len])
+                give true
+        give false
+    if s.len is 0 or pattern[0] is not s[0]
+        give false
+    give glob(pattern[1 until pattern.len], s[1 until s.len])
+
+to align_up (v u64, a u64) gives u64
+    give (v + a - 1) / a * a
+
+to link (objects ptr vec.vec, script string)
+    new cmds = parse_script(script)
+    layout = vec.make()
+    symbols = map.make()
+    taken = map.make()
+    new dot u64 = 0
+    new out_end u64 = 0
+    for each ci in 0 until cmds.len
+        new c = vec.get(cmds, ci) as ptr command
+        if not c.is_section
+            new v = eval(c.expr, dot)
+            if text.same(c.name, ".")
+                if c.op_add
+                    dot = dot + v
+                else
+                    dot = v
+            else
+                map.put(symbols, c.name, v)
+            skip
+        -- gather this section's inputs: per input command, per pattern, per object
+        new inputs = vec.make()               -- (inner command, object, section) triples
+        for each ii in 0 until c.inner.len
+            new item = vec.get(c.inner, ii) as ptr command
+            if not item.is_input
+                skip
+            for each pi in 0 until item.patterns.len / 2
+                new pattern string
+                pattern.ptr = vec.get(item.patterns, pi * 2) as ptr u8
+                pattern.len = vec.get(item.patterns, pi * 2 + 1)
+                for each oi in 0 until objects.len
+                    new o = vec.get(objects, oi) as ptr assembler.object
+                    for each si in 0 until map.count(o.sections)
+                        new s = map.value_at(o.sections, si) as ptr assembler.section
+                        if map.has(taken, sec_key(s)) or not glob(pattern, s.name)
+                            skip
+                        map.put(taken, sec_key(s), 1)
+                        vec.push(inputs, item as u64)
+                        vec.push(inputs, o as u64)
+                        vec.push(inputs, s as u64)
+        new align u64 = 1
+        if c.align.len > 0
+            align = eval(c.align, 0)
+        for each k in 0 until inputs.len / 3
+            new s = vec.get(inputs, k * 3 + 2) as ptr assembler.section
+            if s.align > align
+                align = s.align
+        dot = align_up(dot, align)
+        for each ii in 0 until c.inner.len
+            new item = vec.get(c.inner, ii) as ptr command
+            if item.is_input
+                for each k in 0 until inputs.len / 3
+                    if vec.get(inputs, k * 3) is item as u64
+                        new s = vec.get(inputs, k * 3 + 2) as ptr assembler.section
+                        dot = align_up(dot, s.align)
+                        new p = mem.alloc(size_of(placed)) as ptr placed
+                        p.address = dot
+                        p.sec = s
+                        p.obj = vec.get(inputs, k * 3 + 1) as ptr assembler.object
+                        vec.push(layout, p as u64)
+                        dot += s.size
+            else
+                new v = eval(item.expr, dot)
+                if text.same(item.name, ".")
+                    if item.op_add
+                        dot = dot + v
+                    else
+                        dot = v
+                else
+                    map.put(symbols, item.name, v)
+        if dot > out_end
+            out_end = dot
+    for each oi in 0 until objects.len
+        new o = vec.get(objects, oi) as ptr assembler.object
+        for each si in 0 until map.count(o.sections)
+            new s = map.value_at(o.sections, si) as ptr assembler.section
+            if not map.has(taken, sec_key(s)) and s.size > 0
+                asmtext.fail2("the linker script does not place ", s.name)
+    resolve_and_write(objects, out_end)
+
+to placed_at (i u64) gives ptr placed
+    give vec.get(layout, i) as ptr placed
+
+to address_of_section (s ptr assembler.section) gives u64
+    for each i in 0 until layout.len
+        if placed_at(i).sec as u64 is s as u64
+            give placed_at(i).address
+    give 0
+
+-- Per object: name -> address of its symbols (globals are also in `globals`).
+new locals ptr vec.vec             -- ptr map, one per object
+
+to symbol_address (o ptr assembler.object, sym ptr assembler.symbol) gives u64
+    if sym.sec as u64 is 0
+        give sym.value
+    give address_of_section(sym.sec) + sym.value
+
+to lookup (oi u64, name string) gives u64
+    new local = vec.get(locals, oi) as ptr map.map
+    new found = map.get(local, name)
+    if found is not nothing
+        give found else 0
+    new g = map.get(globals, name)
+    if g is nothing
+        asmtext.fail2("undefined symbol ", name)
+    give g else 0
+
+to resolve_and_write (objects ptr vec.vec, out_end u64)
+    globals = map.make()
+    for each i in 0 until map.count(symbols)
+        map.put(globals, map.key_at(symbols, i), map.value_at(symbols, i))
+    locals = vec.make()
+    for each oi in 0 until objects.len
+        new o = vec.get(objects, oi) as ptr assembler.object
+        new local = map.make()
+        for each i in 0 until map.count(o.symbols)
+            new sym = map.value_at(o.symbols, i) as ptr assembler.symbol
+            new a = symbol_address(o, sym)
+            if sym.global
+                if map.has(globals, sym.name)
+                    asmtext.fail2(sym.name, " is defined in more than one file")
+                map.put(globals, sym.name, a)
+            map.put(local, sym.name, a)
+        vec.push(locals, local as u64)
+    for each oi in 0 until objects.len
+        new o = vec.get(objects, oi) as ptr assembler.object
+        new local = vec.get(locals, oi) as ptr map.map
+        for each i in 0 until map.count(o.aliases)
+            new alias = map.key_at(o.aliases, i)
+            new target = assembler.kept(map.value_at(o.aliases, i))
+            new v = lookup(oi, target)
+            map.put(local, alias, v)
+            if map.has(o.globals, alias)
+                map.put(globals, alias, v)
+    -- the image: every loadable, non-empty section
+    image_base = 0
+    if layout.len > 0
+        image_base = placed_at(0).address
+    new file_end = image_base
+    for each i in 0 until layout.len
+        new p = placed_at(i)
+        if not p.sec.nobits and p.sec.size > 0 and p.address + p.sec.size > file_end
+            file_end = p.address + p.sec.size
+    image.len = 0
+    buf.grow(addr of image, file_end - image_base)
+    for each i in 0 until file_end - image_base
+        image.data[i] = 0
+    image.len = file_end - image_base
+    for each i in 0 until layout.len
+        new p = placed_at(i)
+        if p.sec.nobits or p.sec.size is 0
+            skip
+        for each k in 0 until p.sec.size
+            image.data[p.address - image_base + k] = p.sec.data.data[k]
+    for each i in 0 until layout.len
+        new p = placed_at(i)
+        if p.sec.nobits or p.sec.size is 0
+            skip
+        new oi = object_index(objects, p.obj)
+        for each r in 0 until p.sec.relocs.len
+            new rel = vec.get(p.sec.relocs, r) as ptr assembler.relocation
+            asmtext.file = p.obj.path
+            asmtext.lineno = rel.line
+            new s = lookup(oi, rel.symbol) +% (rel.addend as u64)
+            patch(p.address - image_base + rel.offset, rel.kind, s, p.address + rel.offset)
+    image_memsize = out_end - image_base
+    image_entry = map.get(globals, entry_name) else image_base
+
+to object_index (objects ptr vec.vec, o ptr assembler.object) gives u64
+    for each i in 0 until objects.len
+        if vec.get(objects, i) is o as u64
+            give i
+    give 0
+
+to get32 (off u64) gives u64
+    give (image.data[off] as u64) | ((image.data[off + 1] as u64) << 8) | ((image.data[off + 2] as u64) << 16) | ((image.data[off + 3] as u64) << 24)
+
+to put32 (off u64, v u64)
+    for each i in 0 until 4
+        image.data[off + i] = ((v >> (i * 8)) & 0xFF) as u8
+
+to put64 (off u64, v u64)
+    for each i in 0 until 8
+        image.data[off + i] = ((v >> (i * 8)) & 0xFF) as u8
+
+to fits (v i64, bits u64) gives bool
+    new limit = (1 as i64) << (bits - 1)
+    give v >= 0 -% limit and v < limit
+
+to patch (off u64, kind string, s u64, p u64)
+    if text.same(kind, "abs64")
+        put64(off, s)
+        give
+    if text.same(kind, "abs32")
+        put32(off, s & 0xFFFF_FFFF)
+        give
+    new word = get32(off)
+    new d = (s -% p) as i64
+    if text.same(kind, "jump26") or text.same(kind, "call26")
+        if d % 4 is not 0 or not fits(d >> 2, 26)
+            asmtext.fail("branch target out of range")
+        word = word | ((d >> 2) as u64 & 0x3FF_FFFF)
+    else if text.same(kind, "condbr19") or text.same(kind, "ld_prel19")
+        if d % 4 is not 0 or not fits(d >> 2, 19)
+            asmtext.fail("branch or literal target out of range")
+        word = word | (((d >> 2) as u64 & 0x7FFFF) << 5)
+    else if text.same(kind, "tstbr14")
+        if d % 4 is not 0 or not fits(d >> 2, 14)
+            asmtext.fail("test-and-branch target out of range")
+        word = word | (((d >> 2) as u64 & 0x3FFF) << 5)
+    else if text.same(kind, "adr21")
+        if not fits(d, 21)
+            asmtext.fail("adr target out of range")
+        word = word | (((d as u64) & 3) << 29) | ((((d >> 2) as u64) & 0x7FFFF) << 5)
+    else if text.same(kind, "adrp")
+        new pd = ((s >> 12) as i64) - ((p >> 12) as i64)
+        if not fits(pd, 21)
+            asmtext.fail("adrp target out of range")
+        word = word | (((pd as u64) & 3) << 29) | ((((pd >> 2) as u64) & 0x7FFFF) << 5)
+    else if text.same(kind, "add_lo12")
+        word = word | ((s & 0xFFF) << 10)
+    else
+        asmtext.fail2("unknown relocation ", kind)
+    put32(off, word)
+
+-- ---------------------------------------------------------------- output
+
+-- A minimal ELF64 executable with one loadable segment (enough for QEMU -kernel).
+to elf gives string
+    new b buf.buf
+    new offset u64 = 0x1000
+    buf.add(addr of b, "\x7fELF")
+    le(addr of b, 2, 1)          -- 64-bit
+    le(addr of b, 1, 1)          -- little-endian
+    le(addr of b, 1, 1)          -- version
+    le(addr of b, 0, 1)
+    le(addr of b, 0, 1)
+    le(addr of b, 0, 7)          -- padding
+    le(addr of b, 2, 2)          -- executable
+    le(addr of b, 183, 2)        -- AArch64
+    le(addr of b, 1, 4)
+    le(addr of b, image_entry, 8)
+    le(addr of b, 64, 8)         -- program headers right after this header
+    le(addr of b, 0, 8)          -- no section headers
+    le(addr of b, 0, 4)
+    le(addr of b, 64, 2)
+    le(addr of b, 56, 2)
+    le(addr of b, 1, 2)
+    le(addr of b, 0, 2)
+    le(addr of b, 0, 2)
+    le(addr of b, 0, 2)
+    le(addr of b, 1, 4)          -- PT_LOAD
+    le(addr of b, 7, 4)          -- read, write, execute
+    le(addr of b, offset, 8)
+    le(addr of b, image_base, 8)
+    le(addr of b, image_base, 8)
+    le(addr of b, image.len, 8)
+    new memsize = image_memsize
+    if memsize < image.len
+        memsize = image.len
+    le(addr of b, memsize, 8)
+    le(addr of b, 0x1000, 8)
+    while b.len < offset
+        buf.byte(addr of b, 0)
+    buf.add(addr of b, buf.text(addr of image))
+    give buf.text(addr of b)
+
+to le (b ptr buf.buf, v u64, size u64)
+    for each i in 0 until size
+        new byte u8 = 0
+        if i < 8
+            byte = ((v >> (i * 8)) & 0xFF) as u8
+        buf.byte(b, byte)
+
+to flat gives string
+    give buf.text(addr of image)

@@ -1,0 +1,903 @@
+-- AArch64 instruction encoding. A port of stage0/aa64/encode.py: same instructions,
+-- same choices, same bytes.
+--
+-- Registers are packed in a u64: number in bits 0-7, bit 8 set for x (64-bit),
+-- bit 9 set for sp.
+
+use text
+use buf
+use vec
+use asmtext
+
+fixed is_x u64 = 0x100
+fixed is_sp u64 = 0x200
+
+-- The assembler supplies these (assembler.dull):
+use assembler
+
+to num (r u64) gives u64
+    give r & 0xFF
+
+to wide (r u64) gives bool
+    give r & is_x is not 0
+
+to sf (r u64) gives u64
+    if wide(r)
+        give (1 as u64) << 31
+    give 0
+
+to fail (m string)
+    asmtext.fail(m)
+
+fixed cond_names [18] string = ["eq", "ne", "cs", "hs", "cc", "lo", "mi", "pl", "vs", "vc",
+    "hi", "ls", "ge", "lt", "gt", "le", "al", "nv"]
+fixed cond_codes [18] u64 = [0, 1, 2, 2, 3, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+
+to cond_code (s string) gives maybe u64
+    new t = asmtext.lower(asmtext.strip(s))
+    for each i in 0 until 18
+        if text.same(cond_names[i], t)
+            give cond_codes[i]
+    give nothing
+
+-- ---------------------------------------------------------------- registers
+
+to is_reg (s string) gives bool
+    new t = asmtext.lower(asmtext.strip(s))
+    if text.same(t, "sp") or text.same(t, "wsp") or text.same(t, "xzr") or text.same(t, "wzr")
+        give true
+    if t.len < 2 or (t[0] is not 'x' and t[0] is not 'w')
+        give false
+    for each i in 1 until t.len
+        if not text.is_digit(t[i])
+            give false
+    give true
+
+to reg (s string, allow_sp bool) gives u64
+    new t = asmtext.lower(asmtext.strip(s))
+    if text.same(t, "sp") or text.same(t, "wsp")
+        if not allow_sp
+            asmtext.fail2("sp is not allowed here: ", s)
+        if text.same(t, "sp")
+            give 31 | is_x | is_sp
+        give 31 | is_sp
+    if text.same(t, "xzr")
+        give 31 | is_x
+    if text.same(t, "wzr")
+        give 31
+    if not is_reg(t)
+        asmtext.fail2("expected a register, found ", s)
+    new v u64 = 0
+    for each i in 1 until t.len
+        v = v * 10 + (t[i] - '0') as u64
+    if v > 30
+        asmtext.fail2("expected a register, found ", s)
+    if t[0] is 'x'
+        give v | is_x
+    give v
+
+to same_width2 (a u64, b u64)
+    if wide(a) is not wide(b)
+        fail("registers must all be x or all be w")
+
+to same_width3 (a u64, b u64, c u64)
+    same_width2(a, b)
+    same_width2(a, c)
+
+to zr_like (r u64) gives string
+    if wide(r)
+        give "xzr"
+    give "wzr"
+
+-- ---------------------------------------------------------------- immediates
+
+to imm (s string) gives i64
+    new t = asmtext.strip(s)
+    if t.len > 0 and t[0] is '#'
+        t = t[1 until t.len]
+    give asmtext.eval(t)
+
+-- Encode `value` as a logical immediate: N << 12 | immr << 6 | imms, or nothing.
+to bitmask (value u64, size u64) gives maybe u64
+    new full u64 = 0xFFFF_FFFF_FFFF_FFFF
+    if size is 32
+        full = 0xFFFF_FFFF
+    value = value & full
+    if value is 0 or value is full
+        give nothing
+    new e = size
+    while e > 2
+        new half = e / 2
+        new m = ((1 as u64) << half) - 1
+        if value & m is not (value >> half) & m
+            stop
+        e = half
+    new emask u64 = 0xFFFF_FFFF_FFFF_FFFF
+    if e < 64
+        emask = ((1 as u64) << e) - 1
+    new elem = value & emask
+    new ones u64 = 0
+    for each i in 0 until e
+        if (elem >> i) & 1 is 1
+            ones += 1
+    new run = ((1 as u64) << ones) - 1
+    if ones is 64
+        run = 0xFFFF_FFFF_FFFF_FFFF
+    new immr u64 = 99
+    for each r in 0 until e
+        new rot = run >> r
+        if r > 0
+            rot = rot | (run << (e - r))
+        rot = rot & emask
+        if rot is elem
+            immr = r
+            stop
+    if immr is 99
+        give nothing
+    new nbit u64 = 0
+    if e is 64
+        nbit = 1
+    new imms = (~(e * 2 - 1) & 0x3F) | (ones - 1)
+    give (nbit << 12) | (immr << 6) | imms
+
+-- 'lsl #3' -> kind (0 lsl, 1 lsr, 2 asr, 3 ror) and the amount.
+to shift_kind (s string) gives u64
+    new t = asmtext.lower(asmtext.strip(s))
+    if text.starts_with(t, "lsl")
+        give 0
+    if text.starts_with(t, "lsr")
+        give 1
+    if text.starts_with(t, "asr")
+        give 2
+    if text.starts_with(t, "ror")
+        give 3
+    asmtext.fail2("expected a shift like `lsl #3`, found ", s)
+    give 0
+
+to shift_amount (s string) gives u64
+    new t = asmtext.strip(s)
+    give imm(asmtext.strip(t[3 until t.len])) as u64
+
+-- ---------------------------------------------------------------- the encoder
+
+to need (ops ptr vec.vec, n u64, mn string)
+    if asmtext.op_count(ops) is not n
+        new b buf.buf
+        buf.add(addr of b, "`")
+        buf.add(addr of b, mn)
+        buf.add(addr of b, "` takes ")
+        buf.number(addr of b, n)
+        buf.add(addr of b, " operands")
+        fail(buf.text(addr of b))
+
+to o (ops ptr vec.vec, i u64) gives string
+    give asmtext.op(ops, i)
+
+to count (ops ptr vec.vec) gives u64
+    give asmtext.op_count(ops)
+
+to encode (mnemonic string, ops ptr vec.vec) gives u64
+    new mn = asmtext.lower(mnemonic)
+    if text.starts_with(mn, "b.")
+        new c = cond_code(mn[2 until mn.len])
+        if c is not nothing
+            need(ops, 1, "b.cond")
+            give 0x5400_0000 | (assembler.reloc("condbr19", o(ops, 0)) << 5) | (c else 0)
+    if text.same(mn, "mov")
+        give i_mov(ops)
+    if text.same(mn, "movz")
+        give wide_move(2, ops, "movz")
+    if text.same(mn, "movn")
+        give wide_move(0, ops, "movn")
+    if text.same(mn, "movk")
+        give wide_move(3, ops, "movk")
+    if text.same(mn, "add")
+        give addsub(0, 0, ops, "add")
+    if text.same(mn, "adds")
+        give addsub(0, 1, ops, "adds")
+    if text.same(mn, "sub")
+        give addsub(1, 0, ops, "sub")
+    if text.same(mn, "subs")
+        give addsub(1, 1, ops, "subs")
+    if text.same(mn, "cmp")
+        give addsub(1, 1, asmtext.prepend(zr_like(reg(o(ops, 0), true)), ops), "cmp")
+    if text.same(mn, "cmn")
+        give addsub(0, 1, asmtext.prepend(zr_like(reg(o(ops, 0), true)), ops), "cmn")
+    if text.same(mn, "neg")
+        new d = reg(o(ops, 0), false)
+        new two = asmtext.prepend(o(ops, 0), asmtext.prepend(zr_like(d), asmtext.rest(ops, 1)))
+        give addsub(1, 0, two, "neg")
+    if text.same(mn, "and")
+        give logical(0, ops, "and", 0)
+    if text.same(mn, "orr")
+        give logical(1, ops, "orr", 0)
+    if text.same(mn, "eor")
+        give logical(2, ops, "eor", 0)
+    if text.same(mn, "ands")
+        give logical(3, ops, "ands", 0)
+    if text.same(mn, "bic")
+        give logical(0, ops, "bic", 1)
+    if text.same(mn, "orn")
+        give logical(1, ops, "orn", 1)
+    if text.same(mn, "tst")
+        give logical(3, asmtext.prepend(zr_like(reg(o(ops, 0), false)), ops), "tst", 0)
+    if text.same(mn, "mvn")
+        new d = reg(o(ops, 0), false)
+        give logical(1, asmtext.prepend(o(ops, 0), asmtext.prepend(zr_like(d), asmtext.rest(ops, 1))), "mvn", 1)
+    if text.same(mn, "lsl")
+        give shift_op(ops, 0)
+    if text.same(mn, "lsr")
+        give shift_op(ops, 1)
+    if text.same(mn, "asr")
+        give shift_op(ops, 2)
+    if text.same(mn, "ubfx") or text.same(mn, "sbfx") or text.same(mn, "bfxil")
+        new d = reg(o(ops, 0), false)
+        new n = reg(o(ops, 1), false)
+        new lsb = imm(o(ops, 2)) as u64
+        new width = imm(o(ops, 3)) as u64
+        new opc u64 = 2
+        if text.same(mn, "sbfx")
+            opc = 0
+        else if text.same(mn, "bfxil")
+            opc = 1
+        give bitfield(opc, d, n, lsb, lsb + width - 1)
+    if text.same(mn, "bfi")
+        need(ops, 4, "bfi")
+        new d = reg(o(ops, 0), false)
+        new n = reg(o(ops, 1), false)
+        new size u64 = 32
+        if wide(d)
+            size = 64
+        new lsb = imm(o(ops, 2)) as u64
+        new width = imm(o(ops, 3)) as u64
+        give bitfield(1, d, n, (size - lsb % size) % size, width - 1)
+    if text.same(mn, "sxtb")
+        give extend(ops, false, 8)
+    if text.same(mn, "sxth")
+        give extend(ops, false, 16)
+    if text.same(mn, "sxtw")
+        give extend(ops, false, 32)
+    if text.same(mn, "uxtb")
+        give extend(ops, true, 8)
+    if text.same(mn, "uxth")
+        give extend(ops, true, 16)
+    if text.same(mn, "madd") or text.same(mn, "msub")
+        need(ops, 4, mn)
+        new d = reg(o(ops, 0), false)
+        new n = reg(o(ops, 1), false)
+        new m = reg(o(ops, 2), false)
+        new a = reg(o(ops, 3), false)
+        new base u64 = 0x1B00_0000
+        if text.same(mn, "msub")
+            base = 0x1B00_8000
+        give sf(d) | base | (num(m) << 16) | (num(a) << 10) | (num(n) << 5) | num(d)
+    if text.same(mn, "mul")
+        need(ops, 3, "mul")
+        new d = reg(o(ops, 0), false)
+        new n = reg(o(ops, 1), false)
+        new m = reg(o(ops, 2), false)
+        give sf(d) | 0x1B00_0000 | (num(m) << 16) | (31 << 10) | (num(n) << 5) | num(d)
+    if text.same(mn, "smulh") or text.same(mn, "umulh")
+        need(ops, 3, mn)
+        new base u64 = 0x9B40_0000
+        if text.same(mn, "umulh")
+            base = 0x9BC0_0000
+        give base | (num(reg(o(ops, 2), false)) << 16) | (31 << 10) | (num(reg(o(ops, 1), false)) << 5) | num(reg(o(ops, 0), false))
+    if text.same(mn, "udiv") or text.same(mn, "sdiv")
+        need(ops, 3, mn)
+        new d = reg(o(ops, 0), false)
+        new o1 u64 = 0
+        if text.same(mn, "sdiv")
+            o1 = 1
+        give sf(d) | 0x1AC0_0800 | (num(reg(o(ops, 2), false)) << 16) | (o1 << 10) | (num(reg(o(ops, 1), false)) << 5) | num(d)
+    if text.same(mn, "csel")
+        give csel(0x1A80_0000, ops)
+    if text.same(mn, "csinc")
+        give csel(0x1A80_0400, ops)
+    if text.same(mn, "csinv")
+        give csel(0x5A80_0000, ops)
+    if text.same(mn, "csneg")
+        give csel(0x5A80_0400, ops)
+    if text.same(mn, "cset") or text.same(mn, "csetm")
+        need(ops, 2, mn)
+        new d = reg(o(ops, 0), false)
+        new c = cond_code(o(ops, 1)) else 99
+        if c >= 14
+            fail("bad condition")
+        new base u64 = 0x1A80_0400
+        if text.same(mn, "csetm")
+            base = 0x5A80_0000
+        give sf(d) | base | (31 << 16) | ((c ^ 1) << 12) | (31 << 5) | num(d)
+    if text.same(mn, "b")
+        need(ops, 1, "b")
+        give 0x1400_0000 | assembler.reloc("jump26", o(ops, 0))
+    if text.same(mn, "bl")
+        need(ops, 1, "bl")
+        give 0x9400_0000 | assembler.reloc("call26", o(ops, 0))
+    if text.same(mn, "cbz") or text.same(mn, "cbnz")
+        need(ops, 2, mn)
+        new t = reg(o(ops, 0), false)
+        new base u64 = 0x3400_0000
+        if text.same(mn, "cbnz")
+            base = 0x3500_0000
+        give sf(t) | base | (assembler.reloc("condbr19", o(ops, 1)) << 5) | num(t)
+    if text.same(mn, "tbz") or text.same(mn, "tbnz")
+        need(ops, 3, mn)
+        new t = reg(o(ops, 0), false)
+        new bit = imm(o(ops, 1)) as u64
+        new base u64 = 0x3600_0000
+        if text.same(mn, "tbnz")
+            base = 0x3700_0000
+        give ((bit >> 5) << 31) | base | ((bit & 31) << 19) | (assembler.reloc("tstbr14", o(ops, 2)) << 5) | num(t)
+    if text.same(mn, "br")
+        give 0xD61F_0000 | (num(reg(o(ops, 0), false)) << 5)
+    if text.same(mn, "blr")
+        give 0xD63F_0000 | (num(reg(o(ops, 0), false)) << 5)
+    if text.same(mn, "ret")
+        new r u64 = 30
+        if count(ops) > 0
+            r = num(reg(o(ops, 0), false))
+        give 0xD65F_0000 | (r << 5)
+    if text.same(mn, "eret")
+        give 0xD69F_03E0
+    if text.same(mn, "adrp") or text.same(mn, "adr")
+        need(ops, 2, mn)
+        new d = reg(o(ops, 0), false)
+        if text.same(mn, "adrp")
+            new v = assembler.reloc("adrp", o(ops, 1))
+            give 0x9000_0000 | ((v & 3) << 29) | (((v >> 2) & 0x7FFFF) << 5) | num(d)
+        new v = assembler.reloc("adr21", o(ops, 1))
+        give 0x1000_0000 | ((v & 3) << 29) | (((v >> 2) & 0x7FFFF) << 5) | num(d)
+    if text.same(mn, "ldr") or text.same(mn, "str") or text.same(mn, "ldrb") or text.same(mn, "strb") or
+            text.same(mn, "ldrh") or text.same(mn, "strh") or text.same(mn, "ldrsb") or text.same(mn, "ldrsh") or
+            text.same(mn, "ldrsw")
+        give load_store(mn, ops)
+    if text.same(mn, "ldur") or text.same(mn, "stur")
+        new t = reg(o(ops, 0), false)
+        parse_mem(asmtext.rest(ops, 1))
+        if mem_kind is not 0 or mem_off < -256 or mem_off > 255
+            fail("ldur/stur take [Xn, #-256..255]")
+        new size u64 = 2
+        if wide(t)
+            size = 3
+        new opc u64 = 0
+        if text.same(mn, "ldur")
+            opc = 1
+        give (size << 30) | 0x3800_0000 | (opc << 22) | (((mem_off as u64) & 0x1FF) << 12) | (num(mem_base) << 5) | num(t)
+    if text.same(mn, "ldp") or text.same(mn, "stp")
+        give pair(text.same(mn, "ldp"), ops)
+    if text.same(mn, "ldxr")
+        give exclusive(0x885F_7C00, ops, false)
+    if text.same(mn, "ldaxr")
+        give exclusive(0x885F_FC00, ops, false)
+    if text.same(mn, "stxr")
+        give exclusive(0x8800_7C00, ops, true)
+    if text.same(mn, "stlxr")
+        give exclusive(0x8800_FC00, ops, true)
+    if text.same(mn, "ldar")
+        give exclusive(0x88DF_FC00, ops, false)
+    if text.same(mn, "stlr")
+        give exclusive(0x889F_FC00, ops, false)
+    if text.same(mn, "clrex")
+        give 0xD503_305F | (15 << 8)
+    if text.same(mn, "mrs")
+        need(ops, 2, "mrs")
+        give 0xD530_0000 | sysreg(o(ops, 1)) | num(reg(o(ops, 0), false))
+    if text.same(mn, "msr")
+        give i_msr(ops)
+    if text.same(mn, "dsb")
+        give barrier(4, ops)
+    if text.same(mn, "dmb")
+        give barrier(5, ops)
+    if text.same(mn, "isb")
+        give barrier(6, ops)
+    if text.same(mn, "nop")
+        give 0xD503_201F
+    if text.same(mn, "yield")
+        give 0xD503_203F
+    if text.same(mn, "wfe")
+        give 0xD503_205F
+    if text.same(mn, "wfi")
+        give 0xD503_207F
+    if text.same(mn, "sev")
+        give 0xD503_209F
+    if text.same(mn, "sevl")
+        give 0xD503_20BF
+    if text.same(mn, "svc")
+        give exception(0xD400_0001, ops)
+    if text.same(mn, "hvc")
+        give exception(0xD400_0002, ops)
+    if text.same(mn, "smc")
+        give exception(0xD400_0003, ops)
+    if text.same(mn, "brk")
+        give exception(0xD420_0000, ops)
+    if text.same(mn, "hlt")
+        give exception(0xD440_0000, ops)
+    if text.same(mn, "ic")
+        new w = asmtext.lower(o(ops, 0))
+        if text.same(w, "iallu")
+            give 0xD508_751F
+        if text.same(w, "ialluis")
+            give 0xD508_711F
+        fail("unsupported ic")
+    if text.same(mn, "tlbi")
+        give i_tlbi(ops)
+    if text.same(mn, "dc")
+        give i_dc(ops)
+    asmtext.fail2("unknown instruction ", mn)
+    give 0
+
+-- ---- moves
+
+to movewide (opc u64, d u64, imm16 u64, hw u64) gives u64
+    if d & is_sp is not 0
+        fail("cannot move a constant into sp")
+    if imm16 > 0xFFFF
+        fail("the constant does not fit in 16 bits")
+    if not wide(d) and hw > 1
+        fail("w registers only take lsl #0 or #16")
+    give sf(d) | (opc << 29) | 0x1280_0000 | (hw << 21) | (imm16 << 5) | num(d)
+
+to wide_move (opc u64, ops ptr vec.vec, mn string) gives u64
+    new d = reg(o(ops, 0), false)
+    new v = imm(o(ops, 1)) as u64
+    new hw u64 = 0
+    if count(ops) is 3
+        if shift_kind(o(ops, 2)) is not 0
+            fail("movz/movk/movn only shift with lsl")
+        new sh = shift_amount(o(ops, 2))
+        if sh % 16 is not 0
+            fail("the shift must be 0, 16, 32 or 48")
+        hw = sh / 16
+    give movewide(opc, d, v, hw)
+
+to i_mov (ops ptr vec.vec) gives u64
+    need(ops, 2, "mov")
+    if is_reg(o(ops, 1))
+        new d = reg(o(ops, 0), true)
+        new s = reg(o(ops, 1), true)
+        same_width2(d, s)
+        if d & is_sp is not 0 or s & is_sp is not 0
+            give addsub_imm(0, 0, d, s, 0, 0)
+        give logical_reg(1, d, 31 | (d & is_x), s, 0, 0, 0)
+    new d = reg(o(ops, 0), true)
+    new v = imm(o(ops, 1)) as u64
+    new size u64 = 32
+    new mask u64 = 0xFFFF_FFFF
+    if wide(d)
+        size = 64
+        mask = 0xFFFF_FFFF_FFFF_FFFF
+    new u = v & mask
+    for each hw in 0 until size / 16
+        if u & ~((0xFFFF as u64) << (16 * hw)) & mask is 0
+            give movewide(2, d, (u >> (16 * hw)) & 0xFFFF, hw)
+    new nu = ~v & mask
+    for each hw in 0 until size / 16
+        if nu & ~((0xFFFF as u64) << (16 * hw)) & mask is 0
+            give movewide(0, d, (nu >> (16 * hw)) & 0xFFFF, hw)
+    new bm = bitmask(u, size)
+    if bm is not nothing
+        new b = bm else 0
+        give sf(d) | 0x3200_0000 | (((b >> 12) & 1) << 22) | (((b >> 6) & 0x3F) << 16) | ((b & 0x3F) << 10) | (31 << 5) | num(d)
+    fail("cannot load this constant with one mov; use movz/movk")
+    give 0
+
+-- ---- add / sub
+
+to addsub_imm (op u64, s u64, d u64, n u64, imm12 u64, sh u64) gives u64
+    if imm12 > 0xFFF
+        fail("an add/sub immediate does not fit in 12 bits")
+    give sf(d) | (op << 30) | (s << 29) | 0x1100_0000 | (sh << 22) | (imm12 << 10) | (num(n) << 5) | num(d)
+
+to addsub (op u64, s u64, ops ptr vec.vec, mn string) gives u64
+    if count(ops) is not 3 and count(ops) is not 4
+        fail("add/sub take 3 or 4 operands")
+    new d = reg(o(ops, 0), s is 0)
+    new n = reg(o(ops, 1), true)
+    new third = asmtext.strip(o(ops, 2))
+    if text.starts_with(third, ":lo12:")
+        new v = assembler.reloc("add_lo12", third[6 until third.len])
+        give addsub_imm(op, s, d, n, v, 0)
+    if not is_reg(third)
+        new v = imm(third)
+        new sh u64 = 0
+        if count(ops) is 4
+            new amount = shift_amount(o(ops, 3))
+            if shift_kind(o(ops, 3)) is not 0 or (amount is not 0 and amount is not 12)
+                fail("an add/sub immediate can only shift by lsl #12")
+            if amount is 12
+                sh = 1
+        if v < 0
+            give addsub_imm(1 - op, s, d, n, (0 -% v) as u64, sh)
+        give addsub_imm(op, s, d, n, v as u64, sh)
+    new m = reg(third, false)
+    same_width3(d, n, m)
+    if d & is_sp is not 0 or n & is_sp is not 0
+        new amount u64 = 0
+        if count(ops) is 4
+            if shift_kind(o(ops, 3)) is not 0
+                fail("with sp only `lsl` works")
+            amount = shift_amount(o(ops, 3))
+        new option u64 = 2
+        if wide(d)
+            option = 3
+        give sf(d) | (op << 30) | (s << 29) | 0x0B20_0000 | (num(m) << 16) | (option << 13) | (amount << 10) | (num(n) << 5) | num(d)
+    new kind u64 = 0
+    new amount u64 = 0
+    if count(ops) is 4
+        kind = shift_kind(o(ops, 3))
+        amount = shift_amount(o(ops, 3))
+    give sf(d) | (op << 30) | (s << 29) | 0x0B00_0000 | (kind << 22) | (num(m) << 16) | (amount << 10) | (num(n) << 5) | num(d)
+
+-- ---- logical
+
+to logical_reg (opc u64, d u64, n u64, m u64, kind u64, amount u64, invert u64) gives u64
+    give sf(d) | (opc << 29) | 0x0A00_0000 | (kind << 22) | (invert << 21) | (num(m) << 16) | (amount << 10) | (num(n) << 5) | num(d)
+
+to logical (opc u64, ops ptr vec.vec, mn string, invert u64) gives u64
+    if count(ops) is not 3 and count(ops) is not 4
+        fail("logical operations take 3 or 4 operands")
+    new imm_form = not is_reg(o(ops, 2))
+    new d = reg(o(ops, 0), opc is not 3 and imm_form)
+    new n = reg(o(ops, 1), false)
+    if imm_form
+        if invert is 1
+            asmtext.fail2(mn, " has no immediate form")
+        new size u64 = 32
+        if wide(d)
+            size = 64
+        new bm = bitmask(imm(o(ops, 2)) as u64, size)
+        if bm is nothing
+            asmtext.fail2(o(ops, 2), " cannot be encoded as a logical immediate")
+        new b = bm else 0
+        give sf(d) | (opc << 29) | 0x1200_0000 | (((b >> 12) & 1) << 22) | (((b >> 6) & 0x3F) << 16) | ((b & 0x3F) << 10) | (num(n) << 5) | num(d)
+    new m = reg(o(ops, 2), false)
+    same_width3(d, n, m)
+    new kind u64 = 0
+    new amount u64 = 0
+    if count(ops) is 4
+        kind = shift_kind(o(ops, 3))
+        amount = shift_amount(o(ops, 3))
+    give logical_reg(opc, d, n, m, kind, amount, invert)
+
+-- ---- bit fields and shifts
+
+to bitfield (opc u64, d u64, n u64, immr u64, imms u64) gives u64
+    same_width2(d, n)
+    new s u64 = 0
+    if wide(d)
+        s = 1
+    give (s << 31) | (opc << 29) | 0x1300_0000 | (s << 22) | (immr << 16) | (imms << 10) | (num(n) << 5) | num(d)
+
+to shift_op (ops ptr vec.vec, kind u64) gives u64
+    need(ops, 3, "shift")
+    new d = reg(o(ops, 0), false)
+    new n = reg(o(ops, 1), false)
+    if is_reg(o(ops, 2))
+        new m = reg(o(ops, 2), false)
+        same_width3(d, n, m)
+        give sf(d) | 0x1AC0_2000 | (num(m) << 16) | (kind << 10) | (num(n) << 5) | num(d)
+    new size u64 = 32
+    if wide(d)
+        size = 64
+    new sh = imm(o(ops, 2)) as u64
+    if sh >= size
+        fail("shift amount out of range")
+    if kind is 0
+        give bitfield(2, d, n, (size - sh) % size, size - 1 - sh)
+    if kind is 1
+        give bitfield(2, d, n, sh, size - 1)
+    give bitfield(0, d, n, sh, size - 1)
+
+to extend (ops ptr vec.vec, unsigned bool, bits u64) gives u64
+    need(ops, 2, "extend")
+    new d = reg(o(ops, 0), false)
+    new n = reg(o(ops, 1), false)
+    if unsigned
+        give bitfield(2, d, n, 0, bits - 1)
+    give bitfield(0, d, num(n) | (d & is_x), 0, bits - 1)
+
+to csel (base u64, ops ptr vec.vec) gives u64
+    need(ops, 4, "csel")
+    new d = reg(o(ops, 0), false)
+    new n = reg(o(ops, 1), false)
+    new m = reg(o(ops, 2), false)
+    same_width3(d, n, m)
+    new c = cond_code(o(ops, 3)) else 99
+    if c is 99
+        fail("unknown condition")
+    give sf(d) | base | (num(m) << 16) | (c << 12) | (num(n) << 5) | num(d)
+
+-- ---- memory
+
+-- The parsed address of the last parse_mem call:
+new mem_base u64
+new mem_kind u64        -- 0 offset, 1 pre-index, 2 post-index, 3 register
+new mem_off i64
+new mem_index u64
+new mem_extra string    -- shift for a register offset, "" if none
+
+to parse_mem (ops ptr vec.vec) gives bool
+    new joined buf.buf
+    for each i in 0 until count(ops)
+        if i > 0
+            buf.add(addr of joined, ", ")
+        buf.add(addr of joined, asmtext.strip(o(ops, i)))
+    new t = buf.text(addr of joined)
+    if t.len is 0 or t[0] is not '['
+        give false
+    new close = text.find(t, ']') else 0
+    if close is 0
+        fail("bad memory operand")
+    new inside = asmtext.split_operands(t[1 until close])
+    new trailer = asmtext.strip(t[close + 1 until t.len])
+    new writeback = false
+    if trailer.len > 0 and trailer[0] is '!'
+        writeback = true
+        trailer = asmtext.strip(trailer[1 until trailer.len])
+    mem_base = reg(asmtext.op(inside, 0), true)
+    mem_extra = ""
+    if trailer.len > 0
+        if trailer[0] is not ','
+            fail("bad memory operand")
+        mem_kind = 2
+        mem_off = imm(asmtext.strip(trailer[1 until trailer.len]))
+        give true
+    if asmtext.op_count(inside) is 1
+        mem_kind = 0
+        if writeback
+            mem_kind = 1
+        mem_off = 0
+        give true
+    if is_reg(asmtext.op(inside, 1))
+        mem_kind = 3
+        mem_index = reg(asmtext.op(inside, 1), false)
+        if asmtext.op_count(inside) > 2
+            mem_extra = asmtext.op(inside, 2)
+        give true
+    mem_kind = 0
+    if writeback
+        mem_kind = 1
+    mem_off = imm(asmtext.op(inside, 1))
+    give true
+
+to load_store (mn string, ops ptr vec.vec) gives u64
+    new t = reg(o(ops, 0), false)
+    new size u64 = 0
+    new opc u64 = 0
+    if text.same(mn, "strb")
+        size = 0
+        opc = 0
+    else if text.same(mn, "ldrb")
+        size = 0
+        opc = 1
+    else if text.same(mn, "strh")
+        size = 1
+        opc = 0
+    else if text.same(mn, "ldrh")
+        size = 1
+        opc = 1
+    else if text.same(mn, "ldrsb") or text.same(mn, "ldrsh")
+        size = 0
+        if text.same(mn, "ldrsh")
+            size = 1
+        opc = 3
+        if wide(t)
+            opc = 2
+    else if text.same(mn, "ldrsw")
+        size = 2
+        opc = 2
+    else
+        size = 2
+        if wide(t)
+            size = 3
+        opc = 0
+        if text.same(mn, "ldr")
+            opc = 1
+    if not parse_mem(asmtext.rest(ops, 1))
+        if not text.same(mn, "ldr")
+            fail("loads and stores need an address in [ ]")
+        new v = assembler.reloc("ld_prel19", o(ops, 1))
+        new base u64 = 0x1800_0000
+        if wide(t)
+            base = 0x5800_0000
+        give base | (v << 5) | num(t)
+    if mem_kind is 0
+        new scale = (1 as u64) << size
+        if mem_off >= 0 and (mem_off as u64) % scale is 0 and (mem_off as u64) / scale <= 0xFFF
+            give (size << 30) | 0x3900_0000 | (opc << 22) | (((mem_off as u64) / scale) << 10) | (num(mem_base) << 5) | num(t)
+        if mem_off >= -256 and mem_off <= 255
+            give (size << 30) | 0x3800_0000 | (opc << 22) | (((mem_off as u64) & 0x1FF) << 12) | (num(mem_base) << 5) | num(t)
+        fail("offset cannot be encoded")
+    if mem_kind is 1 or mem_kind is 2
+        if mem_off < -256 or mem_off > 255
+            fail("offset out of range for pre/post index")
+        new idx u64 = 1
+        if mem_kind is 1
+            idx = 3
+        give (size << 30) | 0x3800_0000 | (opc << 22) | (((mem_off as u64) & 0x1FF) << 12) | (idx << 10) | (num(mem_base) << 5) | num(t)
+    new option u64 = 2
+    if wide(mem_index)
+        option = 3
+    new s u64 = 0
+    if mem_extra.len > 0
+        new a = shift_amount(mem_extra)
+        if a is not 0 and a is not size
+            fail("the shift must match the access size")
+        if a is size and a is not 0
+            s = 1
+    give (size << 30) | 0x3820_0800 | (opc << 22) | (num(mem_index) << 16) | (option << 13) | (s << 12) | (num(mem_base) << 5) | num(t)
+
+to pair (load bool, ops ptr vec.vec) gives u64
+    new t1 = reg(o(ops, 0), false)
+    new t2 = reg(o(ops, 1), false)
+    same_width2(t1, t2)
+    parse_mem(asmtext.rest(ops, 2))
+    if mem_kind is 3
+        fail("ldp/stp cannot use a register offset")
+    new scale i64 = 4
+    if wide(t1)
+        scale = 8
+    if mem_off % scale is not 0
+        fail("pair offsets must be multiples of the register size")
+    new imm7 = mem_off / scale
+    if imm7 < -64 or imm7 > 63
+        fail("pair offset out of range")
+    new idx u64 = 2
+    if mem_kind is 1
+        idx = 3
+    else if mem_kind is 2
+        idx = 1
+    new opc u64 = 0
+    if wide(t1)
+        opc = 2
+    new l u64 = 0
+    if load
+        l = 1
+    give (opc << 30) | 0x2800_0000 | (idx << 23) | (l << 22) | (((imm7 as u64) & 0x7F) << 15) | (num(t2) << 10) | (num(mem_base) << 5) | num(t1)
+
+to exclusive (base32 u64, ops ptr vec.vec, status bool) gives u64
+    new first u64 = 1
+    new s u64 = 0
+    if status
+        s = reg(o(ops, 0), false)
+        first = 1
+    else
+        first = 0
+    new t = reg(o(ops, first), false)
+    parse_mem(asmtext.rest(ops, first + 1))
+    new w = base32 | (num(mem_base) << 5) | num(t)
+    if wide(t)
+        w = w | ((1 as u64) << 30)
+    if status
+        w = (w & ~((0x1F as u64) << 16)) | (num(s) << 16)
+    give w
+
+-- ---- system
+
+fixed sysreg_names [53] string = ["midr_el1", "mpidr_el1", "sctlr_el1", "cpacr_el1", "ttbr0_el1",
+    "ttbr1_el1", "tcr_el1", "spsr_el1", "elr_el1", "sp_el0", "spsel", "currentel", "daif",
+    "esr_el1", "far_el1", "par_el1", "mair_el1", "vbar_el1", "contextidr_el1", "tpidr_el1",
+    "tpidr_el0", "tpidrro_el0", "cntfrq_el0", "cntpct_el0", "cntvct_el0", "cntp_tval_el0",
+    "cntp_ctl_el0", "cntp_cval_el0", "cntv_tval_el0", "cntv_ctl_el0", "cntv_cval_el0",
+    "cntkctl_el1", "sctlr_el2", "hcr_el2", "cptr_el2", "spsr_el2", "elr_el2", "sp_el1",
+    "esr_el2", "far_el2", "vbar_el2", "cnthctl_el2", "cntvoff_el2", "tpidr_el2", "mair_el2",
+    "tcr_el2", "ttbr0_el2", "vpidr_el2", "vmpidr_el2", "isr_el1", "id_aa64mmfr0_el1",
+    "ctr_el0", "cntvct_el0"]
+-- op0 op1 CRn CRm op2, packed as op0<<16 | op1<<12 | crn<<8 | crm<<4 | op2
+fixed sysreg_codes [53] u64 = [0x30000, 0x30005, 0x30100, 0x30102, 0x30200,
+    0x30201, 0x30202, 0x30400, 0x30401, 0x30410, 0x30420, 0x30422, 0x33421,
+    0x30520, 0x30600, 0x30740, 0x30a20, 0x30c00, 0x30d01, 0x30d04,
+    0x33d02, 0x33d03, 0x33e00, 0x33e01, 0x33e02, 0x33e20,
+    0x33e21, 0x33e22, 0x33e30, 0x33e31, 0x33e32,
+    0x30e10, 0x34100, 0x34110, 0x34112, 0x34400, 0x34401, 0x34410,
+    0x34520, 0x34600, 0x34c00, 0x34e10, 0x34e03, 0x34d02, 0x34a20,
+    0x34202, 0x34200, 0x34000, 0x34005, 0x30c10, 0x30070,
+    0x33001, 0x33e02]
+
+-- The o0 op1 CRn CRm op2 bits of an mrs/msr for the named register.
+to sysreg (s string) gives u64
+    new t = asmtext.lower(asmtext.strip(s))
+    for each i in 0 until 53
+        if text.same(sysreg_names[i], t)
+            give fields(sysreg_codes[i])
+    -- s<op0>_<op1>_c<n>_c<m>_<op2>
+    if t.len > 0 and t[0] is 's'
+        new parts [5] u64
+        new k u64 = 0
+        new v u64 = 0
+        new any = false
+        for each i in 1 until t.len
+            new c = t[i]
+            if text.is_digit(c)
+                v = v * 10 + (c - '0') as u64
+                any = true
+            else if c is '_'
+                if k < 5
+                    parts[k] = v
+                k += 1
+                v = 0
+                any = false
+        if any and k is 4
+            parts[4] = v
+            give fields((parts[0] << 16) | (parts[1] << 12) | (parts[2] << 8) | (parts[3] << 4) | parts[4])
+    asmtext.fail2("unknown system register ", s)
+    give 0
+
+to fields (code u64) gives u64
+    new op0 = (code >> 16) & 0xF
+    new op1 = (code >> 12) & 0xF
+    new crn = (code >> 8) & 0xF
+    new crm = (code >> 4) & 0xF
+    new op2 = code & 0xF
+    give ((op0 - 2) << 19) | (op1 << 16) | (crn << 12) | (crm << 8) | (op2 << 5)
+
+to i_msr (ops ptr vec.vec) gives u64
+    need(ops, 2, "msr")
+    new name = asmtext.lower(asmtext.strip(o(ops, 0)))
+    if text.same(name, "daifset") or text.same(name, "daifclr") or text.same(name, "spsel")
+        new op2 u64 = 5
+        new op1 u64 = 0
+        if text.same(name, "daifset")
+            op2 = 6
+            op1 = 3
+        else if text.same(name, "daifclr")
+            op2 = 7
+            op1 = 3
+        give 0xD500_401F | (op1 << 16) | (((imm(o(ops, 1)) as u64) & 15) << 8) | (op2 << 5)
+    give 0xD510_0000 | sysreg(o(ops, 0)) | num(reg(o(ops, 1), false))
+
+fixed barrier_names [12] string = ["sy", "st", "ld", "ish", "ishst", "ishld", "nsh", "nshst", "nshld", "osh", "oshst", "oshld"]
+fixed barrier_codes [12] u64 = [15, 14, 13, 11, 10, 9, 7, 6, 5, 3, 2, 1]
+
+to barrier (op2 u64, ops ptr vec.vec) gives u64
+    new opt u64 = 15
+    if count(ops) > 0
+        new t = asmtext.lower(asmtext.strip(o(ops, 0)))
+        new found = false
+        for each i in 0 until 12
+            if text.same(barrier_names[i], t)
+                opt = barrier_codes[i]
+                found = true
+        if not found
+            opt = imm(t) as u64
+    give 0xD503_301F | (opt << 8) | (op2 << 5)
+
+to exception (base u64, ops ptr vec.vec) gives u64
+    new v u64 = 0
+    if count(ops) > 0
+        v = imm(o(ops, 0)) as u64
+    if v > 0xFFFF
+        fail("the immediate must fit in 16 bits")
+    give base | (v << 5)
+
+to sys (op1 u64, crn u64, crm u64, op2 u64, rt u64) gives u64
+    give 0xD508_0000 | (op1 << 16) | (crn << 12) | (crm << 8) | (op2 << 5) | rt
+
+fixed tlbi_names [6] string = ["vmalle1", "vmalle1is", "alle2", "alle2is", "vae1", "vae1is"]
+fixed tlbi_codes [6] u64 = [0x0870, 0x0830, 0x4870, 0x4830, 0x0871, 0x0831]
+
+to i_tlbi (ops ptr vec.vec) gives u64
+    new t = asmtext.lower(asmtext.strip(o(ops, 0)))
+    new rt u64 = 31
+    if count(ops) > 1
+        rt = num(reg(o(ops, 1), false))
+    for each i in 0 until 6
+        if text.same(tlbi_names[i], t)
+            new c = tlbi_codes[i]
+            give sys((c >> 12) & 0xF, (c >> 8) & 0xF, (c >> 4) & 0xF, c & 0xF, rt)
+    fail("unsupported tlbi")
+    give 0
+
+fixed dc_names [7] string = ["civac", "cvac", "cvau", "ivac", "zva", "cisw", "isw"]
+fixed dc_codes [7] u64 = [0x37e1, 0x37a1, 0x37b1, 0x0761, 0x3741, 0x07e2, 0x0762]
+
+to i_dc (ops ptr vec.vec) gives u64
+    need(ops, 2, "dc")
+    new t = asmtext.lower(asmtext.strip(o(ops, 0)))
+    for each i in 0 until 7
+        if text.same(dc_names[i], t)
+            new c = dc_codes[i]
+            give sys((c >> 12) & 0xF, (c >> 8) & 0xF, (c >> 4) & 0xF, c & 0xF, num(reg(o(ops, 1), false)))
+    fail("unsupported dc")
+    give 0

@@ -1,6 +1,7 @@
-"""Check ArmOS's own assembler and linker against clang + lld.
+"""Check ArmOS's own assemblers and linkers against clang + lld.
 
-Builds every program both ways and requires the images to match byte for byte:
+Builds every program three ways - clang + lld, the stage-0 tools (Python) and the
+DULL toolchain - and requires the images to match byte for byte:
 all runnable tests (QEMU virt), the kernel for both boards, both loaders, and
 tests/asm/zoo.s, a file exercising every instruction form we encode.
 
@@ -39,9 +40,12 @@ def first_difference(a, b):
     return min(len(a), len(b))
 
 
+BACKENDS = ("llvm", "own", "dull")
+
+
 def compare(name, build_one):
     paths = {}
-    for backend in ("llvm", "own"):
+    for backend in BACKENDS:
         out = os.path.join(OUT, backend)
         try:
             _, img = build_one(out, backend)
@@ -49,6 +53,10 @@ def compare(name, build_one):
             return f"{backend} build failed: {e}"
         with open(img, "rb") as f:
             paths[backend] = f.read()
+    if paths["dull"] != paths["own"]:
+        a, b = paths["own"], paths["dull"]
+        i = first_difference(a, b)
+        return (f"DULL toolchain differs from stage 0 ({len(b)} vs {len(a)} bytes) at offset {i:#x}")
     a, b = paths["llvm"], paths["own"]
     if a == b:
         return None

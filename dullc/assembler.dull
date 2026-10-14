@@ -1,0 +1,491 @@
+-- The assembler: assembly text -> an object (sections, symbols, relocations) for the
+-- linker. A port of stage0/aa64/assembler.py.
+
+use mem
+use text
+use buf
+use vec
+use map
+use asmtext
+use encode
+
+fixed nop u64 = 0xD503_201F
+
+shape section
+    name   string
+    code   bool
+    nobits bool
+    data   buf.buf
+    size   u64              -- also counts .bss bytes, which have no data
+    align  u64
+    relocs ptr vec.vec      -- ptr relocation
+
+shape relocation
+    offset u64
+    kind   string
+    symbol string
+    addend i64
+    line   u64
+
+shape symbol
+    name    string
+    sec     ptr section     -- 0: an absolute constant
+    value   u64
+    global  bool
+
+shape object
+    path     string
+    sections ptr map.map    -- name -> ptr section, in order of first use
+    symbols  ptr map.map    -- name -> ptr symbol
+    aliases  ptr map.map    -- name -> ptr string (.set a, b)
+    globals  ptr map.map    -- names marked .global
+
+-- ---------------------------------------------------------------- state
+
+new obj ptr object
+new sec ptr section
+new pass_no u64
+
+to fail (m string)
+    asmtext.fail(m)
+
+to keep (s string) gives u64
+    new p = mem.alloc(size_of(string)) as ptr string
+    deref p = s
+    give p as u64
+
+to kept (p u64) gives string
+    give deref (p as ptr string)
+
+-- ---------------------------------------------------------------- sections and symbols
+
+to switch_to (name string, code_flag bool)
+    new found = map.get(obj.sections, name)
+    if found is not nothing
+        sec = (found else 0) as ptr section
+        give
+    new s = mem.alloc(size_of(section)) as ptr section
+    s.name = name
+    s.code = text.same(name, ".text") or text.starts_with(name, ".text.") or code_flag
+    s.nobits = text.same(name, ".bss") or text.starts_with(name, ".bss.")
+    s.align = 1
+    if s.code
+        s.align = 4
+    s.relocs = vec.make()
+    map.put(obj.sections, name, s as u64)
+    sec = s
+
+to here gives u64
+    give sec.size
+
+to define (name string)
+    if pass_no is 1
+        if map.has(obj.symbols, name) or map.has(asmtext.consts, name)
+            asmtext.fail2(name, " is defined twice")
+        new sym = mem.alloc(size_of(symbol)) as ptr symbol
+        sym.name = name
+        sym.sec = sec
+        sym.value = here()
+        map.put(obj.symbols, name, sym as u64)
+
+to emit_bytes (data string)
+    if sec.nobits
+        for each c in data
+            if c is not 0
+                fail("cannot put data in .bss")
+        sec.size += data.len
+        give
+    if pass_no is 2
+        buf.add(addr of sec.data, data)
+    sec.size += data.len
+
+to emit_zeros (count u64, fill u8)
+    if sec.nobits
+        if fill is not 0
+            fail("cannot put data in .bss")
+        sec.size += count
+        give
+    if pass_no is 2
+        for each i in 0 until count
+            buf.byte(addr of sec.data, fill)
+    sec.size += count
+
+to emit_value (v u64, size u64)
+    if sec.nobits
+        if v is not 0
+            fail("cannot put data in .bss")
+        sec.size += size
+        give
+    if pass_no is 2
+        for each i in 0 until size
+            buf.byte(addr of sec.data, ((v >> (i * 8)) & 0xFF) as u8)
+    sec.size += size
+
+-- Record a relocation at the current place (pass 2) for `t` = symbol [+|- expr].
+-- Gives 0, the placeholder the linker fills in.
+to reloc (kind string, t string) gives u64
+    new s = asmtext.strip(t)
+    new j u64 = 0
+    while j < s.len and asmtext.is_ident(s[j])
+        j += 1
+    if j is 0 or not asmtext.is_ident_start(s[0])
+        asmtext.fail2("expected a symbol, found ", t)
+    new name = s[0 until j]
+    new rest = asmtext.strip(s[j until s.len])
+    new addend i64 = 0
+    if rest.len > 0
+        if rest[0] is '+'
+            addend = asmtext.eval(rest[1 until rest.len])
+        else if rest[0] is '-'
+            addend = 0 -% asmtext.eval(rest[1 until rest.len])
+        else
+            asmtext.fail2("expected a symbol, found ", t)
+    if map.has(asmtext.consts, name) and not text.same(kind, "abs64") and not text.same(kind, "abs32")
+        asmtext.fail2(name, " is a constant, not an address")
+    if pass_no is 2
+        new r = mem.alloc(size_of(relocation)) as ptr relocation
+        r.offset = here()
+        r.kind = kind
+        r.symbol = name
+        r.addend = addend
+        r.line = asmtext.lineno
+        vec.push(sec.relocs, r as u64)
+    give 0
+
+-- ---------------------------------------------------------------- preprocessing
+
+-- (line number, text) pairs after comments, .rept and numbered labels.
+new lines ptr vec.vec
+
+to add_line (target ptr vec.vec, n u64, s string)
+    vec.push(target, n)
+    vec.push(target, keep(s))
+
+to preprocess (src string)
+    lines = vec.make()
+    new stack = vec.make()          -- open .rept blocks: (count, ptr vec of lines)
+    new pos u64 = 0
+    new n u64 = 0
+    while pos <= src.len
+        new start = pos
+        while pos < src.len and src[pos] is not '\n'
+            pos += 1
+        new raw = src[start until pos]
+        if raw.len > 0 and raw[raw.len - 1] is '\r'
+            raw = raw[0 until raw.len - 1]
+        pos += 1
+        n += 1
+        new s = asmtext.strip_comment(raw)
+        new low = asmtext.lower(s)
+        new target = lines
+        if stack.len > 0
+            target = vec.get(stack, stack.len - 1) as ptr vec.vec
+        if text.starts_with(low, ".rept")
+            asmtext.lineno = n
+            vec.push(stack, asmtext.eval(s[5 until s.len]) as u64)
+            vec.push(stack, vec.make() as u64)
+            skip
+        if text.starts_with(low, ".endr")
+            if stack.len is 0
+                asmtext.lineno = n
+                fail(".endr without .rept")
+            new body = vec.pop(stack) as ptr vec.vec
+            new count = vec.pop(stack)
+            new outer = lines
+            if stack.len > 0
+                outer = vec.get(stack, stack.len - 1) as ptr vec.vec
+            for each k in 0 until count
+                for each i in 0 until body.len
+                    vec.push(outer, vec.get(body, i))
+            skip
+        add_line(target, n, s)
+    if stack.len > 0
+        fail(".rept without .endr")
+    number_labels()
+
+-- `1:` definitions become .Lnum1_<k>; `1b` / `1f` references point at the right one.
+to number_labels
+    new defs = map.make()             -- "1" -> ptr vec of line indexes
+    new count = lines.len / 2
+    for each i in 0 until count
+        new s = kept(vec.get(lines, i * 2 + 1))
+        new d = digits_label(s)
+        if d.len > 0
+            new list = map.get(defs, d)
+            if list is nothing
+                new v = vec.make()
+                map.put(defs, d, v as u64)
+                vec.push(v, i)
+            else
+                vec.push((list else 0) as ptr vec.vec, i)
+    for each i in 0 until count
+        new s = kept(vec.get(lines, i * 2 + 1))
+        asmtext.lineno = vec.get(lines, i * 2)
+        new out buf.buf
+        new d = digits_label(s)
+        new body = s
+        if d.len > 0
+            buf.add(addr of out, ".Lnum")
+            buf.add(addr of out, d)
+            buf.byte(addr of out, '_')
+            buf.number(addr of out, index_in(map.get(defs, d) else 0, i))
+            buf.byte(addr of out, ':')
+            body = s[d.len + 1 until s.len]
+        -- skip any further leading labels, then rewrite refs in an instruction's operands
+        new prefix_end = leading_labels(body)
+        buf.add(addr of out, body[0 until prefix_end])
+        new rest = body[prefix_end until body.len]
+        new sp = text.find(rest, ' ') else rest.len
+        if rest.len > 0 and rest[0] is not '.' and sp < rest.len
+            buf.add(addr of out, rest[0 until sp])
+            buf.byte(addr of out, ' ')
+            rewrite_refs(addr of out, rest[sp + 1 until rest.len], defs, i)
+        else
+            buf.add(addr of out, rest)
+        vec.set(lines, i * 2 + 1, keep(asmtext.strip(buf.text(addr of out))))
+
+-- "12" if `s` starts with "12:" (a numbered label), else "".
+to digits_label (s string) gives string
+    new j u64 = 0
+    while j < s.len and text.is_digit(s[j])
+        j += 1
+    if j > 0 and j < s.len and s[j] is ':'
+        give s[0 until j]
+    give ""
+
+-- Length of the `name:` labels at the start of `s` (with their spaces).
+to leading_labels (s string) gives u64
+    new i u64 = 0
+    repeat
+        new j = i
+        while j < s.len and text.is_space(s[j])
+            j += 1
+        if j >= s.len or not asmtext.is_ident_start(s[j])
+            give i
+        new k = j
+        while k < s.len and asmtext.is_ident(s[k])
+            k += 1
+        new m = k
+        while m < s.len and text.is_space(s[m])
+            m += 1
+        if m < s.len and s[m] is ':' and not (m + 1 < s.len and s[m + 1] is ':')
+            i = m + 1
+        else
+            give i
+
+to index_in (list u64, line u64) gives u64
+    new v = list as ptr vec.vec
+    for each k in 0 until v.len
+        if vec.get(v, k) is line
+            give k
+    give 0
+
+to rewrite_refs (out ptr buf.buf, ops string, defs ptr map.map, line u64)
+    new i u64 = 0
+    while i < ops.len
+        new c = ops[i]
+        new prev u8 = ' '
+        if i > 0
+            prev = ops[i - 1]
+        if text.is_digit(c) and not asmtext.is_ident(prev) and prev is not '#'
+            new j = i
+            while j < ops.len and text.is_digit(ops[j])
+                j += 1
+            if j < ops.len and (ops[j] is 'b' or ops[j] is 'f') and (j + 1 >= ops.len or not asmtext.is_ident(ops[j + 1]))
+                new num = ops[i until j]
+                new list = map.get(defs, num)
+                if list is nothing
+                    asmtext.fail2("no such numbered label: ", num)
+                new v = (list else 0) as ptr vec.vec
+                new pick i64 = -1
+                for each k in 0 until v.len
+                    new at_line = vec.get(v, k)
+                    if ops[j] is 'b' and at_line <= line
+                        pick = k as i64
+                    if ops[j] is 'f' and at_line > line and pick < 0
+                        pick = k as i64
+                if pick < 0
+                    asmtext.fail2("no matching numbered label for ", ops[i until j + 1])
+                buf.add(out, ".Lnum")
+                buf.add(out, num)
+                buf.byte(out, '_')
+                buf.number(out, pick as u64)
+                i = j + 1
+                skip
+            buf.add(out, ops[i until j])
+            i = j
+            skip
+        buf.byte(out, c)
+        i += 1
+
+-- ---------------------------------------------------------------- statements
+
+to statement (line string)
+    new s = line
+    repeat
+        new j = leading_labels(s)
+        if j is 0
+            stop
+        -- define each label in s[0 until j]
+        new i u64 = 0
+        while i < j
+            while i < j and text.is_space(s[i])
+                i += 1
+            new k = i
+            while k < j and asmtext.is_ident(s[k])
+                k += 1
+            if sec as u64 is 0
+                switch_to(".text", false)
+            define(s[i until k])
+            i = k
+            while i < j and s[i] is not ':'
+                i += 1
+            i += 1
+        s = asmtext.strip(s[j until s.len])
+    if s.len is 0
+        give
+    new sp u64 = 0
+    while sp < s.len and not text.is_space(s[sp])
+        sp += 1
+    new word = s[0 until sp]
+    new rest = asmtext.strip(s[sp until s.len])
+    if word[0] is '.'
+        directive(asmtext.lower(word), rest)
+        give
+    if sec as u64 is 0
+        switch_to(".text", false)
+    if not sec.code
+        asmtext.fail2("instruction outside a code section: ", word)
+    if sec.size % 4 is not 0
+        fail("instruction is not 4-byte aligned")
+    new w u64 = 0
+    if pass_no is 2
+        w = encode.encode(word, asmtext.split_operands(rest))
+    emit_value(w & 0xFFFF_FFFF, 4)
+
+to directive (d string, rest string)
+    new ops = asmtext.split_operands(rest)
+    if text.same(d, ".text") or text.same(d, ".data") or text.same(d, ".bss")
+        switch_to(d, false)
+        give
+    if text.same(d, ".section")
+        new name = asmtext.op(ops, 0)
+        new code_flag = false
+        if asmtext.op_count(ops) > 1 and asmtext.op(ops, 1)[0] is '"'
+            new flags = asmtext.parse_string(asmtext.op(ops, 1))
+            code_flag = text.find(flags, 'x') is not nothing
+        switch_to(name, code_flag)
+        give
+    if text.same(d, ".global") or text.same(d, ".globl")
+        for each i in 0 until asmtext.op_count(ops)
+            map.put(obj.globals, asmtext.op(ops, i), 1)
+        give
+    if text.same(d, ".type") or text.same(d, ".size") or text.same(d, ".file") or text.same(d, ".ident")
+        give
+    if text.same(d, ".set") or text.same(d, ".equ")
+        new name = asmtext.op(ops, 0)
+        new value = asmtext.op(ops, 1)
+        new v i64 = 0
+        if asmtext.try_eval(value, addr of v)
+            map.put(asmtext.consts, name, v as u64)
+        else
+            map.put(obj.aliases, name, keep(value))
+        give
+    if sec as u64 is 0
+        switch_to(".text", false)
+    if text.same(d, ".balign") or text.same(d, ".p2align") or text.same(d, ".align")
+        new nbytes = asmtext.eval(asmtext.op(ops, 0)) as u64
+        if not text.same(d, ".balign")
+            nbytes = (1 as u64) << nbytes
+        if nbytes & (nbytes - 1) is not 0
+            fail(".balign needs a power of two")
+        if nbytes > sec.align
+            sec.align = nbytes
+        new pad = (nbytes - here() % nbytes) % nbytes
+        if sec.code and asmtext.op_count(ops) is 1
+            emit_zeros(pad % 4, 0)
+            for each i in 0 until pad / 4
+                emit_value(nop, 4)
+        else
+            new fill u8 = 0
+            if asmtext.op_count(ops) > 1
+                fill = ((asmtext.eval(asmtext.op(ops, 1)) as u64) & 0xFF) as u8
+            emit_zeros(pad, fill)
+        give
+    new size = data_size(d)
+    if size > 0
+        for each i in 0 until asmtext.op_count(ops)
+            new item = asmtext.strip(asmtext.op(ops, i))
+            new v i64 = 0
+            if asmtext.try_eval(item, addr of v)
+                emit_value(v as u64 & mask_for(size), size)
+            else
+                if size is not 4 and size is not 8
+                    asmtext.fail2(item, " is not a constant")
+                if size is 8
+                    reloc("abs64", item)
+                else
+                    reloc("abs32", item)
+                emit_value(0, size)
+        give
+    if text.same(d, ".zero") or text.same(d, ".space") or text.same(d, ".skip")
+        new count = asmtext.eval(asmtext.op(ops, 0)) as u64
+        new fill u8 = 0
+        if asmtext.op_count(ops) > 1
+            fill = ((asmtext.eval(asmtext.op(ops, 1)) as u64) & 0xFF) as u8
+        emit_zeros(count, fill)
+        give
+    if text.same(d, ".ascii") or text.same(d, ".asciz") or text.same(d, ".string")
+        for each i in 0 until asmtext.op_count(ops)
+            emit_bytes(asmtext.parse_string(asmtext.op(ops, i)))
+            if not text.same(d, ".ascii")
+                emit_zeros(1, 0)
+        give
+    asmtext.fail2("unknown directive ", d)
+
+to data_size (d string) gives u64
+    if text.same(d, ".byte")
+        give 1
+    if text.same(d, ".hword") or text.same(d, ".short") or text.same(d, ".2byte")
+        give 2
+    if text.same(d, ".word") or text.same(d, ".long") or text.same(d, ".4byte")
+        give 4
+    if text.same(d, ".xword") or text.same(d, ".quad") or text.same(d, ".dword") or text.same(d, ".8byte")
+        give 8
+    give 0
+
+to mask_for (size u64) gives u64
+    if size is 8
+        give 0xFFFF_FFFF_FFFF_FFFF
+    give ((1 as u64) << (size * 8)) - 1
+
+-- ---------------------------------------------------------------- the driver
+
+to assemble (src string, path string) gives ptr object
+    obj = mem.alloc(size_of(object)) as ptr object
+    obj.path = path
+    obj.sections = map.make()
+    obj.symbols = map.make()
+    obj.aliases = map.make()
+    obj.globals = map.make()
+    asmtext.consts = map.make()
+    asmtext.file = path
+    asmtext.lineno = 0
+    preprocess(src)
+    for each p in 1 through 2
+        pass_no = p
+        for each i in 0 until map.count(obj.sections)
+            new s = map.value_at(obj.sections, i) as ptr section
+            s.size = 0
+            s.data.len = 0
+            s.relocs = vec.make()
+        sec = 0 as ptr section
+        for each i in 0 until lines.len / 2
+            asmtext.lineno = vec.get(lines, i * 2)
+            statement(kept(vec.get(lines, i * 2 + 1)))
+    for each i in 0 until map.count(obj.globals)
+        new name = map.key_at(obj.globals, i)
+        new found = map.get(obj.symbols, name)
+        if found is not nothing
+            ((found else 0) as ptr symbol).global = true
+    give obj

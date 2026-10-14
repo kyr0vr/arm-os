@@ -1,8 +1,12 @@
-"""Shared build steps: DULL -> .s (stage-0 compiler) -> image.
+"""Shared build steps: DULL source -> image.
 
-Two back ends turn assembly into an image:
-  "own"   ArmOS's own assembler and linker (stage0/aa64) — the default
-  "llvm"  clang + lld from the `ziglang` package — kept only to check "own" against
+Three back ends:
+  "dull"  the DULL toolchain (dullc/: compiler, assembler and linker, all in DULL),
+          running on the PC inside QEMU - the default
+  "own"   the stage-0 tools in Python (stage0/dullc + stage0/aa64) - the bootstrap
+  "llvm"  stage-0 compiler + clang/lld from the `ziglang` package - only for checking
+
+The DULL toolchain is bootstrapped from nothing by stage 0 (see dullc_elf()).
 """
 
 import os
@@ -11,11 +15,23 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "stage0"))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import aa64  # noqa: E402
+import qemu  # noqa: E402
 from dullc import DullError, compile_file  # noqa: E402,F401
 
 TARGET = ["-target", "aarch64-freestanding-none", "-mcpu=cortex_a76"]
+KERNEL = os.path.join(ROOT, "kernel")
+VIRT = os.path.join(ROOT, "rt", "virt")
+LIB = os.path.join(ROOT, "lib")
+DEFAULT_BACKEND = os.environ.get("ARMOS_BACKEND", "dull")
+
+
+class ToolError(RuntimeError):
+    pass
+
+
 BuildError = (DullError, aa64.AsmError, RuntimeError)
 
 
@@ -30,14 +46,66 @@ def link_script(rt_dir, base):
         return f.read().replace("@BASE@", hex(base))
 
 
-KERNEL = os.path.join(ROOT, "kernel")
+def rel(path):
+    return os.path.relpath(os.path.abspath(path), ROOT).replace("\\", "/")
 
 
-def build(source, rt_dir, base, out_dir, name, debug=True, extra_includes=(), backend="own",
+# ---------------------------------------------------------------- the DULL toolchain
+
+def _newest(patterns):
+    import glob
+    t = 0
+    for p in patterns:
+        for f in glob.glob(os.path.join(ROOT, p)):
+            t = max(t, os.path.getmtime(f))
+    return t
+
+
+def dullc_elf():
+    """The DULL toolchain, built by itself.
+
+    Generation 1 is built by stage 0 (Python); generation 1 then builds generation 2
+    with only DULL tools. Generation 2 is what the "dull" back end runs. Both are
+    rebuilt when dullc/, lib/ or rt/virt change."""
+    out = os.path.join(ROOT, "build", "dull")
+    gen2 = os.path.join(out, "dullc2.elf")
+    sources = ["dullc/*.dull", "lib/*.dull", "rt/virt/*"]
+    if os.path.exists(gen2) and os.path.getmtime(gen2) >= _newest(sources):
+        return gen2
+    os.makedirs(out, exist_ok=True)
+    gen1, _ = build(os.path.join(ROOT, "dullc", "main.dull"), VIRT, 0x4008_0000, out, "dullc1",
+                    extra_includes=[LIB], backend="own")
+    _dull_build(gen1, os.path.join(ROOT, "dullc", "main.dull"), VIRT, 0x4008_0000,
+                os.path.join(out, "dullc2"), True, [LIB], [])
+    return gen2
+
+
+def _dull_build(tool, source, rt_dir, base, prefix, debug, includes, extra_asm):
+    args = ["dullc", "build", rel(source) if source else "-", rel(os.path.join(rt_dir, "link.ld")),
+            hex(base), rel(prefix)]
+    for d in [rt_dir, *includes]:
+        args += ["-I", rel(d)]
+    for s in [os.path.join(rt_dir, "start.s"), *extra_asm]:
+        args += ["-S", rel(s)]
+    if not debug:
+        args.append("--release")
+    code, out = qemu.run_tool(tool, args)
+    if code != 0:
+        raise ToolError(out.strip() or f"dullc exited with status {code}")
+    return prefix + ".elf", prefix + ".img"
+
+
+# ---------------------------------------------------------------- building
+
+def build(source, rt_dir, base, out_dir, name, debug=True, extra_includes=(), backend=None,
           extra_asm=()):
     """Compile `source` against runtime `rt_dir`, linked at `base`.
     Returns (elf_path, img_path)."""
+    backend = backend or DEFAULT_BACKEND
     os.makedirs(out_dir, exist_ok=True)
+    if backend == "dull":
+        return _dull_build(dullc_elf(), source, rt_dir, base, os.path.join(out_dir, name), debug,
+                           list(extra_includes), list(extra_asm))
     asm = compile_file(source, [rt_dir, *extra_includes], debug=debug)
     s = os.path.join(out_dir, name + ".s")
     with open(s, "w", encoding="utf-8", newline="\n") as f:
@@ -46,16 +114,30 @@ def build(source, rt_dir, base, out_dir, name, debug=True, extra_includes=(), ba
                              out_dir, name, backend)
 
 
-def build_kernel(rt_dir, base, out_dir, name="kernel", debug=True, backend="own"):
+def build_kernel(rt_dir, base, out_dir, name="kernel", debug=True, backend=None):
     """The ArmOS kernel (kernel/main.dull + kernel/arch.s) for the board in `rt_dir`."""
     return build(os.path.join(KERNEL, "main.dull"), rt_dir, base, out_dir, name, debug=debug,
                  extra_includes=[KERNEL], backend=backend,
                  extra_asm=[os.path.join(KERNEL, "arch.s")])
 
 
-def assemble_and_link(sources, script, out_dir, name, backend="own"):
+def assemble_and_link(sources, script, out_dir, name, backend=None):
+    """Assemble .s files and link them with `script` (link.ld text, base filled in)."""
+    backend = backend or DEFAULT_BACKEND
+    os.makedirs(out_dir, exist_ok=True)
     elf = os.path.join(out_dir, name + ".elf")
     img = os.path.join(out_dir, name + ".img")
+    if backend == "dull":
+        ld = os.path.join(out_dir, name + ".ld")
+        with open(ld, "w", encoding="utf-8", newline="\n") as f:
+            f.write(script)
+        args = ["dullc", "build", "-", rel(ld), "0", rel(os.path.join(out_dir, name))]
+        for s in sources:
+            args += ["-S", rel(s)]
+        code, out = qemu.run_tool(dullc_elf(), args)
+        if code != 0:
+            raise ToolError(out.strip() or f"dullc exited with status {code}")
+        return elf, img
     if backend == "own":
         objects = []
         for path in sources:

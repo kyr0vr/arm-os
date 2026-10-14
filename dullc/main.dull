@@ -1,5 +1,8 @@
 -- dullc: the DULL compiler, written in DULL. Runs on the PC inside QEMU.
 --
+--   dullc build <root.dull> <link.ld> <base> <out> [-I dir]... [-S file.s]... [--release]
+--                                          compile, assemble and link: out.img, out.elf, out.s
+--   dullc compile <root.dull> <out.s> [include dirs...] [--release]   compile only
 --   dullc tokens <file.dull> <out.txt>     dump the tokens (for checking the lexer)
 --   dullc ast <file.dull> <out.txt>        dump the syntax tree (for checking the parser)
 
@@ -11,6 +14,8 @@ use lexer
 use parser
 use ast
 use program
+use assembler
+use linker
 use diag
 
 -- The command line, split on spaces.
@@ -41,7 +46,7 @@ to argument (args ptr vec.vec, i u64) gives string
     give s
 
 to usage
-    sys.print("usage: dullc tokens <file.dull> <out.txt>\n")
+    sys.print("usage: dullc build <root.dull> <link.ld> <base> <out> [-I dir]... [-S file.s]... [--release]\n")
     sys.exit(2)
 
 -- The file name stage 0 reports in messages: the last path component.
@@ -113,6 +118,78 @@ to compile_program (args ptr vec.vec, count u64)
     if not sys.write_file(out_path, output)
         diag.fail("", 0, "cannot write the output file")
 
+-- dullc build <root.dull> <link.ld> <base> <out> [-I folder]... [-S file.s]... [--release]
+-- Compiles, assembles (the compiler's output plus each -S file, in order: the
+-- runtime's start.s first) and links into <out>.img, <out>.elf and <out>.s.
+to build_program (args ptr vec.vec, count u64)
+    new root = argument(args, 2)
+    new script_path = argument(args, 3)
+    new base = argument(args, 4)
+    new out = argument(args, 5)
+    new includes = vec.make()
+    new sources = vec.make()
+    new debug = true
+    new i u64 = 6
+    while i < count
+        new a = argument(args, i)
+        if text.same(a, "--release")
+            debug = false
+        else if text.same(a, "-I") and i + 1 < count
+            new d = argument(args, i + 1)
+            vec.push(includes, d.ptr as u64)
+            vec.push(includes, d.len)
+            i += 1
+        else if text.same(a, "-S") and i + 1 < count
+            new f = argument(args, i + 1)
+            vec.push(sources, f.ptr as u64)
+            vec.push(sources, f.len)
+            i += 1
+        else
+            usage()
+        i += 1
+    new objects = vec.make()
+    new asm_text string
+    if not text.same(root, "-")                -- "-": assemble and link the -S files only
+        program.setup(includes, debug)
+        asm_text = program.compile(root)
+        write_or_fail(with_suffix(out, ".s"), asm_text)
+    for each k in 0 until sources.len / 2
+        new path string
+        path.ptr = vec.get(sources, k * 2) as ptr u8
+        path.len = vec.get(sources, k * 2 + 1)
+        new src string
+        if not sys.read_file(path, addr of src)
+            diag.fail("", 0, program.say("cannot read ", path, ""))
+        vec.push(objects, assembler.assemble(src, base_name(path)) as u64)
+    if not text.same(root, "-")
+        vec.push(objects, assembler.assemble(asm_text, program.say(base_name(out), ".s", "")) as u64)
+    new script string
+    if not sys.read_file(script_path, addr of script)
+        diag.fail("", 0, "cannot read the linker script")
+    linker.link(objects, replace_base(script, base))
+    write_or_fail(with_suffix(out, ".img"), linker.flat())
+    write_or_fail(with_suffix(out, ".elf"), linker.elf())
+
+-- link.ld with its @BASE@ placeholder filled in.
+to replace_base (script string, base string) gives string
+    new b buf.buf
+    new i u64 = 0
+    while i < script.len
+        if text.starts_with(script[i until script.len], "@BASE@")
+            buf.add(addr of b, base)
+            i += 6
+        else
+            buf.byte(addr of b, script[i])
+            i += 1
+    give buf.text(addr of b)
+
+to with_suffix (s string, suffix string) gives string
+    give program.say(s, suffix, "")
+
+to write_or_fail (path string, data string)
+    if not sys.write_file(path, data)
+        diag.fail("", 0, program.say("cannot write ", path, ""))
+
 to main gives u8
     new args = arguments()
     new count = args.len / 2               -- argument 0 is the tool's own name
@@ -127,6 +204,9 @@ to main gives u8
         give 0
     if text.same(command, "compile") and count >= 4
         compile_program(args, count)
+        give 0
+    if text.same(command, "build") and count >= 6
+        build_program(args, count)
         give 0
     usage()
     give 2

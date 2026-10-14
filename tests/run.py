@@ -12,8 +12,9 @@ Each tests/errors/*.dull must fail to compile:
 
     -- error: text that must appear in the error message
 
-Usage: python tests/run.py [name-filter] [--llvm]
-(--llvm builds with clang + lld instead of ArmOS's own assembler and linker)
+Usage: python tests/run.py [name-filter] [--own | --llvm]
+Builds with the DULL toolchain; --own uses the stage-0 tools (Python), --llvm uses the
+stage-0 compiler with clang + lld.
 """
 
 import os
@@ -83,7 +84,7 @@ def run_program(path, h, backend, qemu):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    backend = "llvm" if "--llvm" in sys.argv else "own"
+    backend = "llvm" if "--llvm" in sys.argv else ("own" if "--own" in sys.argv else "dull")
     flt = args[0] if args else ""
     os.makedirs(BUILD, exist_ok=True)
     qemu = qemu_path()

@@ -1,9 +1,9 @@
-# DULL stage-0 compiler
+# DULL stage-0 tools (the bootstrap)
 
-The first DULL compiler, written in Python. It turns `.dull` source into AArch64
-assembly text (`.s`). Its only job is to compile enough DULL to write the real
-compiler in DULL; after that it is retired and kept only so DULL can always be
-rebuilt from nothing.
+The first DULL compiler, assembler and linker, written in Python. They did their job:
+DULL's own toolchain (`dullc/`) is written in DULL and builds everything now. Stage 0
+is kept so DULL can always be rebuilt from nothing - `tools/toolchain.py` uses it once
+to build the first `dullc`, and as a reference the DULL toolchain is checked against.
 
 It is deliberately naive: every value goes through `x0`/`x1` and the stack, and every
 local lives in the stack frame. Correct first, fast never.

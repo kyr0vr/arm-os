@@ -5,7 +5,7 @@ Raspberry Pi 5, built from the ground up: our own language, compiler, assembler,
 linker, kernel, drivers, file system, codecs and GUI. No borrowed toolchain in the
 final product.
 
-Status: **draft v0** (2026-10-08). Phases 0 to 4 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
+Status: **draft v0** (2026-10-08). Phases 0 to 5 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
 
 ---
 
@@ -31,7 +31,7 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
 | Ground-up level | **Level C**: own language + compiler + assembler + linker, then self-hosting |
 | Self-hosting | Early: right after the kernel core (phase 5). The compiler compiles itself **on the PC**; compiling on ArmOS is a stretch goal after "done". |
 | Running DULL tools on the PC | DULL compiles to AArch64, so the self-hosted compiler runs on the PC inside **QEMU** (`virt` machine), reading and writing files through semihosting. |
-| Stage-0 tools | **Python**: compiler `stage0/dullc`, assembler + linker `stage0/aa64` (phases 0 and 2 done). Supports only the DULL subset the real compiler needs. Kept in the repo as the from-nothing bootstrap after it is retired. |
+| Toolchain | **DULL** (`dullc/`), running on the PC in QEMU. The Python stage-0 tools (`stage0/`) are kept only to bootstrap it from nothing. Supports only the DULL subset the real compiler needs. Kept in the repo as the from-nothing bootstrap after it is retired. |
 | Language style | Flow-right pipes (`->`) with plain-word structure; `=` assigns. See [LANGUAGE.md](LANGUAGE.md) |
 | Language name | **DULL** — Decidedly Unremarkable Low-level Language; files are `.dull` |
 | Video subset | H.264 High profile (8-bit 4:2:0, up to level 4.1) + AAC-LC in MP4, **1080p30**; an ffmpeg recipe converts anything else |
@@ -120,7 +120,7 @@ Each phase ends with something visible on the Pi or the PC.
 | 2 | **Own assembler + linker** | ✅ `stage0/aa64` builds every image; all 24 programs plus an instruction zoo are byte-identical to clang + lld (`tests/toolchain_compare.py`), and the Pi 5 kernel boots from it |
 | 3 | **Serial chainloader** | ✅ `tools/build_pi5.py --send COM4` builds a kernel, reboots the Pi into the loader over the cable and runs the new kernel; no SD swaps |
 | 4 | **Kernel core** | ✅ EL2 -> EL1, exception vectors, MMU + caches (168x faster), page allocator + heap self-tests, GIC + 100 Hz timer, all 4 cores via PSCI - on the Pi 5 and on QEMU (`tests/kernel_test.py`) |
-| 5 | **Self-host** | The compiler, rewritten in DULL, compiles itself byte-identically; stage 0 is retired |
+| 5 | **Self-host** | ✅ `dullc/`: compiler, assembler and linker in DULL; compiles itself to a fixed point; every image byte-identical to stage 0 and clang + lld; all builds now use it, stage 0 only bootstraps |
 | 6 | **Text console** | Bitmap font, scrolling console on HDMI, keyboard input over serial |
 | 7 | **Storage** | SDHCI driver + FAT32 read; list and print a `.txt` from the card |
 | 8 | **Processes** | EL0 apps, syscalls, scheduler; the console is an app |
