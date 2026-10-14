@@ -1,0 +1,36 @@
+-- Keeps the processor busy without ever waiting, so the only way anything else gets
+-- to run is the kernel taking turns. `spin <name> <rounds>`, each round 250 ms.
+
+use sys
+use line
+
+to main gives u64
+    new l line.line
+    l.len = sys.args(addr of l.bytes[0], 160)
+    new args = line.text(addr of l)
+    new name_len u64 = 0
+    while name_len < args.len and args[name_len] is not ' '
+        name_len += 1
+    new rounds u64 = 0
+    for each i in name_len until args.len
+        new c = args[i]
+        if c >= '0' and c <= '9'
+            rounds = rounds * 10 + (c - '0') as u64
+    if rounds is 0
+        rounds = 3
+    for each r in 1 until rounds + 1
+        new until_ms = sys.time() + 250
+        new spins u64 = 0
+        while sys.time() < until_ms
+            spins += 1
+        -- one write per line, so lines from different apps never mix
+        new out line.line
+        line.add(addr of out, "spin ")
+        line.add(addr of out, args[0 until name_len])
+        line.add(addr of out, ": round ")
+        line.number(addr of out, r)
+        line.add(addr of out, " of ")
+        line.number(addr of out, rounds)
+        line.byte(addr of out, 10)
+        sys.write(line.text(addr of out), sys.muted)
+    give 0

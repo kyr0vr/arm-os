@@ -2,9 +2,10 @@
 
 An MBR with one FAT32 partition (type 0x0C) at sector 2048, one sector per cluster,
 holding: hello.txt, "A Longer File Name.txt" (a long name), docs/notes.txt, and
-big.txt (spans many clusters, to test following the cluster chain).
+big.txt (spans many clusters, to test following the cluster chain), plus any
+`--add <name> <file>` (one folder level deep at most).
 
-    python tests/make_fat_image.py [out.img]
+    python tests/make_fat_image.py [out.img] [--add apps/hello.app build/.../hello.img]
 """
 
 import os
@@ -111,20 +112,32 @@ def build_dir(img, entries, parent=0, self_cluster=None):
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(ROOT, "build", "disk", "test.img")
+    args = sys.argv[1:]
+    files = dict(FILES)
+    while "--add" in args:                     # --add <name on the disk> <file on the PC>
+        i = args.index("--add")
+        with open(args[i + 2], "rb") as f:
+            files[args[i + 1]] = f.read()
+        del args[i:i + 3]
+    path = args[0] if args else os.path.join(ROOT, "build", "disk", "test.img")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     img = Image()
     root_cluster = img.alloc(b"")              # cluster 2: filled in at the end
-    docs_cluster = img.alloc(b"")
-    root_entries, docs_entries = [], []
-    for name, data in FILES.items():
+    folders = {}                               # folder name -> (cluster, entries)
+    for name in files:
+        if "/" in name and name.split("/")[0] not in folders:
+            folders[name.split("/")[0]] = (img.alloc(b""), [])
+    root_entries = []
+    for name, data in files.items():
         c = img.alloc(data)
-        if name.startswith("docs/"):
-            docs_entries.append((name[5:], False, c, len(data)))
+        if "/" in name:
+            top, leaf = name.split("/", 1)
+            folders[top][1].append((leaf, False, c, len(data)))
         else:
             root_entries.append((name, False, c, len(data)))
-    root_entries.append(("docs", True, docs_cluster, 0))
-    img.clusters[docs_cluster] = build_dir(img, docs_entries, 0, docs_cluster).ljust(512, b"\0")
+    for top, (cluster, entries) in folders.items():
+        root_entries.append((top, True, cluster, 0))
+        img.clusters[cluster] = build_dir(img, entries, 0, cluster).ljust(512, b"\0")
     rootdir = build_dir(img, root_entries)
     assert len(rootdir) <= 512
     img.clusters[root_cluster] = rootdir.ljust(512, b"\0")

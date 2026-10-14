@@ -47,8 +47,10 @@ def programs():
         jobs.append((os.path.relpath(path, ROOT), ["rt/virt", "lib"]))
     for path in sorted(glob.glob(os.path.join(ROOT, "tests", "errors", "*.dull"))):
         jobs.append((os.path.relpath(path, ROOT), ["rt/virt", "lib"]))
-    jobs.append(("kernel/main.dull", ["rt/virt", "kernel"]))
-    jobs.append(("kernel/main.dull", ["rt/pi5", "kernel"]))
+    jobs.append(("kernel/main.dull", ["rt/virt", "kernel", "lib"]))
+    jobs.append(("kernel/main.dull", ["rt/pi5", "kernel", "lib"]))
+    for path in sorted(glob.glob(os.path.join(ROOT, "apps", "*.dull"))):
+        jobs.append((os.path.relpath(path, ROOT), ["rt/app", "lib"]))
     jobs.append(("loader/loader.dull", ["rt/virt"]))
     jobs.append(("loader/loader.dull", ["rt/pi5"]))
     jobs.append(("dullc/main.dull", ["rt/virt", "lib"]))

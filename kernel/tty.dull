@@ -1,0 +1,62 @@
+-- The terminal: what apps write goes to the serial cable and to the screen console.
+
+use io
+use board
+use console
+use fetch
+use facts
+use text
+use fb
+
+fixed putty u32 = 0xE6_DB_C1
+fixed amber u32 = 0xFF_9A_1F
+fixed muted u32 = 0x8C_84_6F
+fixed deep u32 = 0xE0_56_1B
+
+new canvas ptr text.canvas
+new screen ptr fb.screen
+new has_screen bool
+
+to start (c ptr text.canvas, s ptr fb.screen, with_screen bool)
+    canvas = c
+    screen = s
+    has_screen = with_screen
+
+-- Write `count` bytes; `bold` picks the bold face on the screen.
+to write (bytes ptr u8, count u64, color u32, bold bool)
+    if has_screen and not console.active
+        console.start(canvas, screen)
+    new style = text.regular
+    if bold
+        style = text.bold
+    for each i in 0 until count
+        new c = bytes[i]
+        if c is '\n'
+            io.put('\r')
+            io.put('\n')
+        else if c is 8
+            io.put(8)
+        else if c >= 32 and c < 127
+            io.put(c)
+        if has_screen
+            console.put(c, color, style)
+
+to say (s string, color u32)
+    write(s.ptr, s.len, color, false)
+
+to clear
+    if has_screen
+        console.start(canvas, screen)
+
+-- Show the boot screen again; the console comes back with the next thing written.
+to show_fetch
+    facts.uptime(fetch.value(3))
+    fetch.step(canvas, 1000, fetch.info_rows)
+    if has_screen
+        text.present_all(canvas, screen)
+        console.active = false
+
+-- The end of a QEMU test run: keep the last screen, then stop.
+to finish
+    board.save_screen(screen, 1)
+    board.idle()

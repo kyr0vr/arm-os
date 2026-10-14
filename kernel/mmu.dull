@@ -26,7 +26,7 @@ to block (address u64, attr u64) gives u64
     new d = address | 1 | (attr << 2) | (1 << 10)       -- valid block, attribute, accessed
     if attr is devices
         give d | (1 << 53) | (1 << 54)                  -- never execute from devices
-    give d | (3 << 8)                                   -- inner shareable
+    give d | (3 << 8) | (1 << 54)                       -- inner shareable, apps may not run it
 
 -- Build the tables from the board's memory map. False if no pages were free.
 to build gives bool

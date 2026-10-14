@@ -1,0 +1,225 @@
+-- System calls: an app runs `svc #0` with the call's number in x8 and its arguments
+-- in x0-x5; the answer comes back in x0 (rt/app/sys.dull wraps them all).
+--
+-- Every pointer an app passes is checked against its own address space first.
+
+use proc
+use tty
+use facts
+use line
+use fat
+use board
+use timer
+
+fixed call_exit u64 = 0
+fixed call_write u64 = 1
+fixed call_key u64 = 2
+fixed call_sleep u64 = 3
+fixed call_yield u64 = 4
+fixed call_time u64 = 5
+fixed call_info u64 = 6
+fixed call_spawn u64 = 7
+fixed call_wait u64 = 8
+fixed call_kill u64 = 9
+fixed call_dir u64 = 10
+fixed call_read u64 = 11
+fixed call_clear u64 = 12
+fixed call_fetch u64 = 13
+fixed call_reboot u64 = 14
+fixed call_args u64 = 15
+fixed call_grow u64 = 16
+fixed call_procs u64 = 17
+
+fixed bad u64 = 0xFFFF_FFFF_FFFF_FFFF      -- -1
+fixed no_folder u64 = 0xFFFF_FFFF_FFFF_FFFE  -- -2
+fixed no_disk u64 = 0xFFFF_FFFF_FFFF_FFFD    -- -3
+
+new calls u64
+
+to ok (address u64, size u64) gives bool
+    give proc.mapped(proc.me(), address, size)
+
+-- Copy an app's string into a kernel line (at most 160 bytes).
+to fetch_string (address u64, size u64, into ptr line.line) gives bool
+    line.clear(into)
+    if size > 160 or not ok(address, size)
+        give false
+    new p = address as ptr u8
+    for each i in 0 until size
+        line.byte(into, p[i])
+    give true
+
+to put_line (l ptr line.line, address u64, cap u64) gives u64
+    new n = l.len
+    if n > cap
+        n = cap
+    new out = address as ptr u8
+    for each i in 0 until n
+        out[i] = l.bytes[i]
+    give n
+
+to handle (frame ptr u64) gives ptr u64
+    calls += 1
+    new n = frame[8]
+    new a = frame[0]
+    new b = frame[1]
+    new c = frame[2]
+    new d = frame[3]
+    new e = frame[4]
+    if n is call_exit
+        give proc.exit(a)
+    if n is call_key
+        give proc.read_key(frame)
+    if n is call_sleep
+        give proc.sleep(frame, a)
+    if n is call_yield
+        frame[0] = 0
+        give proc.yield(frame)
+    if n is call_wait
+        give proc.wait(frame, a as u32)
+    frame[0] = answer(n, a, b, c, d, e)
+    new s = proc.me().state
+    if s is proc.unused or s is proc.finished              -- it stopped itself
+        give proc.park()
+    give frame
+
+to answer (n u64, a u64, b u64, c u64, d u64, e u64) gives u64
+    if n is call_write
+        if not ok(a, b)
+            give bad
+        tty.write(a as ptr u8, b, c as u32, d is not 0)
+        give b
+    if n is call_time
+        give timer_ms()
+    if n is call_info
+        if not ok(b, c)
+            give bad
+        new l line.line
+        info(a, addr of l)
+        give put_line(addr of l, b, c)
+    if n is call_spawn
+        new name line.line
+        new args line.line
+        if not fetch_string(a, b, addr of name) or not fetch_string(c, d, addr of args)
+            give 0
+        new parent = proc.me().pid
+        if e is not 0
+            parent = 0
+        give proc.spawn(line.text(addr of name), line.text(addr of args), parent) as u64
+    if n is call_kill
+        if proc.kill(a as u32)
+            give 1
+        give 0
+    if n is call_dir
+        give dir_entry(a, b, c, d, e)
+    if n is call_read
+        give read_file(a, b, c, d, e)
+    if n is call_clear
+        tty.clear()
+        give 0
+    if n is call_fetch
+        tty.show_fetch()
+        give 0
+    if n is call_reboot
+        board.reboot()
+    if n is call_args
+        if not ok(a, b)
+            give bad
+        give put_line(addr of proc.me().args, a, b)
+    if n is call_grow
+        give proc.grow(a)
+    if n is call_procs
+        if a >= proc.slots
+            give bad
+        if not ok(b, c)
+            give bad
+        new l line.line
+        if not proc.describe(a, addr of l)
+            give 0
+        give put_line(addr of l, b, c)
+    give bad
+
+to timer_ms gives u64
+    give (timer.now() - facts.boot_time) * 1000 / timer.frequency()
+
+-- The facts `info` can give: 0 memory, 1 uptime, 2 CPU, 3 the disk, 4 its file system.
+to info (kind u64, l ptr line.line)
+    line.clear(l)
+    if kind is 0
+        facts.memory(l)
+    else if kind is 1
+        facts.uptime(l)
+    else if kind is 2
+        facts.cpu(l)
+    else if kind is 3
+        board.disk_name(l)
+        line.add(l, ", ")
+        line.number(l, board.disk_sectors() / 2048)
+        line.add(l, " MB")
+    else if kind is 4
+        if not fat.mount()
+            line.add(l, "none found")
+            give
+        line.add(l, "FAT32 \"")
+        line.add(l, line.text(addr of fat.label))
+        line.add(l, "\", ")
+        new cluster = (fat.sec_per_clus as u64) * 512
+        if cluster < 1024
+            line.number(l, cluster)
+            line.add(l, "-byte clusters, from sector ")
+        else
+            line.number(l, cluster / 1024)
+            line.add(l, " KB clusters, from sector ")
+        line.number(l, fat.part_lba)
+
+-- Find a path for an app; the error to give if it is not a file or folder.
+to look_up (path u64, size u64, out ptr fat.entry) gives u64
+    new name line.line
+    if not fetch_string(path, size, addr of name)
+        give bad
+    if not fat.mount()
+        give no_disk
+    if not fat.find(line.text(addr of name), out)
+        give bad
+    give 0
+
+-- Entry `index` of a folder, skipping "." and "..": the attributes (4 bytes), size
+-- (4), name length (8), then the name, into `out`. Gives 1, or 0 past the end.
+to dir_entry (path u64, size u64, index u64, out u64, cap u64) gives u64
+    if cap < 16 or not ok(out, cap)
+        give bad
+    new e fat.entry
+    new err = look_up(path, size, addr of e)
+    if err is not 0
+        give err
+    if e.attr & fat.attr_dir is 0
+        give no_folder
+    new d fat.dir
+    fat.open_dir(addr of d, e.cluster)
+    new item fat.entry
+    new seen u64 = 0
+    while fat.next(addr of d, addr of item)
+        new name = line.text(addr of item.name)
+        if proc.same(name, ".") or proc.same(name, "..")
+            skip
+        if seen is index
+            new words = out as ptr u32
+            words[0] = item.attr as u32
+            words[1] = item.size
+            new length = (out + 8) as ptr u64
+            deref length = put_line(addr of item.name, out + 16, cap - 16)
+            give 1
+        seen += 1
+    give 0
+
+-- Up to `count` bytes of a file from `offset` into `buffer`; gives how many.
+to read_file (path u64, size u64, offset u64, buffer u64, count u64) gives u64
+    if not ok(buffer, count)
+        give bad
+    new e fat.entry
+    new err = look_up(path, size, addr of e)
+    if err is not 0
+        give err
+    if e.attr & fat.attr_dir is not 0
+        give no_folder
+    give fat.read_at(addr of e, offset, buffer as ptr u8, count)

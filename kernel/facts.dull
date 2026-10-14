@@ -11,7 +11,7 @@ use fb
 elsewhere new _start u8          -- the first byte of the kernel image
 elsewhere new __stack_top u8     -- the last byte of the kernel's image and stack
 
-fixed version string = "0.6"     -- ArmOS version: 0.<phase>
+fixed version string = "0.8"     -- ArmOS version: 0.<phase>
 fixed language string = "DULL 0.3"
 
 new boot_time u64                -- timer count when the kernel started

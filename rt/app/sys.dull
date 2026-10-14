@@ -1,0 +1,123 @@
+-- System calls for ArmOS apps (see kernel/syscall.dull for what each one does).
+
+to call (n u64, a u64, b u64, c u64, d u64, e u64) gives u64
+    new r u64 = 0
+    asm
+        "mov x8, {n}"
+        "mov x0, {a}"
+        "mov x1, {b}"
+        "mov x2, {c}"
+        "mov x3, {d}"
+        "mov x4, {e}"
+        "svc #0"
+        "mov {r}, x0"
+    give r
+
+-- ---------------------------------------------------------------- the terminal
+
+fixed putty u32 = 0xE6_DB_C1          -- the ArmOS colors
+fixed amber u32 = 0xFF_9A_1F
+fixed muted u32 = 0x8C_84_6F
+fixed deep u32 = 0xE0_56_1B
+
+to write (s string, color u32)
+    call(1, s.ptr as u64, s.len, color as u64, 0, 0)
+
+to write_bold (s string, color u32)
+    call(1, s.ptr as u64, s.len, color as u64, 1, 0)
+
+to print (s string)
+    write(s, putty)
+
+to print_u64 (v u64)
+    new digits [20] u8
+    new n u64 = 0
+    repeat
+        digits[19 - n] = '0' + (v % 10) as u8
+        n += 1
+        v = v / 10
+        if v is 0
+            stop
+    call(1, (addr of digits[20 - n]) as u64, n, putty as u64, 0, 0)
+
+-- Wait for a key.
+to key gives u8
+    give call(2, 0, 0, 0, 0, 0) as u8
+
+to clear
+    call(12, 0, 0, 0, 0, 0)
+
+to show_fetch
+    call(13, 0, 0, 0, 0, 0)
+
+-- ---------------------------------------------------------------- time
+
+to sleep (ms u64)
+    call(3, ms, 0, 0, 0, 0)
+
+to yield
+    call(4, 0, 0, 0, 0, 0)
+
+-- Milliseconds since the kernel started.
+to time gives u64
+    give call(5, 0, 0, 0, 0, 0)
+
+-- ---------------------------------------------------------------- facts
+
+fixed info_memory u64 = 0
+fixed info_uptime u64 = 1
+fixed info_cpu u64 = 2
+fixed info_disk u64 = 3
+fixed info_files u64 = 4
+
+-- A fact from the kernel as text, into `buffer`; gives its length.
+to info (kind u64, buffer ptr u8, cap u64) gives u64
+    give call(6, kind, buffer as u64, cap, 0, 0)
+
+-- ---------------------------------------------------------------- programs
+
+-- Start an app; gives its pid, or 0 if there is no such app. A background app is
+-- not waited for.
+to spawn (name string, args string, background bool) gives u32
+    new bg u64 = 0
+    if background
+        bg = 1
+    give call(7, name.ptr as u64, name.len, args.ptr as u64, args.len, bg) as u32
+
+-- Wait for a child to finish; gives its exit code.
+to wait (pid u32) gives u64
+    give call(8, pid as u64, 0, 0, 0, 0)
+
+to kill (pid u32) gives bool
+    give call(9, pid as u64, 0, 0, 0, 0) is 1
+
+to exit (code u64)
+    call(0, code, 0, 0, 0, 0)
+
+to reboot
+    call(14, 0, 0, 0, 0, 0)
+
+-- The text after the app's name on the command line, into `buffer`.
+to args (buffer ptr u8, cap u64) gives u64
+    give call(15, buffer as u64, cap, 0, 0, 0)
+
+-- `bytes` more memory (whole pages, zeroed); 0 if there is none.
+to grow (bytes u64) gives u64
+    give call(16, bytes, 0, 0, 0, 0)
+
+-- Process `index` of the table as a line of text (0 if that slot is empty, -1 past the end).
+to process (index u64, buffer ptr u8, cap u64) gives i64
+    give call(17, index, buffer as u64, cap, 0, 0) as i64
+
+-- ---------------------------------------------------------------- files
+
+fixed attr_dir u32 = 0x10
+
+-- Entry `index` of a folder into `entry` (attributes, size, name length, name):
+-- 1 if there is one, 0 past the end, negative if `path` is not a folder.
+to dir (path string, index u64, entry ptr u8, cap u64) gives i64
+    give call(10, path.ptr as u64, path.len, index, entry as u64, cap) as i64
+
+-- Bytes from a file starting at `offset`; gives how many, or negative if it is not a file.
+to read (path string, offset u64, buffer ptr u8, count u64) gives i64
+    give call(11, path.ptr as u64, path.len, offset, buffer as u64, count) as i64

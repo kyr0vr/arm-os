@@ -2,7 +2,7 @@
 // DULL code reaches these through `elsewhere to ...` declarations; the exception
 // vectors call back into DULL (`trap.handle`, `smp.secondary_main`).
 
-.equ FRAME_SIZE, 272          // x0-x30, ELR, SPSR, padded to 16
+.equ FRAME_SIZE, 272          // x0-x30, ELR, SPSR, SP_EL0
 .equ STACK_SIZE, 0x10000      // per secondary core
 .equ MAX_CORES, 4
 
@@ -175,11 +175,15 @@ save_and_handle:
     mrs     x9, elr_el1
     stp     x30, x9, [sp, #240]
     mrs     x9, spsr_el1
-    str     x9, [sp, #256]
-    mov     x0, sp                        // frame: x0..x30, then ELR, SPSR
-    bl      trap.handle                   // (frame, kind)
-    ldr     x9, [sp, #256]
+    mrs     x10, sp_el0
+    stp     x9, x10, [sp, #256]
+    mov     x0, sp                        // frame: x0..x30, then ELR, SPSR, SP_EL0
+    bl      trap.handle                   // (frame, kind) gives the frame to resume
+    mov     sp, x0                        // maybe another process's
+resume:
+    ldp     x9, x10, [sp, #256]
     msr     spsr_el1, x9
+    msr     sp_el0, x10
     ldp     x30, x9, [sp, #240]
     msr     elr_el1, x9
     ldp     x2, x3, [sp, #16]
@@ -199,6 +203,23 @@ save_and_handle:
     ldp     x0, x1, [sp, #0]
     add     sp, sp, #FRAME_SIZE
     eret
+
+// arch_resume(frame): run the context saved in `frame` (on top of its kernel stack).
+// Never returns.
+.global arch_resume
+arch_resume:
+    mov     sp, x0
+    b       resume
+
+// arch_idle_entry() gives the address of the idle loop (the context that runs when
+// no process is ready).
+.global arch_idle_entry
+arch_idle_entry:
+    adr     x0, idle_loop
+    ret
+idle_loop:
+    wfi
+    b       idle_loop
 
 // ---------------------------------------------------------------- memory management
 
@@ -248,6 +269,33 @@ arch_tlb_flush:
     dsb     sy
     tlbi    vmalle1
     dsb     sy
+    isb
+    ret
+
+// arch_switch_space(ttbr0): use another set of page tables (a process's).
+.global arch_switch_space
+arch_switch_space:
+    dsb     sy
+    msr     ttbr0_el1, x0
+    isb
+    tlbi    vmalle1
+    dsb     sy
+    isb
+    ret
+
+// arch_sync_code(address, size): make code just written to memory visible to
+// instruction fetch.
+.global arch_sync_code
+arch_sync_code:
+    add     x1, x0, x1
+    and     x0, x0, #~63
+1:  dc      cvau, x0
+    add     x0, x0, #64
+    cmp     x0, x1
+    b.lo    1b
+    dsb     ish
+    ic      iallu
+    dsb     ish
     isb
     ret
 

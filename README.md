@@ -28,4 +28,6 @@ Type at the console over the serial cable: `python -m serial.tools.miniterm COM4
 
 The shell can read the SD card: `disk` shows the card and its file system, `ls [folder]` lists files and `cat file` prints one (`help` lists the rest).
 
+The shell is an app, like everything outside the kernel: it starts other apps by name (`hello`, `spin a 5 &` in the background), and `ps` / `kill` manage them. See [apps/](apps/README.md) for writing one.
+
 The console font, ArmOS Mono, is baked from Cascadia Mono and Cascadia Code (SIL Open Font License 1.1, see [fonts/](fonts/)).

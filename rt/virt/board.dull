@@ -14,8 +14,9 @@ fixed gic_cpu  u64 = 0x0801_0000
 fixed cores u64 = 4
 fixed ram_end u64 = 0x4700_0000       -- RAM from 0x4000_0000; the pretend screen sits above this
 
--- The shell reads these keys, then stops (there is no keyboard in the test).
-fixed script string = "help\nmem\nuptime\ncpu\necho hello from armos\nnot-a-command\nhelp\nhelp\necho the console scrolled\ndisk\nls\nls docs\ncat hello.txt\ncat a longer file name.txt\ncat docs/notes.txt\ncat big.txt\ncat nope.txt\n"
+-- The shell reads these keys; once they have run out and nothing is left to do, the
+-- test is over (there is no keyboard in the test).
+fixed script string = "help\nmem\nuptime\ncpu\necho hello from armos\nnot-a-command\nhelp\nhelp\necho the console scrolled\ndisk\nls\nls docs\ncat hello.txt\ncat a longer file name.txt\ncat docs/notes.txt\ncat big.txt\ncat nope.txt\nhello one two three\nps\nspin a 3 &\nspin b 3 &\nps\nsleep 2000\ncrash\necho the shell is still here\napps/hello.app from the SD card\nexit\nuptime\n"
 new script_pos u64
 
 to probe
@@ -45,12 +46,15 @@ to memory_mib gives u64
 to cpu_mhz gives u64
     give 0
 
-to next_key gives maybe u8
+to poll_key gives maybe u8
     if script_pos >= script.len
         give nothing
     new k = script[script_pos]
     script_pos += 1
     give k
+
+to input_ended gives bool
+    give script_pos >= script.len
 
 to core_mpidr (n u64) gives u64
     give n

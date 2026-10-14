@@ -1,0 +1,11 @@
+-- Does something no app may do (reads the kernel's memory), to show that the kernel
+-- stops just that app and everything else keeps going.
+
+use sys
+
+to main gives u64
+    sys.print("crash: reading kernel memory at 0x80000...\n")
+    new p = 0x8_0000 as ptr u64
+    new v = deref p
+    sys.print("crash: that should not have worked\n")
+    give v

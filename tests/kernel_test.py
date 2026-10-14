@@ -36,7 +36,7 @@ EXPECT = [
     "boot screen: 100% drawn",
     "kernel core: all checks passed",
     "root@armos:~$ help",
-    "fetch    show the boot screen again",
+    "fetch      show the boot screen again",
     "Memory: ",
     "Uptime: ",
     "CPU: Cortex-A76 (4)",
@@ -55,6 +55,16 @@ EXPECT = [
     "note 059: a rather mundane line of text",
     "line 00399 of a big file that crosses many clusters",
     "no such file: nope.txt",
+    "hello from an app, running at EL0 in its own memory",
+    "my arguments: one two three",
+    "3 MB of heap: written and read back",
+    "running in the background",
+    "spin a: round 3 of 3",
+    "spin b: round 3 of 3",
+    "app crash was stopped: bad memory access at",
+    "[crash ended with code 139]",
+    "the shell is still here",
+    "my arguments: from the SD card",
 ]
 
 
@@ -70,7 +80,8 @@ DISK = os.path.join(ROOT, "build", "disk", "test.img")
 
 def run(machine, label, show):
     elf, _ = toolchain.build_kernel(os.path.join(ROOT, "rt", "virt"), 0x4008_0000, OUT)
-    subprocess.run([sys.executable, os.path.join(ROOT, "tests", "make_fat_image.py"), DISK],
+    subprocess.run([sys.executable, os.path.join(ROOT, "tests", "make_fat_image.py"), DISK,
+                    "--add", "apps/hello.app", os.path.join(OUT, "apps", "hello.img")],
                    check=True, capture_output=True)
     for n in (0, 1):
         p = os.path.join(OUT, f"screen{n}.raw")
@@ -89,6 +100,13 @@ def run(machine, label, show):
     if show:
         print(out)
     missing = [e for e in EXPECT if e not in out]
+    # two busy apps took turns: b got going before a finished
+    if "spin b: round 1" in out and "spin a: round 3" in out and \
+            out.index("spin b: round 1") > out.index("spin a: round 3"):
+        missing.append("spin a and spin b taking turns")
+    # after `exit` a new shell started and ran `uptime`
+    if out.count("Uptime: ") < 2:
+        missing.append("a new shell after exit")
     if r.returncode != 0 or missing:
         print(f"FAIL {label}: exit {r.returncode}, missing {missing}")
         if not show:

@@ -5,7 +5,7 @@ Raspberry Pi 5, built from the ground up: our own language, compiler, assembler,
 linker, kernel, drivers, file system, codecs and GUI. No borrowed toolchain in the
 final product.
 
-Status: **draft v0** (2026-10-08). Phases 0 to 6 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
+Status: **draft v0** (2026-10-08). Phases 0 to 8 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
 
 ---
 
@@ -123,7 +123,7 @@ Each phase ends with something visible on the Pi or the PC.
 | 5 | **Self-host** | ✅ `dullc/`: compiler, assembler and linker in DULL; compiles itself to a fixed point; every image byte-identical to stage 0 and clang + lld; all builds now use it, stage 0 only bootstraps |
 | 6 | **Text console** | ✅ ArmOS Mono bitmap font, the designed boot screen drawn live (progress arrow with glow, facts read from the hardware), a scrolling console and a tiny shell taking keys over serial - on the Pi and in QEMU (screenshots) |
 | 7 | **Storage** | ✅ SD card driver (SDHCI, polled, 4-bit, 25 MHz) and read-only FAT32 with long file names: `disk`, `ls`, `cat` read the real card on the Pi; QEMU tests the same code on a generated FAT32 image over virtio |
-| 8 | **Processes** | EL0 apps, syscalls, scheduler; the console is an app |
+| 8 | **Processes** | ✅ Apps at EL0 in their own address spaces, 18 system calls, a preemptive round-robin scheduler (1 ms ticks, 10 ms turns); the shell is an app; built-in apps plus `.app` files from the SD card; a crashing app is stopped and the rest carries on - on the Pi and in QEMU |
 | 9 | **GUI + Text** | Compositor, launcher with Text/Music/Video tiles, **Text reader done** (serial keys) |
 | 10 | **USB input** | PCIe root complex → RP1 → xHCI → USB HID: a USB keyboard and mouse drive the GUI |
 | 11 | **Audio** | HDMI audio plays a test tone; MP3 decoder; **Music done** |

@@ -1,10 +1,11 @@
--- The ArmOS kernel. Phase 6: the boot screen and a text console.
+-- The ArmOS kernel. Phase 8: processes.
 --
 -- Brings the machine up step by step and checks each step: exception level,
 -- exceptions, memory, the MMU and caches, interrupts and the timer, all four cores.
 -- The boot screen shows it happening (the arrow through the A is the progress bar,
--- and the facts beside it are read from the hardware), then a tiny shell takes keys
--- from the serial cable. Builds for the Raspberry Pi 5 (rt/pi5) and QEMU (rt/virt).
+-- and the facts beside it are read from the hardware). Then the first app, the shell,
+-- starts at EL0 and the kernel only answers system calls and interrupts from then on.
+-- Builds for the Raspberry Pi 5 (rt/pi5) and QEMU (rt/virt).
 
 use io
 use board
@@ -20,7 +21,8 @@ use selftest
 use text
 use fetch
 use facts
-use shell
+use tty
+use proc
 
 elsewhere to arch_drop_to_el1
 elsewhere to arch_current_el gives u64
@@ -59,7 +61,7 @@ to main
     io.line("")
     io.line("========================================")
     io.line(" ArmOS - a rather mundane operating system")
-    io.line(" phase 6: boot screen and console")
+    io.line(" phase 8: processes")
     io.line("========================================")
 
     -- exception level
@@ -159,6 +161,6 @@ to main
         io.line(" check(s) failed")
 
     board.save_screen(addr of screen, 0)
-    shell.run(addr of canvas, addr of screen, have_canvas)
-    board.save_screen(addr of screen, 1)
-    board.idle()
+    tty.start(addr of canvas, addr of screen, have_canvas)
+    io.line("")
+    proc.start("shell")

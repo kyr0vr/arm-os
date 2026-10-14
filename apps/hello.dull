@@ -1,0 +1,30 @@
+-- A first app: says hello, shows its arguments and uses some heap memory.
+
+use sys
+use line
+use mem
+
+to main gives u64
+    sys.write_bold("hello from an app", sys.amber)
+    sys.print(", running at EL0 in its own memory\n")
+    new l line.line
+    l.len = sys.args(addr of l.bytes[0], 160)
+    if l.len > 0
+        sys.write("my arguments: ", sys.muted)
+        sys.print(line.text(addr of l))
+        sys.print("\n")
+    -- 3 MB of heap, written and read back
+    new size u64 = 3 * 1024 * 1024
+    new block = mem.alloc(size)
+    for each i in 0 until size
+        block[i] = (i % 251) as u8
+    new good = true
+    for each i in 0 until size
+        if block[i] is not (i % 251) as u8
+            good = false
+    if good
+        sys.write("3 MB of heap: written and read back\n", sys.muted)
+    else
+        sys.write("heap check failed\n", sys.deep)
+        give 1
+    give 0

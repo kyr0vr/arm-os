@@ -82,13 +82,13 @@ to memory_mib gives u64
 to cpu_mhz gives u64
     give (arm_hz / 1_000_000) as u64
 
--- The next key from the serial cable. "ARMR" (the PC asking for a new kernel)
--- reboots into the loader instead.
+-- A key from the serial cable if one has arrived. "ARMR" (the PC asking for a new
+-- kernel) reboots into the loader instead.
 new matched u64
 
-to next_key gives maybe u8
+to poll_key gives maybe u8
     new word [4] u8 = ['A', 'R', 'M', 'R']
-    new b = io.get()
+    new b = io.try_get() else give nothing
     if b is word[matched]
         matched += 1
         if matched is 4
@@ -100,6 +100,10 @@ to next_key gives maybe u8
     else
         matched = 0
     give b
+
+-- Keys never run out on the Pi.
+to input_ended gives bool
+    give false
 
 -- Only QEMU saves screenshots.
 to save_screen (s ptr fb.screen, which u32)

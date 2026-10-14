@@ -1,0 +1,30 @@
+-- Memory for apps: a bump allocator over heap the kernel maps on request, so
+-- lib/ (vec, buf, map) works in apps. Blocks come back zeroed; nothing is freed.
+
+use sys
+
+elsewhere to dull_trap (message ptr u8)
+
+fixed chunk u64 = 0x10_0000          -- ask the kernel for 1 MB at a time
+
+new next u64
+new limit u64
+new used u64
+
+to alloc (bytes u64) gives ptr u8
+    new size = (bytes + 15) & 0xFFFF_FFFF_FFFF_FFF0
+    if next + size > limit
+        new want = chunk
+        if size > want
+            want = (size + 4095) & 0xFFFF_FFFF_FFFF_F000
+        new start = sys.grow(want)
+        if start is 0
+            new msg string = "out of memory\0"
+            dull_trap(msg.ptr)
+        if start is not limit
+            next = start
+        limit = start + want
+    new p = next
+    next += size
+    used += size
+    give p as ptr u8

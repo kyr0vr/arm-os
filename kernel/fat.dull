@@ -258,19 +258,31 @@ to find (path string, out ptr entry) gives bool
 
 -- Read up to `max` bytes of a file into `into`. Gives how many were read.
 to read_file (e ptr entry, into ptr u8, max u64) gives u64
-    new want = e.size as u64
+    give read_at(e, 0, into, max)
+
+-- The same, starting `offset` bytes into the file.
+to read_at (e ptr entry, offset u64, into ptr u8, max u64) gives u64
+    new size = e.size as u64
+    if offset >= size
+        give 0
+    new want = size - offset
     if want > max
         want = max
-    new done u64 = 0
     new c = e.cluster
+    new skip_bytes = offset
+    while skip_bytes >= cluster_bytes() and c >= 2 and c < end_of_chain
+        c = next_cluster(c)
+        skip_bytes -= cluster_bytes()
+    new done u64 = 0
     while done < want and c >= 2 and c < end_of_chain
         if not load_cluster(c)
             stop
-        new n = cluster_bytes()
+        new n = cluster_bytes() - skip_bytes
         if n > want - done
             n = want - done
         for each k in 0 until n
-            into[done + k] = cluster_buf[k]
+            into[done + k] = cluster_buf[skip_bytes + k]
         done += n
+        skip_bytes = 0
         c = next_cluster(c)
     give done

@@ -1,0 +1,533 @@
+-- Processes: programs running at EL0, each in its own address space, taking turns
+-- on core 0.
+--
+-- Every process has a kernel stack. When it traps into the kernel (a system call,
+-- the timer, a fault), kernel/arch.s saves its registers in a frame at the top of
+-- that stack; switching processes is just resuming another process's frame. System
+-- calls never wait inside the kernel: one that has to wait (for a key, for time to
+-- pass, for a child to finish) parks the process and its answer is written into its
+-- frame later. Slot 0 is the idle context, a `wfi` loop at EL1.
+--
+-- Address spaces: the kernel's identity map (EL1 only) plus one GB of user memory at
+-- 0x40_0000_0000, mapped in 4 KB pages: the program image, then its heap growing up,
+-- and its stack at the top.
+
+use pages
+use mmu
+use board
+use timer
+use line
+use fat
+use tty
+
+elsewhere to arch_resume (frame ptr u64)
+elsewhere to arch_idle_entry gives u64
+elsewhere to arch_switch_space (ttbr u64)
+elsewhere to arch_sync_code (address u64, size u64)
+elsewhere new apps_table u64           -- the built-in apps (tools/toolchain.py makes it)
+
+fixed slots u64 = 16
+fixed user_base u64 = 0x40_0000_0000
+fixed user_size u64 = 0x4000_0000
+fixed user_slot u64 = 256              -- user_base / 1 GB: its level-1 entry
+fixed heap_limit u64 = 0x40_3000_0000  -- the heap stops 256 MB below the top
+fixed stack_pages u64 = 64             -- 256 KB of stack
+fixed kstack_pages u64 = 4
+fixed frame_words u64 = 34
+fixed elr u64 = 31
+fixed spsr u64 = 32
+fixed sp0 u64 = 33
+fixed slice u64 = 10                   -- ticks a process may run before the next one
+
+-- States.
+fixed unused u32 = 0
+fixed ready u32 = 1
+fixed wants_key u32 = 2
+fixed asleep u32 = 3
+fixed waiting u32 = 4                  -- for a child to finish
+fixed finished u32 = 5                 -- finished, its parent has not asked yet
+
+fixed state_names [6] string = ["-", "ready", "key", "sleep", "wait", "done"]
+
+shape process
+    state      u32
+    pid        u32
+    parent     u32                     -- pid of the parent, 0 if nobody waits for it
+    wait_for   u32
+    l1         u64
+    l2         u64
+    frame      ptr u64
+    kstack     u64
+    wake_at    u64
+    heap_end   u64
+    user_pages u64
+    exit_code  u64
+    ticks      u64
+    name       line.line
+    args       line.line
+
+new table [16] process
+new current u64
+new active_l1 u64
+new next_pid u32
+new running bool
+new slice_used u64
+new switches u64
+
+-- Keys typed but not yet read.
+new keys [1024] u8
+new keys_head u64
+new keys_count u64
+
+-- ---------------------------------------------------------------- address spaces
+
+fixed table_bits u64 = 3
+fixed address_mask u64 = 0xFF_FFFF_F000
+
+to user_page_entry (pa u64) gives u64
+    -- page, normal memory, EL0 read/write, inner shareable, accessed, not global,
+    -- never executed by the kernel
+    give pa | 3 | (mmu.normal << 2) | (1 << 6) | (3 << 8) | (1 << 10) | (1 << 11) | (1 << 53)
+
+to new_space (p ptr process) gives bool
+    new t1 = pages.alloc() else give false
+    new t2 = pages.alloc() else give false
+    new mine = t1 as ptr u64
+    new kernel = mmu.l1 as ptr u64
+    for each i in 0 until 512
+        mine[i] = kernel[i]
+    mine[user_slot] = (t2 as u64) | table_bits
+    p.l1 = t1 as u64
+    p.l2 = t2 as u64
+    p.user_pages = 0
+    give true
+
+-- A fresh zeroed page mapped at `va`; gives its physical address (0 when out of memory).
+to add_page (p ptr process, va u64) gives u64
+    new l2 = p.l2 as ptr u64
+    new i2 = (va >> 21) & 511
+    if l2[i2] is 0
+        new t = pages.alloc() else give 0
+        l2[i2] = (t as u64) | table_bits
+    new l3 = (l2[i2] & address_mask) as ptr u64
+    new page = pages.alloc() else give 0
+    l3[(va >> 12) & 511] = user_page_entry(page as u64)
+    p.user_pages += 1
+    give page as u64
+
+-- Is all of [va, va + size) mapped for the process?
+to mapped (p ptr process, va u64, size u64) gives bool
+    if size is 0
+        give true
+    if va < user_base or size > user_size or va + size > user_base + user_size
+        give false
+    new l2 = p.l2 as ptr u64
+    new page = va & 0xFFFF_FFFF_FFFF_F000
+    while page < va + size
+        new e2 = l2[(page >> 21) & 511]
+        if e2 is 0
+            give false
+        new l3 = (e2 & address_mask) as ptr u64
+        if l3[(page >> 12) & 511] is 0
+            give false
+        page += 4096
+    give true
+
+to free_space (p ptr process)
+    if p.l2 is 0
+        give
+    new l2 = p.l2 as ptr u64
+    for each i2 in 0 until 512
+        if l2[i2] is not 0
+            new l3 = (l2[i2] & address_mask) as ptr u64
+            for each i3 in 0 until 512
+                if l3[i3] is not 0
+                    pages.free((l3[i3] & address_mask) as ptr u8)
+            pages.free(l3 as ptr u8)
+    pages.free(p.l2 as ptr u8)
+    pages.free(p.l1 as ptr u8)
+    p.l1 = 0
+    p.l2 = 0
+    p.user_pages = 0
+
+to use_space (l1 u64)
+    if l1 is not active_l1
+        arch_switch_space(l1)
+        active_l1 = l1
+
+-- ---------------------------------------------------------------- loading programs
+
+-- An app image starts with "DULX", a version word, the address its memory ends at
+-- (with .bss) and its entry point (rt/app/start.s).
+to load (p ptr process, image ptr u8, size u64) gives bool
+    if size < 32 or image[0] is not 'D' or image[1] is not 'U' or image[2] is not 'L' or image[3] is not 'X'
+        give false
+    new words = image as ptr u64
+    new finish = words[1]
+    new entry = words[2]
+    if finish < user_base + size or finish > heap_limit or entry < user_base or entry >= user_base + size
+        give false
+    new count = (finish - user_base + 4095) / 4096
+    for each i in 0 until count
+        new pa = add_page(p, user_base + i * 4096)
+        if pa is 0
+            give false
+        new into = pa as ptr u8
+        new from = i * 4096
+        for each k in 0 until 4096 as u64
+            if from + k >= size
+                stop
+            into[k] = image[from + k]
+        arch_sync_code(pa, 4096)
+    p.heap_end = user_base + count * 4096
+    for each i in 0 until stack_pages
+        if add_page(p, user_base + user_size - (i + 1) * 4096) is 0
+            give false
+    new f = (p.kstack + kstack_pages * 4096 - frame_words * 8) as ptr u64
+    for each i in 0 until frame_words
+        f[i] = 0
+    f[elr] = entry
+    f[spsr] = 0                        -- EL0, interrupts on
+    f[sp0] = user_base + user_size
+    p.frame = f
+    give true
+
+-- The built-in apps: a count, then (name address, name length, image address, size).
+to builtin_count gives u64
+    give deref ((addr of apps_table) as ptr u64)
+
+to builtin_entry (i u64) gives ptr u64
+    give ((addr of apps_table) as u64 + 8 + i * 32) as ptr u64
+
+to builtin_name (i u64, into ptr line.line)
+    new e = builtin_entry(i)
+    new name = e[0] as ptr u8
+    line.clear(into)
+    for each k in 0 until e[1]
+        line.byte(into, name[k])
+
+to same (a string, b string) gives bool
+    if a.len is not b.len
+        give false
+    for each i in 0 until a.len
+        if a[i] is not b[i]
+            give false
+    give true
+
+-- The last part of a path, without ".app".
+to short_name (path string, into ptr line.line)
+    new start u64 = 0
+    for each i in 0 until path.len
+        if path[i] is '/'
+            start = i + 1
+    new finish = path.len
+    if finish - start > 4 and same(path[finish - 4 until finish], ".app")
+        finish -= 4
+    line.clear(into)
+    line.add(into, path[start until finish])
+
+fixed max_file u64 = 0x40_0000        -- 4 MB
+
+-- Start the program `name` (a built-in app, or a file on the SD card) with `args`.
+-- Gives its pid, or 0 if it could not start.
+to spawn (name string, args string, parent u32) gives u32
+    new slot u64 = 0
+    for each i in 1 until slots
+        if table[i].state is unused
+            slot = i
+            stop
+    if slot is 0
+        give 0
+    new p = addr of table[slot]
+    if p.kstack is 0
+        new k = pages.alloc_run(kstack_pages) else give 0
+        p.kstack = k as u64
+    if not new_space(p)
+        give 0
+    new ok = false
+    new found = false
+    new n line.line
+    for each i in 0 until builtin_count()
+        builtin_name(i, addr of n)
+        if same(line.text(addr of n), name)
+            new e = builtin_entry(i)
+            ok = load(p, e[2] as ptr u8, e[3])
+            found = true
+            stop
+    if not found
+        ok = load_file(p, name)
+    if not ok
+        free_space(p)
+        give 0
+    next_pid += 1
+    p.pid = next_pid
+    p.parent = parent
+    p.wait_for = 0
+    p.ticks = 0
+    p.exit_code = 0
+    short_name(name, addr of p.name)
+    line.clear(addr of p.args)
+    line.add(addr of p.args, args)
+    p.state = ready
+    give p.pid
+
+-- `path` on the SD card, or `path` + ".app".
+to load_file (p ptr process, path string) gives bool
+    new e fat.entry
+    if not fat.find(path, addr of e)
+        new longer line.line
+        line.add(addr of longer, path)
+        line.add(addr of longer, ".app")
+        if not fat.find(line.text(addr of longer), addr of e)
+            give false
+    if e.attr & fat.attr_dir is not 0 or (e.size as u64) > max_file
+        give false
+    new count = ((e.size as u64) + 4095) / 4096
+    if count is 0
+        give false
+    new buffer = pages.alloc_run(count) else give false
+    new size = fat.read_file(addr of e, buffer, e.size as u64)
+    new ok = load(p, buffer, size)
+    for each i in 0 until count
+        pages.free(buffer + i * 4096)
+    give ok
+
+-- ---------------------------------------------------------------- scheduling
+
+-- Set up the idle context and start the first process. Never returns.
+to start (first string)
+    new k = pages.alloc_run(kstack_pages) else give
+    new idle = addr of table[0]
+    idle.kstack = k as u64
+    idle.l1 = mmu.l1
+    idle.state = ready
+    line.add(addr of idle.name, "idle")
+    new f = (idle.kstack + kstack_pages * 4096 - frame_words * 8) as ptr u64
+    f[elr] = arch_idle_entry()
+    f[spsr] = 5                        -- EL1 on its own stack, interrupts on
+    idle.frame = f
+    active_l1 = mmu.l1
+    if spawn(first, "", 0) is 0
+        tty.say("could not start the first app\n", tty.deep)
+        board.idle()
+    running = true
+    timer.start(1000)                  -- 1 ms ticks: keys are picked up promptly
+    current = 0
+    arch_resume(switch_to(pick()))
+
+-- The next ready process after the current one (round robin), or 0 for idle.
+to pick gives u64
+    for each k in 1 until slots + 1
+        new i = (current + k) % slots
+        if i is not 0 and table[i].state is ready
+            give i
+    give 0
+
+to switch_to (i u64) gives ptr u64
+    if i is not current
+        switches += 1
+    current = i
+    slice_used = 0
+    use_space(table[i].l1)
+    give table[i].frame
+
+-- The current process can not go on now: run something else.
+to park gives ptr u64
+    give switch_to(pick())
+
+-- The timer: pick up keys, wake sleepers, and take turns.
+to tick (frame ptr u64) gives ptr u64
+    table[current].frame = frame
+    if current is not 0
+        table[current].ticks += 1
+    repeat
+        new k = board.poll_key() else stop
+        if keys_count < 1024
+            keys[(keys_head + keys_count) % 1024] = k
+            keys_count += 1
+    deliver_keys()
+    new now = timer.now()
+    for each i in 1 until slots
+        if table[i].state is asleep and now >= table[i].wake_at
+            table[i].state = ready
+            table[i].frame[0] = 0
+    if board.input_ended()
+        check_finished()
+    slice_used += 1
+    if current is 0 or slice_used >= slice
+        give switch_to(pick())
+    give frame
+
+-- Hand waiting keys to a process that wants one.
+to deliver_keys
+    while keys_count > 0
+        new who u64 = 0
+        for each i in 1 until slots
+            if table[i].state is wants_key
+                who = i
+                stop
+        if who is 0
+            give
+        table[who].frame[0] = take_key() as u64
+        table[who].state = ready
+
+to take_key gives u8
+    new k = keys[keys_head]
+    keys_head = (keys_head + 1) % 1024
+    keys_count -= 1
+    give k
+
+-- QEMU's scripted keys have run out: once nothing is left to run, the test is over.
+to check_finished
+    if keys_count > 0
+        give
+    for each i in 1 until slots
+        new s = table[i].state
+        if s is ready or s is asleep
+            give
+    tty.finish()
+
+-- ---------------------------------------------------------------- what system calls ask for
+
+to me gives ptr process
+    give addr of table[current]
+
+-- Wait for a key (the answer goes in x0).
+to read_key (frame ptr u64) gives ptr u64
+    if keys_count > 0
+        frame[0] = take_key() as u64
+        give frame
+    table[current].state = wants_key
+    give park()
+
+to sleep (frame ptr u64, ms u64) gives ptr u64
+    table[current].wake_at = timer.now() + ms * timer.frequency() / 1000
+    table[current].state = asleep
+    give park()
+
+to yield (frame ptr u64) gives ptr u64
+    give switch_to(pick())
+
+-- Wait for child `pid` to finish; x0 gets its exit code (or -1 if there is no such child).
+to wait (frame ptr u64, pid u32) gives ptr u64
+    new me_pid = table[current].pid
+    for each i in 1 until slots
+        if table[i].state is not unused and table[i].pid is pid and table[i].parent is me_pid
+            if table[i].state is finished
+                frame[0] = table[i].exit_code
+                table[i].state = unused
+                give frame
+            table[current].state = waiting
+            table[current].wait_for = pid
+            give park()
+    frame[0] = 0xFFFF_FFFF_FFFF_FFFF
+    give frame
+
+-- More heap: map `bytes` (rounded up to pages) at the end of the heap; gives where
+-- the new memory starts, or 0.
+to grow (bytes u64) gives u64
+    new p = me()
+    new count = (bytes + 4095) / 4096
+    new start = p.heap_end
+    if start + count * 4096 > heap_limit
+        give 0
+    for each i in 0 until count
+        if add_page(p, start + i * 4096) is 0
+            give 0
+    p.heap_end = start + count * 4096
+    give start
+
+-- Stop process `slot` with `code`.
+to finish (slot u64, code u64)
+    new p = addr of table[slot]
+    if slot is current
+        use_space(mmu.l1)
+    free_space(p)
+    p.exit_code = code
+    p.state = finished
+    -- its children no longer have anyone to report to
+    for each i in 1 until slots
+        if table[i].state is not unused and table[i].parent is p.pid
+            table[i].parent = 0
+            if table[i].state is finished
+                table[i].state = unused
+    -- tell the parent, if it is waiting
+    for each i in 1 until slots
+        if table[i].state is waiting and table[i].pid is p.parent and table[i].wait_for is p.pid
+            table[i].frame[0] = code
+            table[i].state = ready
+            p.state = unused
+    if p.parent is 0
+        p.state = unused
+    -- nothing left at all: start the shell again
+    for each i in 1 until slots
+        if table[i].state is not unused
+            give
+    spawn("shell", "", 0)
+
+to exit (code u64) gives ptr u64
+    finish(current, code)
+    give park()
+
+-- Stop process `pid`. False if there is none (the idle context can not be stopped).
+to kill (pid u32) gives bool
+    for each i in 1 until slots
+        new s = table[i].state
+        if s is not unused and s is not finished and table[i].pid is pid
+            finish(i, 137)
+            give true
+    give false
+
+-- A process did something it may not (a bad address, an unknown instruction).
+to crashed (frame ptr u64, esr u64, far u64) gives ptr u64
+    new l line.line
+    line.add(addr of l, "app ")
+    line.add(addr of l, line.text(addr of table[current].name))
+    line.add(addr of l, " was stopped: ")
+    new class = esr >> 26
+    if class is 0x24
+        line.add(addr of l, "bad memory access at ")
+        line.hex(addr of l, far)
+    else if class is 0x20
+        line.add(addr of l, "jumped to a bad address ")
+        line.hex(addr of l, far)
+    else if class is 0x00
+        line.add(addr of l, "unknown instruction at ")
+        line.hex(addr of l, frame[elr])
+    else
+        line.add(addr of l, "exception class ")
+        line.hex(addr of l, class)
+        line.add(addr of l, " at ")
+        line.hex(addr of l, frame[elr])
+    line.byte(addr of l, '\n')
+    tty.say(line.text(addr of l), tty.deep)
+    finish(current, 139)
+    give park()
+
+-- One line describing slot `i` for `ps`, or false if the slot is empty.
+to describe (i u64, into ptr line.line) gives bool
+    new p = addr of table[i]
+    if i is 0 or p.state is unused
+        give false
+    line.clear(into)
+    pad(into, p.pid as u64, 5)
+    line.add(into, "  ")
+    line.add(into, state_names[p.state])
+    for each k in state_names[p.state].len until 7
+        line.byte(into, ' ')
+    pad(into, p.ticks, 7)
+    line.add(into, " ms ")
+    pad(into, p.user_pages * 4, 6)
+    line.add(into, " KB  ")
+    line.add(into, line.text(addr of p.name))
+    if p.args.len > 0
+        line.byte(into, ' ')
+        line.add(into, line.text(addr of p.args))
+    give true
+
+to pad (l ptr line.line, v u64, width u64)
+    new digits line.line
+    line.number(addr of digits, v)
+    for each k in digits.len until width
+        line.byte(l, ' ')
+    line.add(l, line.text(addr of digits))

@@ -1,0 +1,259 @@
+-- The ArmOS shell: an app like any other. It reads keys, runs its own commands and
+-- starts other apps (`name args`, or `name args &` to leave it running in the
+-- background).
+
+use sys
+use line
+
+to say (s string, color u32)
+    sys.write(s, color)
+
+to say_bold (s string, color u32)
+    sys.write_bold(s, color)
+
+to prompt
+    say_bold("root", sys.amber)
+    say_bold("@", sys.putty)
+    say_bold("armos", sys.amber)
+    say(":~$ ", sys.putty)
+
+to help
+    say("commands:\n", sys.muted)
+    say("  fetch      show the boot screen again\n", sys.putty)
+    say("  clear      clear the screen\n", sys.putty)
+    say("  mem        memory in use\n", sys.putty)
+    say("  uptime     time since the kernel started\n", sys.putty)
+    say("  cpu        the processor\n", sys.putty)
+    say("  echo ...   say something back\n", sys.putty)
+    say("  ls [dir]   list files on the SD card\n", sys.putty)
+    say("  cat file   show a text file\n", sys.putty)
+    say("  disk       the SD card and its file system\n", sys.putty)
+    say("  ps         running apps\n", sys.putty)
+    say("  kill pid   stop an app\n", sys.putty)
+    say("  sleep ms   wait a while\n", sys.putty)
+    say("  reboot     restart the Pi\n", sys.putty)
+    say("  exit       leave the shell (a new one starts)\n", sys.putty)
+    say("apps: hello, spin, crash, or a .app file; add & to run one in the background\n", sys.muted)
+
+to show (key string, kind u64)
+    new l line.line
+    l.len = sys.info(kind, addr of l.bytes[0], 160)
+    say_bold(key, sys.amber)
+    say(": ", sys.putty)
+    say(line.text(addr of l), sys.putty)
+    say("\n", sys.putty)
+
+to run_command (cmd string)
+    new t = trim(cmd)
+    if t.len is 0
+        give
+    new background = false
+    if t[t.len - 1] is '&'
+        background = true
+        t = trim(t[0 until t.len - 1])
+    new word = first_word(t)
+    new rest = trim(t[word.len until t.len])
+    if same(word, "help")
+        help()
+    else if same(word, "fetch")
+        sys.show_fetch()
+        sys.key()
+        sys.clear()
+    else if same(word, "clear")
+        sys.clear()
+    else if same(word, "mem")
+        show("Memory", sys.info_memory)
+    else if same(word, "uptime")
+        show("Uptime", sys.info_uptime)
+    else if same(word, "cpu")
+        show("CPU", sys.info_cpu)
+    else if same(word, "echo")
+        say(rest, sys.putty)
+        say("\n", sys.putty)
+    else if same(word, "ls")
+        list(rest)
+    else if same(word, "cat")
+        show_file(rest)
+    else if same(word, "disk")
+        show("Disk", sys.info_disk)
+        show("Files", sys.info_files)
+    else if same(word, "ps")
+        processes()
+    else if same(word, "kill")
+        if not sys.kill(number(rest) as u32)
+            say("no such app: ", sys.deep)
+            say(rest, sys.putty)
+            say("\n", sys.putty)
+    else if same(word, "sleep")
+        sys.sleep(number(rest))
+    else if same(word, "reboot")
+        say("rebooting\n", sys.muted)
+        sys.reboot()
+    else if same(word, "exit")
+        sys.exit(0)
+    else
+        start_app(word, rest, background)
+
+to start_app (name string, args string, background bool)
+    new pid = sys.spawn(name, args, background)
+    if pid is 0
+        say("not a command: ", sys.deep)
+        say(name, sys.putty)
+        say(" (try help)\n", sys.muted)
+        give
+    if background
+        say("[", sys.muted)
+        sys.print_u64(pid as u64)
+        say("] ", sys.muted)
+        say(name, sys.putty)
+        say(" running in the background\n", sys.muted)
+        give
+    new code = sys.wait(pid)
+    if code is not 0
+        say("[", sys.muted)
+        say(name, sys.putty)
+        say(" ended with code ", sys.muted)
+        sys.print_u64(code)
+        say("]\n", sys.muted)
+
+to processes
+    say("  pid  state      cpu       memory  app\n", sys.muted)
+    new l line.line
+    for each i in 0 until 64 as u64
+        new n = sys.process(i, addr of l.bytes[0], 160)
+        if n < 0
+            stop
+        if n > 0
+            l.len = n as u64
+            say(line.text(addr of l), sys.putty)
+            say("\n", sys.putty)
+
+-- A folder's contents.
+to list (path string)
+    new entry [176] u8
+    new count u64 = 0
+    repeat
+        new r = sys.dir(path, count, addr of entry[0], 176)
+        if r < 0
+            if count is 0
+                say("not a folder: ", sys.deep)
+                say(path, sys.putty)
+                say("\n", sys.putty)
+            give
+        if r is 0
+            stop
+        count += 1
+        new words = (addr of entry[0]) as ptr u32
+        new length = deref ((addr of entry[8]) as ptr u64)
+        new name line.line
+        for each k in 0 until length
+            line.byte(addr of name, entry[16 + k])
+        if words[0] & sys.attr_dir is not 0
+            say("  <dir> ", sys.muted)
+            say_bold(line.text(addr of name), sys.amber)
+            say("/\n", sys.amber)
+        else
+            new l line.line
+            line.add(addr of l, "  ")
+            pad_number(addr of l, words[1] as u64, 6)
+            line.byte(addr of l, ' ')
+            say(line.text(addr of l), sys.muted)
+            say(line.text(addr of name), sys.putty)
+            say("\n", sys.putty)
+    if count is 0
+        say("  (empty)\n", sys.muted)
+
+to pad_number (l ptr line.line, v u64, width u64)
+    new digits line.line
+    line.number(addr of digits, v)
+    for each k in digits.len until width
+        line.byte(l, ' ')
+    line.add(l, line.text(addr of digits))
+
+-- A text file, 4 KB at a time.
+to show_file (path string)
+    new buffer [4096] u8
+    new offset u64 = 0
+    new chunk line.line
+    repeat
+        new n = sys.read(path, offset, addr of buffer[0], 4096)
+        if n < 0
+            say("no such file: ", sys.deep)
+            say(path, sys.putty)
+            say("\n", sys.putty)
+            give
+        if n is 0
+            stop
+        for each i in 0 until n as u64
+            new c = buffer[i]
+            if c is '\r'
+                skip
+            if c is '\t'
+                c = ' '
+            if c is not '\n' and (c < 32 or c >= 127)
+                c = '?'
+            line.byte(addr of chunk, c)
+            if c is '\n' or chunk.len >= 150
+                say(line.text(addr of chunk), sys.putty)
+                line.clear(addr of chunk)
+        offset += n as u64
+    if chunk.len > 0
+        say(line.text(addr of chunk), sys.putty)
+        say("\n", sys.putty)
+
+-- ---------------------------------------------------------------- words
+
+to same (a string, b string) gives bool
+    if a.len is not b.len
+        give false
+    for each i in 0 until a.len
+        if a[i] is not b[i]
+            give false
+    give true
+
+to trim (s string) gives string
+    new a u64 = 0
+    new b = s.len
+    while a < b and s[a] is ' '
+        a += 1
+    while b > a and s[b - 1] is ' '
+        b -= 1
+    give s[a until b]
+
+to first_word (s string) gives string
+    new n u64 = 0
+    while n < s.len and s[n] is not ' '
+        n += 1
+    give s[0 until n]
+
+to number (s string) gives u64
+    new v u64 = 0
+    for each c in s
+        if c < '0' or c > '9'
+            stop
+        v = v * 10 + (c - '0') as u64
+    give v
+
+-- ---------------------------------------------------------------- reading keys
+
+to main gives u64
+    new typed line.line
+    say("\n", sys.putty)
+    prompt()
+    repeat
+        new key = sys.key()
+        if key is '\r' or key is '\n'
+            say("\n", sys.putty)
+            run_command(line.text(addr of typed))
+            line.clear(addr of typed)
+            prompt()
+        else if key is 8 or key is 127
+            if typed.len > 0
+                typed.len -= 1
+                say("\x08 \x08", sys.putty)
+        else if key >= 32 and key < 127
+            line.byte(addr of typed, key)
+            new one [1] u8
+            one[0] = key
+            sys.call(1, (addr of one[0]) as u64, 1, sys.putty as u64, 0, 0)
+    give 0
