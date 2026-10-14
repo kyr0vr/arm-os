@@ -1,0 +1,44 @@
+-- Console output for the Raspberry Pi 5: the PL011 UART on the 3-pin debug header.
+-- The firmware has already set it up at 115200 baud.
+
+device uart at 0x10_7d00_1000
+    data  at 0x00 u32
+    flags at 0x18 u32
+        tx_full is bit 5
+
+to put (b u8)
+    hold until uart.flags.tx_full is 0
+    uart.data = b as u32
+
+to print (text string)
+    for each ch in text
+        if ch is '\n'
+            put('\r')
+        put(ch)
+
+to line (text string)
+    print(text)
+    print("\n")
+
+to print_u64 (v u64)
+    new digits [20] u8
+    new n u64 = 0
+    if v is 0
+        put('0')
+        give
+    while v > 0
+        digits[n] = (v % 10) as u8 + '0'
+        v = v / 10
+        n += 1
+    while n > 0
+        n -= 1
+        put(digits[n])
+
+to print_hex (v u64)
+    print("0x")
+    for each i in 0 until 16
+        new nib = ((v >> (60 - i * 4)) & 0xF) as u8
+        if nib < 10
+            put('0' + nib)
+        else
+            put('a' + nib - 10)

@@ -1,0 +1,123 @@
+-- Framebuffer from the Pi firmware, through the mailbox property interface.
+-- The firmware (running on the VideoCore) allocates a block of memory and scans it
+-- out to HDMI; we just write pixels into it.
+
+device mbox at 0x10_7c01_3880
+    read    at 0x00 u32
+    status0 at 0x18 u32
+        empty is bit 30
+    write   at 0x20 u32
+    status1 at 0x38 u32
+        full  is bit 31
+
+fixed channel_props u32 = 8
+fixed ok u32 = 0x8000_0000
+
+shape screen
+    base   ptr u32
+    width  u32
+    height u32
+    pitch  u32        -- bytes per row
+    order  u32        -- 0 = BGR, 1 = RGB
+
+new buf [64] u32       -- message buffer; the mailbox needs a 16-byte aligned copy
+new last_reply u32     -- the firmware's answer code from the last open(), for diagnostics
+new last_addr u32      -- the buffer address it gave back
+
+to message gives ptr u32
+    new a = ((addr of buf) as u64 + 15) & 0xFFFF_FFFF_FFFF_FFF0
+    give a as ptr u32
+
+-- Send a property message and wait for the firmware to answer it.
+to call (m ptr u32) gives bool
+    new bus = ((m as u64) & 0x3FFF_FFFF) | 0xC000_0000
+    new word = (bus as u32) | channel_props
+    dsb()
+    hold until mbox.status1.full is 0
+    mbox.write = word
+    repeat
+        hold until mbox.status0.empty is 0
+        if mbox.read is word
+            dsb()
+            give m[1] is ok
+
+-- Ask for a `want_w` x `want_h` 32-bit screen. The monitor's own size wins if the
+-- firmware reports one.
+to open (want_w u32, want_h u32, s ptr screen) gives bool
+    new w = want_w
+    new h = want_h
+    new m = message()
+
+    m[0] = 8 * 4
+    m[1] = 0
+    m[2] = 0x40003     -- get physical display size
+    m[3] = 8
+    m[4] = 0
+    m[5] = 0
+    m[6] = 0
+    m[7] = 0
+    if call(m) and m[5] > 0 and m[6] > 0
+        w = m[5]
+        h = m[6]
+
+    m[0] = 35 * 4
+    m[1] = 0
+    m[2] = 0x48003     -- set physical size
+    m[3] = 8
+    m[4] = 0
+    m[5] = w
+    m[6] = h
+    m[7] = 0x48004     -- set virtual size
+    m[8] = 8
+    m[9] = 0
+    m[10] = w
+    m[11] = h
+    m[12] = 0x48009    -- set virtual offset
+    m[13] = 8
+    m[14] = 0
+    m[15] = 0
+    m[16] = 0
+    m[17] = 0x48005    -- set depth
+    m[18] = 4
+    m[19] = 0
+    m[20] = 32
+    m[21] = 0x48006    -- set pixel order
+    m[22] = 4
+    m[23] = 0
+    m[24] = 1          -- RGB
+    m[25] = 0x40001    -- allocate buffer
+    m[26] = 8
+    m[27] = 0
+    m[28] = 4096       -- alignment in, address out
+    m[29] = 0          -- size out
+    m[30] = 0x40008    -- get pitch
+    m[31] = 4
+    m[32] = 0
+    m[33] = 0
+    m[34] = 0          -- end tag
+    new answered = call(m)
+    last_reply = m[1]
+    last_addr = m[28]
+    if not answered or m[28] is 0
+        give false
+
+    s.base   = ((m[28] & 0x3FFF_FFFF) as u64) as ptr u32
+    s.width  = m[5]
+    s.height = m[6]
+    s.order  = m[24]
+    s.pitch  = m[33]
+    give true
+
+-- Write `n` copies of `color` starting at `p` (n must be at least 1).
+to fill_row (p ptr u32, n u64, color u32)
+    asm
+        "1: str {color}, [{p}], #4"
+        "subs {n}, {n}, #1"
+        "b.ne 1b"
+
+to fill_rect (s ptr screen, x u32, y u32, w u32, h u32, color u32)
+    if w is 0 or h is 0
+        give
+    for each row in y until y + h
+        new start = s.base + ((row as u64) * (s.pitch as u64) / 4 + (x as u64))
+        fill_row(start, w as u64, color)

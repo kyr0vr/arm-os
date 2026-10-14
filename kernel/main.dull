@@ -1,0 +1,47 @@
+-- ArmOS phase 1: say hello over the debug UART and paint the screen.
+
+use io
+use fb
+
+fixed red   u32 = 0x00FF_0000
+fixed green u32 = 0x0000_FF00
+fixed blue  u32 = 0x0000_00FF
+
+to main
+    io.line("")
+    io.line("========================================")
+    io.line(" ArmOS - a rather mundane operating system")
+    io.line(" phase 1: DULL running on a Raspberry Pi 5")
+    io.line("========================================")
+    io.print("exception level: EL")
+    io.print_u64(read_sysreg(CurrentEL) >> 2)
+    io.line("")
+
+    new s fb.screen
+    if not fb.open(1920, 1080, addr of s)
+        io.print("framebuffer: the firmware refused (reply ")
+        io.print_hex(fb.last_reply as u64)
+        io.print(", address ")
+        io.print_hex(fb.last_addr as u64)
+        io.line(") - is HDMI plugged in?")
+        give
+    io.print("framebuffer: ")
+    io.print_u64(s.width as u64)
+    io.print(" x ")
+    io.print_u64(s.height as u64)
+    io.print(", pitch ")
+    io.print_u64(s.pitch as u64)
+    io.print(", order ")
+    io.print_u64(s.order as u64)
+    io.print(", at ")
+    io.print_hex(s.base as u64)
+    io.line("")
+
+    new third = s.width / 3
+    fb.fill_rect(addr of s, 0, 0, third, s.height, red)
+    fb.fill_rect(addr of s, third, 0, third, s.height, green)
+    fb.fill_rect(addr of s, third * 2, 0, s.width - third * 2, s.height, blue)
+    io.line("screen painted: three bands, meant to be red | green | blue")
+    io.line("ArmOS is alive.")
+    repeat
+        wfe()
