@@ -65,12 +65,55 @@ dull_trap:
     adrp    x0, newline
     add     x0, x0, :lo12:newline
     bl      uart_puts
-    b       park
+    b       wait_reboot
 
 cpu_exception:
     adrp    x0, exc_msg
     add     x0, x0, :lo12:exc_msg
     bl      uart_puts
+    b       wait_reboot
+
+// After a crash: wait for "ARMR" from the PC, then reboot through the watchdog,
+// so tools/build_pi5.py --send can recover the Pi without anyone touching it.
+wait_reboot:
+    movz    x1, #0x1000
+    movk    x1, #0x7d00, lsl #16
+    movk    x1, #0x10, lsl #32           // UART
+    adrp    x4, reboot_word
+    add     x4, x4, :lo12:reboot_word
+    mov     x5, #0                       // bytes matched so far
+8:  ldr     w3, [x1, #0x18]
+    tbnz    w3, #4, 8b                   // wait while RX FIFO empty
+    ldr     w2, [x1]
+    and     w2, w2, #0xff
+    ldrb    w3, [x4, x5]
+    cmp     w2, w3
+    b.eq    9f
+    ldrb    w3, [x4]
+    cmp     w2, w3
+    cset    x5, eq                       // a fresh 'A' restarts the match at 1
+    b       8b
+9:  add     x5, x5, #1
+    cmp     x5, #4
+    b.ne    8b
+    movz    x1, #0x0000
+    movk    x1, #0x7d20, lsl #16
+    movk    x1, #0x10, lsl #32           // power management (watchdog)
+    movz    w6, #0x5a00, lsl #16         // password
+    ldr     w2, [x1, #0x20]              // RSTS: boot partition 0
+    movz    w3, #0xfaaa
+    movk    w3, #0xffff, lsl #16
+    and     w2, w2, w3
+    orr     w2, w2, w6
+    str     w2, [x1, #0x20]
+    mov     w2, #10                      // WDOG: fire in 10 ticks
+    orr     w2, w2, w6
+    str     w2, [x1, #0x24]
+    ldr     w2, [x1, #0x1c]              // RSTC: full reset
+    and     w2, w2, #0xffffffcf
+    orr     w2, w2, w6
+    orr     w2, w2, #0x20
+    str     w2, [x1, #0x1c]
     b       park
 
 .balign 2048
@@ -83,4 +126,5 @@ vectors:
 .section .rodata, "a"
 trap_prefix: .asciz "\r\ntrap: "
 newline:     .asciz "\r\n"
+reboot_word: .ascii "ARMR"
 exc_msg:     .asciz "\r\ncpu exception - stopped\r\n"

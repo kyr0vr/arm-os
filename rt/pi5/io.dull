@@ -4,11 +4,23 @@
 device uart at 0x10_7d00_1000
     data  at 0x00 u32
     flags at 0x18 u32
-        tx_full is bit 5
+        rx_empty is bit 4
+        tx_full  is bit 5
 
 to put (b u8)
     hold until uart.flags.tx_full is 0
     uart.data = b as u32
+
+-- Wait for one byte from the other end.
+to get gives u8
+    hold until uart.flags.rx_empty is 0
+    give (uart.data & 0xFF) as u8
+
+-- A byte if one has arrived, otherwise nothing.
+to try_get gives maybe u8
+    if uart.flags.rx_empty is 1
+        give nothing
+    give (uart.data & 0xFF) as u8
 
 to print (text string)
     for each ch in text

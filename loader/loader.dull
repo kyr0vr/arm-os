@@ -1,0 +1,90 @@
+-- ArmOS serial loader.
+--
+-- Lives on the SD card in place of the kernel, linked high in memory so it is never
+-- in the way. It says "ArmOS loader: ready" once a second until a kernel arrives
+-- over the UART, checks it, copies it into place and jumps to it.
+--
+-- Protocol (all numbers little-endian):
+--   PC -> loader   "ARMB"  size u32  load address u64  FNV-1a checksum u32
+--   loader -> PC   "ArmOS loader: receiving <size> bytes"
+--   PC -> loader   <size> bytes of raw kernel image
+--   loader -> PC   "ArmOS loader: checksum ok - starting kernel"   (or a complaint, then ready again)
+
+use io
+
+fixed magic [4] u8 = ['A', 'R', 'M', 'B']
+fixed max_size u32 = 0x100_0000          -- 16 MB
+fixed fnv_start u32 = 0x811C_9DC5
+fixed fnv_prime u32 = 0x0100_0193
+
+new marker u8                              -- lives inside the loader; kernels must end below it
+
+to read_u32 gives u32
+    new v u32 = 0
+    for each i in 0 until 4
+        v = v | (io.get() as u32) << (i * 8)
+    give v
+
+to read_u64 gives u64
+    new lo = read_u32() as u64
+    new hi = read_u32() as u64
+    give lo | hi << 32
+
+to checksum (p ptr u8, n u64) gives u32
+    new h = fnv_start
+    for each i in 0 until n
+        h = (h ^ (p[i] as u32)) *% fnv_prime
+    give h
+
+-- Clean up and jump to the new kernel. Never comes back.
+to start (entry u64)
+    asm
+        "dsb sy"
+        "ic iallu"
+        "dsb sy"
+        "isb"
+        "br {entry}"
+
+-- Say "ready" once a second until the magic word arrives.
+to wait_for_magic
+    new freq = read_sysreg(cntfrq_el0)
+    new next = read_sysreg(cntpct_el0)
+    new matched u64 = 0
+    repeat
+        new now = read_sysreg(cntpct_el0)
+        if now >= next
+            io.line("ArmOS loader: ready")
+            next = now + freq
+        new b = io.try_get() else skip
+        if b is magic[matched]
+            matched += 1
+            if matched is 4
+                give
+        else if b is magic[0]
+            matched = 1
+        else
+            matched = 0
+
+to main
+    io.line("")
+    io.line("ArmOS serial loader")
+    new limit = (addr of marker) as u64 - 0x10_0000
+    repeat
+        wait_for_magic()
+        new size = read_u32()
+        new load = read_u64()
+        new want = read_u32()
+        if size is 0 or size > max_size or load + (size as u64) > limit
+            io.line("ArmOS loader: bad header - send again")
+            skip
+        io.print("ArmOS loader: receiving ")
+        io.print_u64(size as u64)
+        io.line(" bytes")
+        new p = load as ptr u8
+        for each i in 0 until size as u64
+            p[i] = io.get()
+        if checksum(p, size as u64) is not want
+            io.line("ArmOS loader: checksum mismatch - send again")
+            skip
+        io.line("ArmOS loader: checksum ok - starting kernel")
+        start(load)

@@ -83,7 +83,12 @@ def run_program(path, h, start_obj, qemu):
     with open(s, "w", encoding="utf-8", newline="\n") as f:
         f.write(asm)
     zig("cc", "-target", "aarch64-freestanding-none", "-c", s, "-o", o)
-    zig("ld.lld", "-T", os.path.join(RT, "link.ld"), start_obj, o, "-o", elf)
+    with open(os.path.join(RT, "link.ld"), encoding="utf-8") as f:
+        script = f.read().replace("@BASE@", "0x40080000")
+    ld = os.path.join(BUILD, "link.ld")
+    with open(ld, "w", encoding="utf-8", newline="\n") as f:
+        f.write(script)
+    zig("ld.lld", "-T", ld, start_obj, o, "-o", elf)
     cmd = [qemu, "-M", "virt", "-cpu", "cortex-a76", "-m", "128M", "-display", "none",
            "-monitor", "none", "-serial", "stdio", "-semihosting-config",
            "enable=on,target=native", "-kernel", elf]

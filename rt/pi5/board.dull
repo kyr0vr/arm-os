@@ -1,0 +1,37 @@
+-- Raspberry Pi 5 board services: reboot through the power-management watchdog.
+
+use io
+
+device pm at 0x10_7d20_0000
+    rstc at 0x1c u32
+    rsts at 0x20 u32
+    wdog at 0x24 u32
+
+fixed password u32 = 0x5A00_0000
+fixed full_reset u32 = 0x20
+
+-- Restart the whole Pi, as if the power had been cycled. Never comes back.
+to reboot
+    pm.rsts = (pm.rsts & 0xFFFF_FAAA) | password        -- boot partition 0: the normal boot
+    pm.wdog = 10 | password                              -- fire in 10 watchdog ticks
+    pm.rstc = (pm.rstc & 0xFFFF_FFCF) | password | full_reset
+    repeat
+        wfe()
+
+-- Sit idle, rebooting when the PC sends "ARMR" (how tools/build_pi5.py --send gets
+-- back to the serial loader without anyone touching the Pi).
+to idle
+    new word [4] u8 = ['A', 'R', 'M', 'R']
+    new matched u64 = 0
+    repeat
+        new b = io.get()
+        if b is word[matched]
+            matched += 1
+            if matched is 4
+                io.line("")
+                io.line("rebooting")
+                reboot()
+        else if b is word[0]
+            matched = 1
+        else
+            matched = 0

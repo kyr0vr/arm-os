@@ -2,6 +2,7 @@
 
 use io
 use fb
+use board
 
 to main
     io.line("")
@@ -20,7 +21,7 @@ to main
         io.print(", address ")
         io.print_hex(fb.last_addr as u64)
         io.line(") - is HDMI plugged in?")
-        give
+        board.idle()
     io.print("framebuffer: ")
     io.print_u64(s.width as u64)
     io.print(" x ")
@@ -37,7 +38,7 @@ to main
 
     if s.depth is not 32
         io.line("framebuffer: not 32 bits per pixel - check framebuffer_depth in config.txt")
-        give
+        board.idle()
     new red = fb.color(addr of s, 255, 0, 0)
     new green = fb.color(addr of s, 0, 255, 0)
     new blue = fb.color(addr of s, 0, 0, 255)
@@ -47,5 +48,4 @@ to main
     fb.fill_rect(addr of s, third * 2, 0, s.width - third * 2, s.height, blue)
     io.line("screen painted: red | green | blue")
     io.line("ArmOS is alive.")
-    repeat
-        wfe()
+    board.idle()
