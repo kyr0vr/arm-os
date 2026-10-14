@@ -1,0 +1,745 @@
+-- The DULL parser: tokens -> syntax tree (see ast.dull for the node layout).
+-- A port of stage0/dullc/parser.py; it must build the same trees and give the same
+-- error messages.
+
+use text
+use buf
+use vec
+use lexer
+use ast
+use diag
+
+new toks ptr vec.vec
+new pos u64
+new file string
+
+-- ---------------------------------------------------------------- token helpers
+
+to tok gives ptr lexer.token
+    give vec.get(toks, pos) as ptr lexer.token
+
+to peek gives ptr lexer.token
+    new i = pos + 1
+    if i >= toks.len
+        i = toks.len - 1
+    give vec.get(toks, i) as ptr lexer.token
+
+to fail (message string)
+    diag.fail(file, tok().line, message)
+
+to at_kind (kind u32) gives bool
+    give tok().kind is kind
+
+to at_value (kind u32, value string) gives bool
+    new t = tok()
+    give t.kind is kind and text.same(t.text, value)
+
+to at_kw (word string) gives bool
+    give at_value(lexer.t_kw, word)
+
+to at_sym (s string) gives bool
+    give at_value(lexer.t_sym, s)
+
+to take gives ptr lexer.token
+    new t = tok()
+    pos += 1
+    give t
+
+fixed kind_words [10] string = ["name", "int", "str", "char", "kw", "sym", "newline", "indent", "dedent", "eof"]
+
+-- How stage 0 shows the current token in "found ..." (Python's repr of its value).
+to found (b ptr buf.buf, t ptr lexer.token)
+    new k = t.kind
+    if k is lexer.t_int or k is lexer.t_char
+        buf.number(b, t.value)
+    else if k is lexer.t_str
+        buf.byte(b, 'b')
+        diag.repr(b, t.text)
+    else if k is lexer.t_name or k is lexer.t_kw or k is lexer.t_sym
+        diag.repr(b, t.text)
+    else
+        diag.repr(b, kind_words[k - 1])
+
+to expected (want string)
+    new b buf.buf
+    buf.add(addr of b, "expected ")
+    buf.add(addr of b, want)
+    buf.add(addr of b, ", found ")
+    found(addr of b, tok())
+    fail(buf.text(addr of b))
+
+-- expect(kind, value): the token must be this keyword/symbol.
+to expect_value (kind u32, value string) gives ptr lexer.token
+    if not at_value(kind, value)
+        new w buf.buf
+        diag.repr(addr of w, value)
+        expected(buf.text(addr of w))
+    give take()
+
+-- expect(kind, what=...): any token of this kind.
+to expect_kind (kind u32, what string) gives ptr lexer.token
+    if not at_kind(kind)
+        expected(what)
+    give take()
+
+to expect_name (what string) gives string
+    give expect_kind(lexer.t_name, what).text
+
+to expect_newline
+    if at_kind(lexer.t_eof)
+        give
+    expect_kind(lexer.t_newline, "end of line")
+
+to node (kind u32, line u64) gives ptr ast.node
+    give ast.make(kind, line)
+
+-- ---------------------------------------------------------------- file
+
+to parse (tokens ptr vec.vec, file_name string) gives ptr ast.node
+    toks = tokens
+    pos = 0
+    file = file_name
+    new decls = vec.make()
+    while not at_kind(lexer.t_eof)
+        if at_kind(lexer.t_newline)
+            take()
+            skip
+        vec.push(decls, top_decl() as u64)
+    new f = node(ast.k_file, 1)
+    f.name = file_name
+    f.list = decls
+    give f
+
+to top_decl gives ptr ast.node
+    new t = tok()
+    if t.kind is lexer.t_kw
+        new v = t.text
+        if text.same(v, "use")
+            give use_decl()
+        if text.same(v, "fixed")
+            give fixed_decl()
+        if text.same(v, "new")
+            new n = new_stmt()
+            n.kind = ast.k_global
+            give n
+        if text.same(v, "shape")
+            give shape_decl()
+        if text.same(v, "choice")
+            give choice_decl()
+        if text.same(v, "device")
+            give device_decl()
+        if text.same(v, "to")
+            give func_decl(false)
+        if text.same(v, "elsewhere")
+            give elsewhere_decl()
+    fail("expected a top-level declaration (to, new, fixed, shape, choice, device, use)")
+    give t as u64 as ptr ast.node
+
+to elsewhere_decl gives ptr ast.node
+    new line = take().line
+    if at_kw("new")
+        take()
+        new n = node(ast.k_global, line)
+        n.name = expect_name("a variable name")
+        n.a = type_expr() as u64
+        expect_newline()
+        n.flags = ast.f_elsewhere
+        give n
+    if at_kw("to")
+        give func_decl(true)
+    fail("expected `elsewhere new ...` or `elsewhere to ...`")
+    give node(ast.k_global, line)
+
+to use_decl gives ptr ast.node
+    new n = node(ast.k_use, take().line)
+    n.name = expect_name("a module name")
+    n.name2 = n.name
+    if at_kw("as")
+        take()
+        n.name2 = expect_name("a module alias")
+    expect_newline()
+    give n
+
+to fixed_decl gives ptr ast.node
+    new n = node(ast.k_fixed, take().line)
+    n.name = expect_name("a name")
+    if not at_sym("=")
+        n.a = type_expr() as u64
+    expect_value(lexer.t_sym, "=")
+    n.b = expr() as u64
+    expect_newline()
+    give n
+
+to shape_decl gives ptr ast.node
+    new n = node(ast.k_shape, take().line)
+    n.name = expect_name("a shape name")
+    expect_newline()
+    expect_kind(lexer.t_indent, "indented fields")
+    n.list = vec.make()
+    while not at_kind(lexer.t_dedent)
+        new f = node(ast.k_param, tok().line)
+        f.name = expect_name("a field name")
+        f.a = type_expr() as u64
+        expect_newline()
+        vec.push(n.list, f as u64)
+    take()
+    give n
+
+to choice_decl gives ptr ast.node
+    new n = node(ast.k_choice, take().line)
+    n.name = expect_name("a choice name")
+    expect_newline()
+    expect_kind(lexer.t_indent, "indented variants")
+    n.list = vec.make()
+    while not at_kind(lexer.t_dedent)
+        new v = node(ast.k_param, tok().line)
+        v.name = expect_name("a variant name")
+        if at_sym("(")
+            fail("choices carrying data are not supported by the stage-0 compiler")
+        expect_newline()
+        vec.push(n.list, v as u64)
+    take()
+    give n
+
+to device_decl gives ptr ast.node
+    new n = node(ast.k_device, take().line)
+    n.name = expect_name("a device name")
+    expect_value(lexer.t_kw, "at")
+    n.a = expr() as u64
+    expect_newline()
+    n.list = vec.make()
+    expect_kind(lexer.t_indent, "indented registers")
+    while not at_kind(lexer.t_dedent)
+        new r = node(ast.k_reg, tok().line)
+        r.name = expect_name("a register name")
+        expect_value(lexer.t_kw, "at")
+        r.a = expr() as u64
+        r.b = type_expr() as u64
+        expect_newline()
+        r.list = vec.make()
+        if at_kind(lexer.t_indent)
+            take()
+            while not at_kind(lexer.t_dedent)
+                new f = node(ast.k_bitfield, tok().line)
+                f.name = expect_name("a field name")
+                expect_value(lexer.t_kw, "is")
+                new which = expect_name("bit or bits")
+                if text.same(which, "bit")
+                    f.a = expr() as u64
+                    f.b = f.a
+                else if text.same(which, "bits")
+                    f.a = expr_no_range() as u64
+                    expect_value(lexer.t_sym, ":")
+                    f.b = expr() as u64
+                else
+                    fail("expected `bit N` or `bits H:L`")
+                expect_newline()
+                vec.push(r.list, f as u64)
+            take()
+        vec.push(n.list, r as u64)
+    take()
+    give n
+
+to func_decl (outside bool) gives ptr ast.node
+    new n = node(ast.k_func, take().line)
+    n.name = expect_name("a function name")
+    n.list = vec.make()
+    if at_sym("(")
+        take()
+        if not at_sym(")")
+            repeat
+                new p = node(ast.k_param, tok().line)
+                p.name = expect_name("a parameter name")
+                p.a = type_expr() as u64
+                vec.push(n.list, p as u64)
+                if at_sym(",")
+                    take()
+                    skip
+                stop
+        expect_value(lexer.t_sym, ")")
+    if at_kw("gives")
+        take()
+        n.a = type_expr() as u64
+    expect_newline()
+    if outside
+        n.flags = ast.f_elsewhere
+        give n
+    n.list2 = block()
+    give n
+
+-- ---------------------------------------------------------------- types
+
+to type_expr gives ptr ast.node
+    new t = tok()
+    if t.kind is lexer.t_kw and (text.same(t.text, "ptr") or text.same(t.text, "span") or text.same(t.text, "maybe"))
+        take()
+        new kind = ast.k_t_ptr
+        if text.same(t.text, "span")
+            kind = ast.k_t_span
+        else if text.same(t.text, "maybe")
+            kind = ast.k_t_maybe
+        new n = node(kind, t.line)
+        n.a = type_expr() as u64
+        give n
+    if t.kind is lexer.t_kw and text.same(t.text, "fix")
+        fail("fixed-point types are not supported by the stage-0 compiler")
+    if at_sym("[")
+        take()
+        new n = node(ast.k_t_array, t.line)
+        n.a = expr() as u64
+        expect_value(lexer.t_sym, "]")
+        n.b = type_expr() as u64
+        give n
+    if t.kind is lexer.t_int and peek().kind is lexer.t_kw and text.same(peek().text, "lanes")
+        fail("lane types are not supported by the stage-0 compiler")
+    if t.kind is lexer.t_name
+        take()
+        new n = node(ast.k_t_name, t.line)
+        if at_sym(".")
+            take()
+            n.name2 = t.text
+            n.flags = ast.f_has_module
+            n.name = expect_name("a type name")
+            give n
+        n.name = t.text
+        give n
+    fail("expected a type")
+    give node(ast.k_t_name, t.line)
+
+-- ---------------------------------------------------------------- statements
+
+to block gives ptr vec.vec
+    expect_kind(lexer.t_indent, "an indented block")
+    new stmts = vec.make()
+    while not at_kind(lexer.t_dedent) and not at_kind(lexer.t_eof)
+        vec.push(stmts, stmt() as u64)
+    expect_kind(lexer.t_dedent, "dedent")
+    give stmts
+
+to stmt gives ptr ast.node
+    new t = tok()
+    if t.kind is lexer.t_kw
+        new v = t.text
+        if text.same(v, "new")
+            give new_stmt()
+        if text.same(v, "if")
+            give if_stmt()
+        if text.same(v, "while")
+            take()
+            new n = node(ast.k_while, t.line)
+            n.a = expr() as u64
+            expect_newline()
+            n.list2 = block()
+            give n
+        if text.same(v, "repeat")
+            take()
+            expect_newline()
+            new n = node(ast.k_repeat, t.line)
+            n.list2 = block()
+            give n
+        if text.same(v, "hold")
+            take()
+            expect_value(lexer.t_kw, "until")
+            new n = node(ast.k_hold, t.line)
+            n.a = expr() as u64
+            expect_newline()
+            give n
+        if text.same(v, "for")
+            give for_stmt()
+        if text.same(v, "give")
+            take()
+            new n = node(ast.k_give, t.line)
+            if not at_kind(lexer.t_newline) and not at_kind(lexer.t_eof)
+                n.a = expr() as u64
+            expect_newline()
+            give n
+        if text.same(v, "stop") or text.same(v, "skip")
+            take()
+            expect_newline()
+            if text.same(v, "stop")
+                give node(ast.k_stop, t.line)
+            give node(ast.k_skip, t.line)
+        if text.same(v, "after")
+            take()
+            new n = node(ast.k_after, t.line)
+            n.a = expr() as u64
+            expect_newline()
+            give n
+        if text.same(v, "stream")
+            take()
+            new n = node(ast.k_stream, t.line)
+            n.a = expr() as u64
+            expect_newline()
+            give n
+        if text.same(v, "asm")
+            give asm_stmt()
+        if text.same(v, "on")
+            fail("`on core` is not supported by the stage-0 compiler")
+    new e = expr()
+    if at_kind(lexer.t_sym) and is_assign_op(tok().text)
+        new n = node(ast.k_assign, t.line)
+        n.name = take().text
+        n.a = e as u64
+        n.b = expr() as u64
+        expect_newline()
+        give n
+    expect_newline()
+    new n = node(ast.k_expr_stmt, t.line)
+    n.a = e as u64
+    give n
+
+fixed assign_ops [10] string = ["=", "+=", "-=", "*=", "/=", "&=", "|=", "^=", "<<=", ">>="]
+
+to is_assign_op (s string) gives bool
+    for each op in assign_ops
+        if text.same(s, op)
+            give true
+    give false
+
+to new_stmt gives ptr ast.node
+    new n = node(ast.k_new, take().line)
+    n.name = expect_name("a variable name")
+    if not at_sym("=") and not at_kind(lexer.t_newline)
+        n.a = type_expr() as u64
+    if at_sym("=")
+        take()
+        n.b = expr() as u64
+    if n.a is 0 and n.b is 0
+        new b buf.buf
+        buf.add(addr of b, "`new ")
+        buf.add(addr of b, n.name)
+        buf.add(addr of b, "` needs a type or a value")
+        fail(buf.text(addr of b))
+    expect_newline()
+    give n
+
+to if_stmt gives ptr ast.node
+    new n = node(ast.k_if, take().line)
+    n.list = vec.make()
+    new first = node(ast.k_arm, n.line)
+    first.a = expr() as u64
+    expect_newline()
+    first.list2 = block()
+    vec.push(n.list, first as u64)
+    while at_kw("else")
+        take()
+        if at_kw("if")
+            take()
+            new arm = node(ast.k_arm, n.line)
+            arm.a = expr() as u64
+            expect_newline()
+            arm.list2 = block()
+            vec.push(n.list, arm as u64)
+            skip
+        expect_newline()
+        n.list2 = block()
+        stop
+    give n
+
+to for_stmt gives ptr ast.node
+    new line = take().line
+    expect_value(lexer.t_kw, "each")
+    new var = expect_name("a loop variable")
+    expect_value(lexer.t_kw, "in")
+    new start = expr()
+    if at_kw("until") or at_kw("through")
+        new n = node(ast.k_for_range, line)
+        n.name = var
+        if text.same(take().text, "through")
+            n.value = 1
+        n.a = start as u64
+        n.b = expr() as u64
+        expect_newline()
+        n.list2 = block()
+        give n
+    expect_newline()
+    new n = node(ast.k_for_each, line)
+    n.name = var
+    n.a = start as u64
+    n.list2 = block()
+    give n
+
+to asm_stmt gives ptr ast.node
+    new n = node(ast.k_asm, take().line)
+    n.list = vec.make()
+    if at_kind(lexer.t_str)
+        vec.push(n.list, str_node(take()) as u64)
+        expect_newline()
+    else
+        expect_newline()
+        expect_kind(lexer.t_indent, "indented asm lines")
+        while not at_kind(lexer.t_dedent)
+            vec.push(n.list, str_node(expect_kind(lexer.t_str, "a quoted asm line")) as u64)
+            expect_newline()
+        take()
+    give n
+
+to str_node (t ptr lexer.token) gives ptr ast.node
+    new s = node(ast.k_str, t.line)
+    s.name = t.text
+    give s
+
+-- ---------------------------------------------------------------- expressions
+
+to expr gives ptr ast.node
+    new left = unwrap()
+    while at_sym("->")
+        new line = take().line
+        new target = postfix()
+        if target.kind is ast.k_call
+            vec.insert(target.list, 0, left as u64)
+            target.flags = target.flags | ast.f_piped
+            left = target
+        else
+            new call = node(ast.k_call, line)
+            call.a = target as u64
+            call.list = vec.make()
+            vec.push(call.list, left as u64)
+            call.flags = ast.f_piped
+            left = call
+    give left
+
+to unwrap gives ptr ast.node
+    new e = logic_or()
+    if at_kw("else")
+        new n = node(ast.k_unwrap, take().line)
+        n.a = e as u64
+        if at_kw("give")
+            take()
+            n.name = "give"
+            if not at_kind(lexer.t_newline) and not at_sym(")")
+                n.b = expr() as u64
+            give n
+        if at_kw("stop") or at_kw("skip")
+            n.name = take().text
+            give n
+        n.name = "value"
+        n.b = logic_or() as u64
+        give n
+    give e
+
+to logic_or gives ptr ast.node
+    new left = logic_and()
+    while at_kw("or")
+        new n = node(ast.k_logic, take().line)
+        n.name = "or"
+        n.a = left as u64
+        n.b = logic_and() as u64
+        left = n
+    give left
+
+to logic_and gives ptr ast.node
+    new left = logic_not()
+    while at_kw("and")
+        new n = node(ast.k_logic, take().line)
+        n.name = "and"
+        n.a = left as u64
+        n.b = logic_not() as u64
+        left = n
+    give left
+
+to logic_not gives ptr ast.node
+    if at_kw("not")
+        new n = node(ast.k_unary, take().line)
+        n.name = "not"
+        n.a = logic_not() as u64
+        give n
+    give compare()
+
+to is_compare_op (s string) gives bool
+    give text.same(s, "<") or text.same(s, ">") or text.same(s, "<=") or text.same(s, ">=")
+
+to compare gives ptr ast.node
+    new left = binary(0)
+    if at_kw("is")
+        new n = node(ast.k_compare, take().line)
+        n.name = "=="
+        if at_kw("not")
+            take()
+            n.name = "!="
+        n.a = left as u64
+        n.b = binary(0) as u64
+        give n
+    if at_kind(lexer.t_sym) and is_compare_op(tok().text)
+        new op = take().text
+        new n = node(ast.k_compare, tok().line)      -- stage 0 takes the line after the operator
+        n.name = op
+        n.a = left as u64
+        n.b = binary(0) as u64
+        give n
+    give left
+
+-- Binary precedence, low to high: | then ^ then & then shifts, + -, * / %.
+to in_level (level u64, s string) gives bool
+    if level is 0
+        give text.same(s, "|")
+    if level is 1
+        give text.same(s, "^")
+    if level is 2
+        give text.same(s, "&")
+    if level is 3
+        give text.same(s, "<<") or text.same(s, ">>")
+    if level is 4
+        give text.same(s, "+") or text.same(s, "-") or text.same(s, "+%") or text.same(s, "-%") or
+            text.same(s, "+|") or text.same(s, "-|")
+    give text.same(s, "*") or text.same(s, "/") or text.same(s, "%") or text.same(s, "*%")
+
+to binary (level u64) gives ptr ast.node
+    if level is 6
+        give cast()
+    new left = binary(level + 1)
+    while at_kind(lexer.t_sym) and in_level(level, tok().text)
+        new t = take()
+        new right = binary(level + 1)
+        new n = node(ast.k_binary, t.line)
+        n.name = t.text
+        n.a = left as u64
+        n.b = right as u64
+        left = n
+    give left
+
+to cast gives ptr ast.node
+    new e = prefix()
+    while at_kw("as")
+        new n = node(ast.k_cast, take().line)
+        n.a = e as u64
+        n.b = type_expr() as u64
+        e = n
+    give e
+
+to prefix gives ptr ast.node
+    new t = tok()
+    if t.kind is lexer.t_sym and (text.same(t.text, "-") or text.same(t.text, "~"))
+        take()
+        new n = node(ast.k_unary, t.line)
+        n.name = t.text
+        n.a = prefix() as u64
+        give n
+    if t.kind is lexer.t_kw and text.same(t.text, "deref")
+        take()
+        new n = node(ast.k_deref, t.line)
+        n.a = prefix() as u64
+        give n
+    if t.kind is lexer.t_kw and text.same(t.text, "addr")
+        take()
+        expect_value(lexer.t_kw, "of")
+        new n = node(ast.k_addr_of, t.line)
+        n.a = prefix() as u64
+        give n
+    if t.kind is lexer.t_kw and text.same(t.text, "not")
+        take()
+        new n = node(ast.k_unary, t.line)
+        n.name = "not"
+        n.a = prefix() as u64
+        give n
+    give postfix()
+
+to expr_no_range gives ptr ast.node
+    give binary(0)
+
+to postfix gives ptr ast.node
+    new e = primary()
+    repeat
+        if at_sym("(")
+            new line = take().line
+            if e.kind is ast.k_name and text.same(e.name, "size_of")
+                new n = node(ast.k_size_of, line)
+                n.a = type_expr() as u64
+                expect_value(lexer.t_sym, ")")
+                e = n
+                skip
+            new call = node(ast.k_call, line)
+            call.a = e as u64
+            call.list = vec.make()
+            if not at_sym(")")
+                repeat
+                    vec.push(call.list, expr() as u64)
+                    if at_sym(",")
+                        take()
+                        skip
+                    stop
+            expect_value(lexer.t_sym, ")")
+            e = call
+        else if at_sym("[")
+            new line = take().line
+            new first = expr_no_range()
+            if at_sym(":")
+                take()
+                new n = node(ast.k_bits, line)
+                n.a = e as u64
+                n.b = first as u64
+                n.c = expr_no_range() as u64
+                expect_value(lexer.t_sym, "]")
+                e = n
+            else if at_kw("until")
+                take()
+                new n = node(ast.k_slice, line)
+                n.a = e as u64
+                n.b = first as u64
+                n.c = expr_no_range() as u64
+                expect_value(lexer.t_sym, "]")
+                e = n
+            else
+                expect_value(lexer.t_sym, "]")
+                new n = node(ast.k_index, line)
+                n.a = e as u64
+                n.b = first as u64
+                e = n
+        else if at_sym(".")
+            new n = node(ast.k_field, take().line)
+            if at_kind(lexer.t_kw)
+                n.name = take().text
+            else
+                n.name = expect_name("a field name")
+            n.a = e as u64
+            e = n
+        else
+            give e
+
+to primary gives ptr ast.node
+    new t = tok()
+    if t.kind is lexer.t_int or t.kind is lexer.t_char
+        take()
+        new n = node(ast.k_int, t.line)
+        n.value = t.value
+        if t.kind is lexer.t_char
+            n.flags = ast.f_char
+        give n
+    if t.kind is lexer.t_str
+        take()
+        give str_node(t)
+    if t.kind is lexer.t_name
+        take()
+        new n = node(ast.k_name, t.line)
+        n.name = t.text
+        give n
+    if t.kind is lexer.t_kw
+        if text.same(t.text, "true") or text.same(t.text, "false")
+            take()
+            new n = node(ast.k_bool, t.line)
+            if text.same(t.text, "true")
+                n.value = 1
+            give n
+        if text.same(t.text, "nothing")
+            take()
+            give node(ast.k_nothing, t.line)
+    if t.kind is lexer.t_sym and text.same(t.text, "(")
+        take()
+        new e = expr()
+        expect_value(lexer.t_sym, ")")
+        give e
+    if t.kind is lexer.t_sym and text.same(t.text, "[")
+        take()
+        new n = node(ast.k_array_lit, t.line)
+        n.list = vec.make()
+        if not at_sym("]")
+            repeat
+                vec.push(n.list, expr() as u64)
+                if at_sym(",")
+                    take()
+                    skip
+                stop
+        expect_value(lexer.t_sym, "]")
+        give n
+    expected("an expression")
+    give node(ast.k_nothing, t.line)

@@ -1,0 +1,329 @@
+-- The syntax tree. One `node` shape serves every kind; what its fields mean depends
+-- on the kind (the table below). Child nodes are `ptr node` stored as u64, lists are
+-- `ptr vec` of nodes. A port of the Node class in stage0/dullc/parser.py.
+--
+--   kind        name       name2   value      a          b          c       list      list2
+--   file        path                                                       decls
+--   use         module     alias
+--   fixed       name                          type       value
+--   global      name                          type       value                             (flag elsewhere)
+--   shape       name                                                       fields(param)
+--   choice      name                                                       variants(param)
+--   device      name                          base                         regs
+--   reg         name                          offset     type              bitfields
+--   bitfield    name                          hi         lo
+--   func        name                          ret                          params    body  (flag elsewhere)
+--   param       name                          type
+--   t_ptr t_span t_maybe                      inner
+--   t_array                                   count      inner
+--   t_name      name       module                                                          (flag has_module)
+--   while                                     cond                                   body
+--   repeat                                                                           body
+--   hold                                      cond
+--   give                                      value
+--   stop skip
+--   after                                     expr
+--   stream                                    chain
+--   asm                                                                    lines(str)
+--   new         name                          type       value
+--   if                                                                     arms      otherwise
+--   arm                                       cond                                   body
+--   for_range   var                inclusive  start      end                         body
+--   for_each    var                           seq                                    body
+--   assign      op                            target     value
+--   expr_stmt                                 expr
+--   int                            value                                               (flag char)
+--   str         bytes
+--   name        name
+--   bool                           value
+--   nothing
+--   array_lit                                                              items
+--   call                                      func                         args          (flag piped)
+--   index                                     value      index
+--   bits                                      value      hi         lo
+--   slice                                     value      lo         hi
+--   field       name                          value
+--   unary       op                            operand
+--   deref addr_of                             operand
+--   cast                                      value      to
+--   binary compare logic   op                 left       right
+--   unwrap      action                        value      fallback
+--   size_of                                   of
+
+use mem
+use vec
+use buf
+
+fixed k_file u32 = 1
+fixed k_use u32 = 2
+fixed k_fixed u32 = 3
+fixed k_global u32 = 4
+fixed k_shape u32 = 5
+fixed k_choice u32 = 6
+fixed k_device u32 = 7
+fixed k_reg u32 = 8
+fixed k_bitfield u32 = 9
+fixed k_func u32 = 10
+fixed k_param u32 = 11
+fixed k_t_ptr u32 = 12
+fixed k_t_span u32 = 13
+fixed k_t_maybe u32 = 14
+fixed k_t_array u32 = 15
+fixed k_t_name u32 = 16
+fixed k_while u32 = 17
+fixed k_repeat u32 = 18
+fixed k_hold u32 = 19
+fixed k_give u32 = 20
+fixed k_stop u32 = 21
+fixed k_skip u32 = 22
+fixed k_after u32 = 23
+fixed k_stream u32 = 24
+fixed k_asm u32 = 25
+fixed k_new u32 = 26
+fixed k_if u32 = 27
+fixed k_arm u32 = 28
+fixed k_for_range u32 = 29
+fixed k_for_each u32 = 30
+fixed k_assign u32 = 31
+fixed k_expr_stmt u32 = 32
+fixed k_int u32 = 33
+fixed k_str u32 = 34
+fixed k_name u32 = 35
+fixed k_bool u32 = 36
+fixed k_nothing u32 = 37
+fixed k_array_lit u32 = 38
+fixed k_call u32 = 39
+fixed k_index u32 = 40
+fixed k_bits u32 = 41
+fixed k_slice u32 = 42
+fixed k_field u32 = 43
+fixed k_unary u32 = 44
+fixed k_deref u32 = 45
+fixed k_addr_of u32 = 46
+fixed k_cast u32 = 47
+fixed k_binary u32 = 48
+fixed k_compare u32 = 49
+fixed k_logic u32 = 50
+fixed k_unwrap u32 = 51
+fixed k_size_of u32 = 52
+fixed k_lvtmp u32 = 53
+
+fixed kind_names [53] string = ["file", "use", "fixed", "global", "shape", "choice", "device",
+    "reg", "bitfield", "func", "param", "t_ptr", "t_span", "t_maybe", "t_array", "t_name",
+    "while", "repeat", "hold", "give", "stop", "skip", "after", "stream", "asm", "new", "if",
+    "arm", "for_range", "for_each", "assign", "expr_stmt", "int", "str", "name", "bool",
+    "nothing", "array_lit", "call", "index", "bits", "slice", "field", "unary", "deref",
+    "addr_of", "cast", "binary", "compare", "logic", "unwrap", "size_of", "lvtmp"]
+
+fixed f_elsewhere u64 = 1
+fixed f_char u64 = 2
+fixed f_piped u64 = 4
+fixed f_has_module u64 = 8
+
+shape node
+    kind  u32
+    line  u64
+    name  string
+    name2 string
+    value u64
+    a     u64
+    b     u64
+    c     u64
+    list  ptr vec.vec
+    list2 ptr vec.vec
+    flags u64
+    -- filled in by the checker
+    ty    u64
+    ref   u64
+    sym   u64
+    aux   u64
+    aux2  u64
+    aux3  u64
+
+to make (kind u32, line u64) gives ptr node
+    new n = mem.alloc(size_of(node)) as ptr node
+    n.kind = kind
+    n.line = line
+    give n
+
+to child (n ptr node, which u64) gives ptr node
+    if which is 0
+        give n.a as ptr node
+    if which is 1
+        give n.b as ptr node
+    give n.c as ptr node
+
+to item (v ptr vec.vec, i u64) gives ptr node
+    give vec.get(v, i) as ptr node
+
+to has (n ptr node, flag u64) gives bool
+    give n.flags & flag is not 0
+
+-- ---------------------------------------------------------------- dumping
+-- A fixed text form of a tree, so the stage-0 tree and this one can be compared.
+-- (kind line fields...) with each kind's fields in the order of the table above.
+
+to hex_bytes (b ptr buf.buf, s string)
+    buf.byte(b, '"')
+    for each c in s
+        new hi = c >> 4
+        new lo = c & 15
+        buf.byte(b, hex(hi))
+        buf.byte(b, hex(lo))
+    buf.byte(b, '"')
+
+to hex (n u8) gives u8
+    if n < 10
+        give '0' + n
+    give 'a' + n - 10
+
+to dump_list (b ptr buf.buf, v ptr vec.vec)
+    if v as u64 is 0
+        buf.add(b, " -")
+        give
+    buf.add(b, " [")
+    for each i in 0 until v.len
+        if i > 0
+            buf.byte(b, ' ')
+        dump(b, item(v, i))
+    buf.byte(b, ']')
+
+to dump_child (b ptr buf.buf, x u64)
+    buf.byte(b, ' ')
+    if x is 0
+        buf.byte(b, '-')
+        give
+    dump(b, x as ptr node)
+
+to word (b ptr buf.buf, s string)
+    buf.byte(b, ' ')
+    hex_bytes(b, s)
+
+to dump (b ptr buf.buf, n ptr node)
+    new k = n.kind
+    buf.byte(b, '(')
+    buf.add(b, kind_names[k - 1])
+    buf.byte(b, ' ')
+    buf.number(b, n.line)
+    if k is k_file
+        word(b, n.name)
+        dump_list(b, n.list)
+    else if k is k_use
+        word(b, n.name)
+        word(b, n.name2)
+    else if k is k_fixed or k is k_new
+        word(b, n.name)
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+    else if k is k_global
+        word(b, n.name)
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+        buf.byte(b, ' ')
+        buf.number(b, n.flags & f_elsewhere)
+    else if k is k_shape or k is k_choice
+        word(b, n.name)
+        dump_list(b, n.list)
+    else if k is k_device
+        word(b, n.name)
+        dump_child(b, n.a)
+        dump_list(b, n.list)
+    else if k is k_reg
+        word(b, n.name)
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+        dump_list(b, n.list)
+    else if k is k_bitfield
+        word(b, n.name)
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+    else if k is k_func
+        word(b, n.name)
+        dump_child(b, n.a)
+        dump_list(b, n.list)
+        dump_list(b, n.list2)
+        buf.byte(b, ' ')
+        buf.number(b, n.flags & f_elsewhere)
+    else if k is k_param
+        word(b, n.name)
+        dump_child(b, n.a)
+    else if k is k_t_ptr or k is k_t_span or k is k_t_maybe
+        dump_child(b, n.a)
+    else if k is k_t_array
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+    else if k is k_t_name
+        word(b, n.name)
+        if has(n, f_has_module)
+            word(b, n.name2)
+        else
+            buf.add(b, " -")
+    else if k is k_while or k is k_arm
+        dump_child(b, n.a)
+        dump_list(b, n.list2)
+    else if k is k_repeat
+        dump_list(b, n.list2)
+    else if k is k_hold or k is k_give or k is k_after or k is k_stream or k is k_expr_stmt
+        dump_child(b, n.a)
+    else if k is k_asm
+        buf.add(b, " [")
+        for each i in 0 until n.list.len
+            if i > 0
+                buf.byte(b, ' ')
+            hex_bytes(b, item(n.list, i).name)
+        buf.byte(b, ']')
+    else if k is k_array_lit
+        dump_list(b, n.list)
+    else if k is k_if
+        dump_list(b, n.list)
+        dump_list(b, n.list2)
+    else if k is k_for_range
+        word(b, n.name)
+        buf.byte(b, ' ')
+        buf.number(b, n.value)
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+        dump_list(b, n.list2)
+    else if k is k_for_each
+        word(b, n.name)
+        dump_child(b, n.a)
+        dump_list(b, n.list2)
+    else if k is k_assign or k is k_binary or k is k_compare or k is k_logic
+        word(b, n.name)
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+    else if k is k_int
+        buf.byte(b, ' ')
+        buf.number(b, n.value)
+        buf.byte(b, ' ')
+        buf.number(b, (n.flags & f_char) / f_char)
+    else if k is k_str or k is k_name
+        word(b, n.name)
+    else if k is k_bool
+        buf.byte(b, ' ')
+        buf.number(b, n.value)
+    else if k is k_call
+        dump_child(b, n.a)
+        dump_list(b, n.list)
+        buf.byte(b, ' ')
+        buf.number(b, (n.flags & f_piped) / f_piped)
+    else if k is k_index or k is k_cast
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+    else if k is k_bits or k is k_slice
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+        dump_child(b, n.c)
+    else if k is k_field
+        word(b, n.name)
+        dump_child(b, n.a)
+    else if k is k_unary
+        word(b, n.name)
+        dump_child(b, n.a)
+    else if k is k_deref or k is k_addr_of or k is k_size_of
+        dump_child(b, n.a)
+    else if k is k_unwrap
+        word(b, n.name)
+        dump_child(b, n.a)
+        dump_child(b, n.b)
+    buf.byte(b, ')')
