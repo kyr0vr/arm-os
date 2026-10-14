@@ -1,0 +1,76 @@
+-- The page allocator: hands out 4 KB pages of physical memory.
+--
+-- Memory comes in as up to four ranges. Fresh pages are taken from the front of a
+-- range; freed pages go on a list (each free page holds the address of the next).
+
+fixed size u64 = 4096
+fixed max_ranges u64 = 4
+
+shape range
+    next u64
+    limit u64
+
+new ranges [4] range
+new range_count u64
+new free_list u64            -- address of the first freed page, 0 if none
+new free_listed u64          -- pages on that list
+new in_use u64
+
+-- Offer the memory from `start` up to `finish` (rounded inward to whole pages).
+to add (start u64, finish u64)
+    new s = (start + size - 1) & 0xFFFF_FFFF_FFFF_F000
+    new e = finish & 0xFFFF_FFFF_FFFF_F000
+    if e <= s or range_count is max_ranges
+        give
+    ranges[range_count].next = s
+    ranges[range_count].limit = e
+    range_count += 1
+
+-- Pages that can still be handed out.
+to available gives u64
+    new n = free_listed
+    for each i in 0 until range_count
+        n += (ranges[i].limit - ranges[i].next) / size
+    give n
+
+to zero (address u64, count u64)
+    new q = address as ptr u64
+    for each i in 0 until count * 512
+        q[i] = 0
+
+-- One zero-filled page.
+to alloc gives maybe ptr u8
+    new p u64 = 0
+    if free_list is not 0
+        p = free_list
+        free_list = deref (p as ptr u64)
+        free_listed -= 1
+    else
+        for each i in 0 until range_count
+            if ranges[i].next < ranges[i].limit
+                p = ranges[i].next
+                ranges[i].next += size
+                stop
+    if p is 0
+        give nothing
+    zero(p, 1)
+    in_use += 1
+    give p as ptr u8
+
+-- `count` zero-filled pages in a row (only from fresh memory).
+to alloc_run (count u64) gives maybe ptr u8
+    for each i in 0 until range_count
+        if ranges[i].limit - ranges[i].next >= count * size
+            new p = ranges[i].next
+            ranges[i].next += count * size
+            zero(p, count)
+            in_use += count
+            give p as ptr u8
+    give nothing
+
+to free (page ptr u8)
+    new a = page as u64
+    deref (a as ptr u64) = free_list
+    free_list = a
+    free_listed += 1
+    in_use -= 1

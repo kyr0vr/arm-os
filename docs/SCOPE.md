@@ -5,7 +5,7 @@ Raspberry Pi 5, built from the ground up: our own language, compiler, assembler,
 linker, kernel, drivers, file system, codecs and GUI. No borrowed toolchain in the
 final product.
 
-Status: **draft v0** (2026-10-08). Phases 0 to 3 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
+Status: **draft v0** (2026-10-08). Phases 0 to 4 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
 
 ---
 
@@ -68,6 +68,9 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
   - The firmware only offers a screen if it saw a monitor at boot; `hdmi_force_hotplug=1` drives HDMI regardless.
   - (Phase 3) The firmware **starts the image at `0x80000` whatever `kernel_address` says**, although its log reports the requested address. The boot code copies itself to its link address when the two differ.
   - (Phase 3) Rebooting works through the power-management watchdog at `0x10_7d20_0000`.
+  - (Phase 4) Cores start through PSCI `CPU_ON` with `smc`; their MPIDRs are `0x000`, `0x100`, `0x200`, `0x300`.
+  - (Phase 4) The GIC-400 (distributor `0x10_7fff_9000`, CPU interface `0x10_7fff_a000`) delivers the EL1 virtual timer (interrupt 27) to the non-secure kernel with no extra setup.
+  - (Phase 4) The firmware gives the ARM cores just under 1 GB of low RAM (mailbox tag `0x10005`); the screen buffer sits in it and is mapped uncached.
 - **Emulation.** QEMU has no Pi 5 machine. We develop against QEMU `virt` (AArch64,
   GICv2/v3, PL011) behind a thin board layer, and run on the real Pi regularly.
 
@@ -116,7 +119,7 @@ Each phase ends with something visible on the Pi or the PC.
 | 1 | **Alive** | ✅ Pi 5 prints "ArmOS" over serial and paints the screen red / green / blue |
 | 2 | **Own assembler + linker** | ✅ `stage0/aa64` builds every image; all 24 programs plus an instruction zoo are byte-identical to clang + lld (`tests/toolchain_compare.py`), and the Pi 5 kernel boots from it |
 | 3 | **Serial chainloader** | ✅ `tools/build_pi5.py --send COM4` builds a kernel, reboots the Pi into the loader over the cable and runs the new kernel; no SD swaps |
-| 4 | **Kernel core** | Timer interrupts tick, MMU on, page allocator and heap pass tests, all 4 cores say hello |
+| 4 | **Kernel core** | ✅ EL2 -> EL1, exception vectors, MMU + caches (168x faster), page allocator + heap self-tests, GIC + 100 Hz timer, all 4 cores via PSCI - on the Pi 5 and on QEMU (`tests/kernel_test.py`) |
 | 5 | **Self-host** | The compiler, rewritten in DULL, compiles itself byte-identically; stage 0 is retired |
 | 6 | **Text console** | Bitmap font, scrolling console on HDMI, keyboard input over serial |
 | 7 | **Storage** | SDHCI driver + FAT32 read; list and print a `.txt` from the card |

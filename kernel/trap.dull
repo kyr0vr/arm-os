@@ -1,0 +1,47 @@
+-- Exceptions: every one lands in `handle`, called from kernel/arch.s with the saved
+-- registers (`frame`: x0..x30, then ELR, then SPSR) and the vector table entry number.
+
+use io
+use board
+use gic
+use timer
+
+fixed elr_slot u64 = 31
+fixed brk_class u64 = 0x3C
+
+fixed kinds   [4] string = ["sync", "IRQ", "FIQ", "SError"]
+fixed sources [4] string = ["EL1 with SP0", "EL1", "EL0 (64-bit)", "EL0 (32-bit)"]
+
+new breakpoints u64       -- `brk` instructions caught and stepped over (the self-test uses one)
+
+to handle (frame ptr u64, entry u64)
+    if entry is 5                         -- an interrupt while the kernel was running
+        new iar = gic.ack()
+        new id = iar & 0x3FF
+        if id is timer.irq
+            timer.tick()
+        if id < 1020
+            gic.done(iar)
+        give
+    new esr = read_sysreg(esr_el1)
+    if entry is 4 and esr[31:26] is brk_class
+        breakpoints += 1
+        frame[elr_slot] = frame[elr_slot] + 4
+        give
+    io.line("")
+    io.print("exception: ")
+    io.print(kinds[entry % 4])
+    io.print(" from ")
+    io.line(sources[entry / 4])
+    io.print("  ESR ")
+    io.print_hex(esr)
+    io.print("  (class ")
+    io.print_hex(esr[31:26])
+    io.line(")")
+    io.print("  ELR ")
+    io.print_hex(frame[elr_slot])
+    io.print("  FAR ")
+    io.print_hex(read_sysreg(far_el1))
+    io.line("")
+    io.line("stopped")
+    board.idle()

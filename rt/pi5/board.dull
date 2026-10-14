@@ -1,6 +1,17 @@
--- Raspberry Pi 5 board services: reboot through the power-management watchdog.
+-- Raspberry Pi 5 board facts and services for the kernel: where things are, which
+-- memory is which, starting cores, and rebooting through the power-management watchdog.
 
 use io
+use pages
+use fb
+
+elsewhere new __stack_top u8          -- end of the kernel image and its stack (link.ld)
+
+fixed gic_dist u64 = 0x10_7fff_9000
+fixed gic_cpu  u64 = 0x10_7fff_a000
+fixed cores u64 = 4
+fixed loader_start u64 = 0x0200_0000  -- the serial loader lives here; keep clear
+fixed loader_end   u64 = 0x0300_0000
 
 device pm at 0x10_7d20_0000
     rstc at 0x1c u32
@@ -9,6 +20,30 @@ device pm at 0x10_7d20_0000
 
 fixed password u32 = 0x5A00_0000
 fixed full_reset u32 = 0x20
+
+-- Cortex-A76 cores number themselves in affinity level 1: 0x000, 0x100, 0x200, 0x300.
+to core_mpidr (n u64) gives u64
+    give n << 8
+
+-- The Pi's firmware (ARM Trusted Firmware) answers PSCI calls through `smc`.
+to psci_smc (boot_el u64) gives bool
+    give true
+
+-- What lives in each GB of the address space: 0 nothing, 1 RAM, 2 devices.
+to memory_kind (g u64) gives u8
+    if g < 8
+        give 1                        -- up to 8 GB of RAM
+    if g >= 64 and g < 68
+        give 2                        -- 0x10_0000_0000: the SoC's peripherals
+    give 0
+
+-- Hand the page allocator the RAM nobody else is using (before the MMU is on).
+to add_ram
+    pages.add((addr of __stack_top) as u64, loader_start)
+    new top = fb.arm_memory()
+    if top is 0
+        top = 0x3B00_0000
+    pages.add(loader_end, top)
 
 -- Restart the whole Pi, as if the power had been cycled. Never comes back.
 to reboot

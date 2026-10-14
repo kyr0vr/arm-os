@@ -1,0 +1,29 @@
+-- A regular tick from the ARM generic timer (the EL1 virtual timer, interrupt 27).
+
+use gic
+
+fixed irq u32 = 27
+
+new ticks u64
+new interval u64
+
+to frequency gives u64
+    give read_sysreg(cntfrq_el0)
+
+to now gives u64
+    give read_sysreg(cntvct_el0)
+
+to start (hz u64)
+    interval = frequency() / hz
+    write_sysreg(cntv_tval_el0, interval)
+    write_sysreg(cntv_ctl_el0, 1)            -- enabled, not masked
+    gic.enable(irq)
+
+-- Called from the interrupt handler.
+to tick
+    write_sysreg(cntv_tval_el0, interval)
+    ticks += 1
+
+-- Microseconds between two `now()` readings.
+to micros (start u64, finish u64) gives u64
+    give (finish - start) * 1_000_000 / frequency()

@@ -1,0 +1,61 @@
+-- The kernel heap: memory of any size, cut from pages.
+--
+-- Requests up to 2 KB round up to one of eight sizes (16, 32, ... 2048 bytes); each
+-- size keeps its own list of free blocks, refilled a page at a time. Bigger requests
+-- get whole pages. The caller says how big a block was when giving it back.
+
+use pages
+
+fixed sizes u64 = 8
+fixed smallest u64 = 16
+
+new lists [8] u64            -- first free block of each size, 0 if none
+
+-- Which size list `bytes` belongs to (8 means "whole pages").
+to size_class (bytes u64) gives u64
+    new c u64 = 0
+    new s = smallest
+    while s < bytes and c < sizes
+        s = s * 2
+        c += 1
+    give c
+
+to block_size (c u64) gives u64
+    give smallest << c
+
+-- Cut a fresh page into blocks for list `c`.
+to refill (c u64) gives bool
+    new page = pages.alloc() else give false
+    new b = block_size(c)
+    new count = pages.size / b
+    for each i in 0 until count
+        new block = page as u64 + i * b
+        deref (block as ptr u64) = lists[c]
+        lists[c] = block
+    give true
+
+-- `bytes` of zero-filled memory.
+to alloc (bytes u64) gives maybe ptr u8
+    new c = size_class(bytes)
+    if c >= sizes
+        give pages.alloc_run((bytes + pages.size - 1) / pages.size)
+    if lists[c] is 0
+        if not refill(c)
+            give nothing
+    new p = lists[c]
+    lists[c] = deref (p as ptr u64)
+    new q = p as ptr u64
+    for each i in 0 until block_size(c) / 8
+        q[i] = 0
+    give p as ptr u8
+
+-- Give back a block from `alloc(bytes)`.
+to free (p ptr u8, bytes u64)
+    new c = size_class(bytes)
+    if c >= sizes
+        new count = (bytes + pages.size - 1) / pages.size
+        for each i in 0 until count
+            pages.free(p + i * pages.size)
+        give
+    deref (p as ptr u64) = lists[c]
+    lists[c] = p as u64

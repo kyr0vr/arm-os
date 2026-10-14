@@ -1,0 +1,45 @@
+-- Starting the other cores through PSCI, the firmware's standard power interface.
+
+use io
+use lock
+use board
+use timer
+
+elsewhere to arch_psci (function u64, a u64, b u64, c u64, use_smc bool) gives i64
+elsewhere to arch_secondary_entry gives u64
+elsewhere to arch_current_el gives u64
+
+fixed cpu_on u64 = 0xC400_0003
+
+new console lock.lock
+new arrived u64
+
+-- Start cores 1 .. count-1 and wait (up to a second) for them to check in.
+-- Gives how many arrived.
+to start (count u64, use_smc bool) gives u64
+    for each n in 1 until count
+        new r = arch_psci(cpu_on, board.core_mpidr(n), arch_secondary_entry(), n, use_smc)
+        if r is not 0
+            io.print("core ")
+            io.print_u64(n)
+            io.print(": the firmware would not start it (")
+            io.print_hex(r as u64)
+            io.line(")")
+    new deadline = timer.now() + timer.frequency()
+    while arrived < count - 1 and timer.now() < deadline
+        wfe()
+    give arrived
+
+-- Every other core starts here (from kernel/arch.s), with the MMU already on.
+to secondary_main (which u64)
+    lock.acquire(addr of console)
+    io.print("core ")
+    io.print_u64(which)
+    io.print(" says hello (EL")
+    io.print_u64(arch_current_el())
+    io.line(", MMU on)")
+    arrived += 1
+    lock.release(addr of console)
+    sev()
+    repeat
+        wfe()

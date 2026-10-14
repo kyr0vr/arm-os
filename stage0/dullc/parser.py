@@ -108,7 +108,23 @@ class Parser:
                 return self.device_decl()
             if t.value == "to":
                 return self.func_decl()
+            if t.value == "elsewhere":
+                return self.elsewhere_decl()
         self.err("expected a top-level declaration (to, new, fixed, shape, choice, device, use)")
+
+    def elsewhere_decl(self):
+        # `elsewhere new name type` / `elsewhere to name (...) gives T`: defined outside DULL
+        # (assembly or the linker script), referred to by its plain symbol name.
+        line = self.take().line
+        if self.at_kw("new"):
+            self.take()
+            name = self.expect_name("a variable name")
+            ty = self.type_expr()
+            self.expect_newline()
+            return Node("global", line, name=name, type=ty, value=None, elsewhere=True)
+        if self.at_kw("to"):
+            return self.func_decl(elsewhere=True)
+        self.err("expected `elsewhere new ...` or `elsewhere to ...`")
 
     def use_decl(self):
         line = self.take().line
@@ -200,7 +216,7 @@ class Parser:
         self.take()
         return Node("device", line, name=name, base=base, regs=regs)
 
-    def func_decl(self):
+    def func_decl(self, elsewhere=False):
         line = self.take().line
         name = self.expect_name("a function name")
         params = []
@@ -222,6 +238,8 @@ class Parser:
             self.take()
             ret = self.type_expr()
         self.expect_newline()
+        if elsewhere:
+            return Node("func", line, name=name, params=params, ret=ret, body=None, elsewhere=True)
         body = self.block()
         return Node("func", line, name=name, params=params, ret=ret, body=body)
 

@@ -1,0 +1,50 @@
+-- QEMU `virt` board facts and services for the kernel (the same interface as
+-- rt/pi5/board.dull), so the kernel can be tested on the PC.
+-- Run with: -M virt,gic-version=2 -cpu cortex-a76 -smp 4 -m 128M
+
+use pages
+
+elsewhere new __stack_top u8
+
+fixed gic_dist u64 = 0x0800_0000
+fixed gic_cpu  u64 = 0x0801_0000
+fixed cores u64 = 4
+fixed ram_end u64 = 0x4800_0000       -- 128 MB of RAM from 0x4000_0000
+
+to core_mpidr (n u64) gives u64
+    give n
+
+-- QEMU's built-in PSCI answers `hvc` when the kernel starts at EL1, `smc` when it
+-- starts at EL2 (virtualization=on).
+to psci_smc (boot_el u64) gives bool
+    give boot_el is 2
+
+to memory_kind (g u64) gives u8
+    if g is 0
+        give 2                        -- devices (GIC, UART) below 1 GB
+    if g is 1
+        give 1                        -- RAM
+    give 0
+
+to add_ram
+    pages.add((addr of __stack_top) as u64, ram_end)
+
+-- Stop QEMU with exit status `code` (semihosting).
+to exit (code u64)
+    new block [2] u64
+    block[0] = 0x2_0026               -- ADP_Stopped_ApplicationExit
+    block[1] = code
+    new p = addr of block[0]
+    asm
+        "mov x1, {p}"
+        "mov w0, #0x18"
+        "hlt #0xf000"
+    repeat
+        wfe()
+
+to reboot
+    exit(0)
+
+-- On the PC there is nothing to wait for: finish the run.
+to idle
+    exit(0)

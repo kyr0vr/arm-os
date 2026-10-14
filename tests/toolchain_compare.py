@@ -1,7 +1,7 @@
 """Check ArmOS's own assembler and linker against clang + lld.
 
 Builds every program both ways and requires the images to match byte for byte:
-all runnable tests (QEMU virt), the Pi 5 kernel and loader, the virt loader, and
+all runnable tests (QEMU virt), the kernel for both boards, both loaders, and
 tests/asm/zoo.s, a file exercising every instruction form we encode.
 
 Usage: python tests/toolchain_compare.py [name-filter]
@@ -26,7 +26,8 @@ def jobs():
     for fn in sorted(os.listdir(tdir)):
         if fn.endswith(".dull"):
             yield fn[:-5], os.path.join(tdir, fn), virt, 0x4008_0000
-    yield "pi5_kernel", os.path.join(ROOT, "kernel", "main.dull"), pi5, 0x8_0000
+    yield "pi5_kernel", None, pi5, 0x8_0000
+    yield "virt_kernel", None, virt, 0x4008_0000
     yield "pi5_loader", os.path.join(ROOT, "loader", "loader.dull"), pi5, 0x200_0000
     yield "virt_loader", os.path.join(ROOT, "loader", "loader.dull"), virt, 0x4200_0000
 
@@ -66,8 +67,12 @@ def main():
     for name, src, rt, base in jobs():
         if flt not in name:
             continue
-        problem = compare(name, lambda out, backend, src=src, rt=rt, base=base, name=name:
-                          toolchain.build(src, rt, base, out, name, backend=backend))
+        if src is None:
+            problem = compare(name, lambda out, backend, rt=rt, base=base, name=name:
+                              toolchain.build_kernel(rt, base, out, name, backend=backend))
+        else:
+            problem = compare(name, lambda out, backend, src=src, rt=rt, base=base, name=name:
+                              toolchain.build(src, rt, base, out, name, backend=backend))
         print(f"{'ok  ' if problem is None else 'FAIL'} {name}" + ("" if problem is None else f": {problem}"))
         failed += problem is not None
         passed += problem is None

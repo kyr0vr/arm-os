@@ -1,0 +1,68 @@
+-- The MMU: one identity map (virtual address = physical address) for the kernel.
+--
+-- Level 1 maps 1 GB blocks; the first GB gets a level-2 table of 2 MB blocks so parts
+-- of it (the screen) can be left uncached. 39-bit addresses reach the Pi 5's devices
+-- at 0x10_0000_0000.
+
+use pages
+use board
+
+elsewhere to arch_mmu_on (ttbr u64, tcr u64, mair u64, sctlr_bits u64)
+elsewhere to arch_tlb_flush
+
+fixed devices   u64 = 0          -- MAIR slot 0: Device-nGnRnE
+fixed normal    u64 = 1          -- slot 1: normal memory, write-back cached
+fixed no_cache  u64 = 2          -- slot 2: normal memory, not cached
+fixed mair      u64 = 0x44_FF_00
+
+fixed gb u64 = 0x4000_0000
+fixed mb2 u64 = 0x20_0000
+
+new l1 u64
+new l2 u64
+new enabled bool
+
+to block (address u64, attr u64) gives u64
+    new d = address | 1 | (attr << 2) | (1 << 10)       -- valid block, attribute, accessed
+    if attr is devices
+        give d | (1 << 53) | (1 << 54)                  -- never execute from devices
+    give d | (3 << 8)                                   -- inner shareable
+
+-- Build the tables from the board's memory map. False if no pages were free.
+to build gives bool
+    new t1 = pages.alloc() else give false
+    new t2 = pages.alloc() else give false
+    l1 = t1 as u64
+    l2 = t2 as u64
+    new first = l1 as ptr u64
+    new second = l2 as ptr u64
+    for each i in 0 until 512
+        second[i] = block(i * mb2, normal)
+    for each g in 0 until 512
+        new kind = board.memory_kind(g)
+        if kind is 1 and g is 0
+            first[g] = l2 | 3                           -- table descriptor
+        else if kind is 1
+            first[g] = block(g * gb, normal)
+        else if kind is 2
+            first[g] = block(g * gb, devices)
+    give true
+
+-- Leave [address, address + size) in the first GB uncached (for the screen).
+to uncached (address u64, size u64)
+    if address + size > gb
+        give
+    new second = l2 as ptr u64
+    for each i in address / mb2 until (address + size + mb2 - 1) / mb2
+        second[i] = block(i * mb2, no_cache)
+    if enabled
+        arch_tlb_flush()
+
+to enable
+    new tcr u64 = 25                    -- T0SZ: 39-bit virtual addresses
+    tcr = tcr | (1 << 8) | (1 << 10)    -- table walks cached (write-back)
+    tcr = tcr | (3 << 12)               -- inner shareable
+    tcr = tcr | (1 << 23)               -- no TTBR1 (upper half) walks
+    tcr = tcr | (2 << 32)               -- 40-bit physical addresses
+    arch_mmu_on(l1, tcr, mair, 1 | (1 << 2) | (1 << 12))   -- MMU, data cache, instruction cache
+    enabled = true

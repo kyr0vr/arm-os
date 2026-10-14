@@ -1,0 +1,48 @@
+-- The ARM GIC-400 (GICv2) interrupt controller: one distributor shared by all
+-- cores, and one CPU interface per core.
+
+new dist_base u64
+new cpu_base u64
+
+device gicd at dist_base
+    ctlr at 0x000 u32
+    typer at 0x004 u32
+
+device gicc at cpu_base
+    ctlr at 0x000 u32
+    pmr  at 0x004 u32
+    bpr  at 0x008 u32
+    iar  at 0x00C u32
+    eoir at 0x010 u32
+
+fixed priority u8 = 0xA0
+
+-- Core 0: switch on the distributor and this core's interface.
+to init (dist u64, cpu u64)
+    dist_base = dist
+    cpu_base = cpu
+    gicd.ctlr = 1
+    init_core()
+
+-- Every core: accept interrupts of any priority.
+to init_core
+    gicc.pmr = 0xFF
+    gicc.bpr = 0
+    gicc.ctlr = 1
+
+-- Let interrupt `id` through (for PPIs like the timer, on the calling core).
+to enable (id u32)
+    new prio = (dist_base + 0x400 + id as u64) as ptr u8
+    deref prio = priority
+    if id >= 32
+        new target = (dist_base + 0x800 + id as u64) as ptr u8
+        deref target = 1                     -- deliver shared interrupts to core 0
+    new set = (dist_base + 0x100 + (id as u64 / 32) * 4) as ptr u32
+    deref set = (1 as u32) << (id % 32)
+
+-- Which interrupt fired (the raw acknowledge value; low 10 bits are the number).
+to ack gives u32
+    give gicc.iar
+
+to done (iar u32)
+    gicc.eoir = iar

@@ -50,6 +50,7 @@ Needs Python 3 and `qemu-system-aarch64`.
 python tests/run.py               # everything
 python tests/run.py maybe         # tests whose file name contains "maybe"
 python tests/loader_test.py       # the serial loader, end to end on QEMU
+python tests/kernel_test.py       # the kernel on QEMU: 4 cores, started at EL1 and at EL2
 ```
 
 `python tests/toolchain_compare.py` checks our assembler and linker against clang + lld

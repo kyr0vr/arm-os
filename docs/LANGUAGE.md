@@ -1,8 +1,8 @@
-# DULL — Spec v0.2
+# DULL — Spec v0.3
 
 *Decidedly Unremarkable Low-level Language* — the systems language ArmOS is written in.
 
-Source files use the `.dull` extension. Status: **draft v0.2** (2026-10-08) — everything
+Source files use the `.dull` extension. Status: **draft v0.3** (2026-10-14) — everything
 here may change once real code is written in it. Changes are listed in §19.
 
 ---
@@ -85,7 +85,7 @@ to play (path string)
 to gives give new fixed shape choice device at is not and or
 if else while repeat hold until for each in stop skip after stream
 true false nothing maybe ptr addr deref span lanes of fix
-on core asm use as
+on core asm use as elsewhere
 ```
 
 ## 4. Types
@@ -409,6 +409,22 @@ use mp3 as audio_mp3
 
 No visibility keywords in v0: everything at top level is public.
 
+## 15a. Things defined elsewhere
+
+A few things a kernel needs are not written in DULL: symbols the linker script defines
+and small routines that must be assembly (exception entry, starting other cores).
+`elsewhere` declares them so DULL code can use them:
+
+```
+elsewhere new __stack_top u8              -- a symbol from the linker script
+elsewhere to arch_mmu_on (ttbr u64, tcr u64, mair u64, sctlr_bits u64)
+elsewhere to arch_current_el gives u64
+```
+
+An `elsewhere` name is used as the plain symbol, with no module prefix, and nothing is
+generated for it. Going the other way, assembly calls DULL functions by their
+`module.name` symbol (`bl trap.handle`).
+
 ## 16. Calling convention and layout
 
 - **AAPCS64**, so `asm`, the firmware and any hand-written assembly interoperate.
@@ -452,6 +468,10 @@ unwrap      = logic_or [ "else" ( "give" [ expr ] | "stop" | "skip" | logic_or )
 3. Strings: is `string` = `span u8` enough, or do we want an owned string type?
 
 ## 19. Changes
+
+### v0.3 — found while building the kernel core
+
+- `elsewhere` declarations for linker symbols and assembly routines (§15a).
 
 ### v0.2 — found while building the stage-0 compiler
 

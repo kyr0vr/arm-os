@@ -1,51 +1,119 @@
--- ArmOS phase 1: say hello over the debug UART and paint the screen.
+-- The ArmOS kernel. Phase 4: the kernel core.
+--
+-- Brings the machine up step by step and checks each step: exception level,
+-- exceptions, memory, the MMU and caches, interrupts and the timer, all four cores.
+-- Builds for the Raspberry Pi 5 (rt/pi5) and for QEMU's virt board (rt/virt).
 
 use io
-use fb
 use board
+use fb
+use trap
+use pages
+use heap
+use mmu
+use gic
+use timer
+use smp
+use selftest
+
+elsewhere to arch_drop_to_el1
+elsewhere to arch_current_el gives u64
+elsewhere to arch_install_vectors
+elsewhere to arch_irq_on
+
+new failures u64
+
+to check (ok bool, what string)
+    if ok
+        io.print("  ok    ")
+    else
+        io.print("  FAIL  ")
+        failures += 1
+    io.line(what)
 
 to main
     io.line("")
     io.line("========================================")
     io.line(" ArmOS - a rather mundane operating system")
-    io.line(" phase 1: DULL running on a Raspberry Pi 5")
+    io.line(" phase 4: the kernel core")
     io.line("========================================")
-    io.print("exception level: EL")
-    io.print_u64(read_sysreg(CurrentEL) >> 2)
-    io.line("")
 
+    -- exception level
+    new boot_el = arch_current_el()
+    arch_drop_to_el1()
+    io.print("started at EL")
+    io.print_u64(boot_el)
+    io.print(", kernel runs at EL")
+    io.print_u64(arch_current_el())
+    io.line("")
+    check(arch_current_el() is 1, "running at EL1")
+
+    -- exceptions
+    arch_install_vectors()
+    asm "brk #1"
+    check(trap.breakpoints is 1, "a test breakpoint was caught and stepped over")
+
+    -- the screen, while firmware calls still see memory directly
     new s fb.screen
-    if not fb.open(1920, 1080, addr of s)
-        io.print("framebuffer: the firmware refused (reply ")
-        io.print_hex(fb.last_reply as u64)
-        io.print(", address ")
-        io.print_hex(fb.last_addr as u64)
-        io.line(") - is HDMI plugged in?")
-        board.idle()
-    io.print("framebuffer: ")
-    io.print_u64(s.width as u64)
-    io.print(" x ")
-    io.print_u64(s.height as u64)
-    io.print(", pitch ")
-    io.print_u64(s.pitch as u64)
-    io.print(", order ")
-    io.print_u64(s.order as u64)
-    io.print(", depth ")
-    io.print_u64(s.depth as u64)
-    io.print(", at ")
-    io.print_hex(s.base as u64)
-    io.line("")
+    new have_screen = fb.open(1920, 1080, addr of s)
 
-    if s.depth is not 32
-        io.line("framebuffer: not 32 bits per pixel - check framebuffer_depth in config.txt")
+    -- memory
+    board.add_ram()
+    io.print("memory: ")
+    io.print_u64(pages.available() * 4 / 1024)
+    io.line(" MB free for the kernel")
+    check(pages.available() > 256, "the page allocator has memory")
+
+    -- the MMU and caches
+    new slow = selftest.busy_work()
+    if not mmu.build()
+        check(false, "page tables built")
         board.idle()
-    new red = fb.color(addr of s, 255, 0, 0)
-    new green = fb.color(addr of s, 0, 255, 0)
-    new blue = fb.color(addr of s, 0, 0, 255)
-    new third = s.width / 3
-    fb.fill_rect(addr of s, 0, 0, third, s.height, red)
-    fb.fill_rect(addr of s, third, 0, third, s.height, green)
-    fb.fill_rect(addr of s, third * 2, 0, s.width - third * 2, s.height, blue)
-    io.line("screen painted: red | green | blue")
-    io.line("ArmOS is alive.")
+    if have_screen
+        mmu.uncached(s.base as u64, (s.pitch as u64) * (s.height as u64))
+    mmu.enable()
+    new fast = selftest.busy_work()
+    io.print("MMU and caches on: a test loop took ")
+    io.print_u64(timer.micros(0, slow))
+    io.print(" us before, ")
+    io.print_u64(timer.micros(0, fast))
+    io.line(" us after")
+    check(read_sysreg(sctlr_el1) & 5 is 5, "MMU and data cache enabled")
+
+    check(selftest.page_allocator(), "page allocator: alloc, free, reuse")
+    check(selftest.heap_allocator(), "heap: 9 sizes, zeroed, no overlaps, reuse")
+
+    -- interrupts and the timer
+    gic.init(board.gic_dist, board.gic_cpu)
+    timer.start(100)
+    arch_irq_on()
+    new t0 = timer.now()
+    new deadline = t0 + timer.frequency() * 2
+    while timer.ticks < 50 and timer.now() < deadline
+        wfi()
+    new took = timer.micros(t0, timer.now())
+    io.print("timer: ")
+    io.print_u64(timer.ticks)
+    io.print(" ticks in ")
+    io.print_u64(took / 1000)
+    io.line(" ms (100 per second)")
+    check(timer.ticks >= 50 and took > 400_000 and took < 600_000, "timer interrupts arrive on time")
+
+    -- the other cores
+    new others = smp.start(board.cores, board.psci_smc(boot_el))
+    check(others is board.cores - 1, "all four cores running")
+
+    if have_screen
+        new third = s.width / 3
+        fb.fill_rect(addr of s, 0, 0, third, s.height, fb.color(addr of s, 255, 0, 0))
+        fb.fill_rect(addr of s, third, 0, third, s.height, fb.color(addr of s, 0, 255, 0))
+        fb.fill_rect(addr of s, third * 2, 0, s.width - third * 2, s.height, fb.color(addr of s, 0, 0, 255))
+        io.line("screen painted: red | green | blue (through the uncached mapping)")
+
+    if failures is 0
+        io.line("kernel core: all checks passed")
+    else
+        io.print("kernel core: ")
+        io.print_u64(failures)
+        io.line(" check(s) failed")
     board.idle()

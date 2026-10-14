@@ -1,0 +1,22 @@
+-- Spinlocks, for data shared between cores. They need the MMU and caches on:
+-- exclusive loads and stores only work on normal (cacheable) memory.
+
+shape lock
+    held u32
+
+to acquire (l ptr lock)
+    new a = addr of l.held
+    new t u32 = 0
+    new one u32 = 1
+    asm
+        "sevl"
+        "1: wfe"
+        "2: ldaxr {t}, [{a}]"
+        "cbnz {t}, 1b"
+        "stxr {t}, {one}, [{a}]"
+        "cbnz {t}, 2b"
+
+to release (l ptr lock)
+    new a = addr of l.held
+    asm
+        "stlr wzr, [{a}]"

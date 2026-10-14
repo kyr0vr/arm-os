@@ -1,0 +1,22 @@
+-- QEMU `virt` has no firmware screen; the same interface as rt/pi5/fb.dull, always
+-- saying no.
+
+shape screen
+    base   ptr u32
+    width  u32
+    height u32
+    pitch  u32
+    order  u32
+    depth  u32
+
+to arm_memory gives u64
+    give 0
+
+to open (want_w u32, want_h u32, s ptr screen) gives bool
+    give false
+
+to color (s ptr screen, r u8, g u8, b u8) gives u32
+    give 0
+
+to fill_rect (s ptr screen, x u32, y u32, w u32, h u32, color u32)
+    give

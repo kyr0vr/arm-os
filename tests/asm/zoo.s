@@ -207,6 +207,45 @@ _start:
     ic      iallu
     eret
 
+    // atomics, caches, TLBs
+    ldxr    w0, [x1]
+    ldxr    x0, [x1]
+    ldaxr   w2, [x3]
+    ldaxr   x2, [x3]
+    stxr    w4, w5, [x6]
+    stxr    w4, x5, [x6]
+    stlxr   w7, w8, [x9]
+    ldar    x0, [x1]
+    stlr    wzr, [x2]
+    stlr    x3, [x4]
+    clrex
+    tlbi    vmalle1
+    tlbi    vmalle1is
+    tlbi    alle2
+    dc      civac, x0
+    dc      cvac, x1
+    dc      ivac, x2
+    mrs     x0, vpidr_el2
+    msr     vmpidr_el2, x1
+    mrs     x2, isr_el1
+    mrs     x3, id_aa64mmfr0_el1
+    mrs     x4, ctr_el0
+    msr     sp_el1, x5
+    msr     elr_el2, x6
+    msr     spsr_el2, x7
+    msr     cnthctl_el2, x8
+    msr     cntvoff_el2, xzr
+    msr     cptr_el2, x9
+    msr     cntv_tval_el0, x10
+    msr     cntv_ctl_el0, x11
+    msr     mair_el1, x12
+    msr     tcr_el1, x13
+    msr     ttbr0_el1, x14
+    mrs     x15, esr_el1
+    mrs     x16, far_el1
+    mrs     x17, elr_el1
+    smc     #0
+
     .balign 8
 literal: .xword 0x1122334455667788
 

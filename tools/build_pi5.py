@@ -65,8 +65,11 @@ def main():
     else:
         source, base, name = os.path.join(ROOT, "kernel", "main.dull"), KERNEL_BASE, "kernel"
     try:
-        _, img = toolchain.build(source, RT, base, OUT, name, debug=not args.release)
-    except (toolchain.DullError, RuntimeError) as e:
+        if args.loader:
+            _, img = toolchain.build(source, RT, base, OUT, name, debug=not args.release)
+        else:
+            _, img = toolchain.build_kernel(RT, base, OUT, name, debug=not args.release)
+    except toolchain.BuildError as e:
         raise SystemExit(f"error: {e}")
     print(f"built {img} ({os.path.getsize(img)} bytes, runs at {hex(base)})")
 

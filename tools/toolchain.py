@@ -30,7 +30,11 @@ def link_script(rt_dir, base):
         return f.read().replace("@BASE@", hex(base))
 
 
-def build(source, rt_dir, base, out_dir, name, debug=True, extra_includes=(), backend="own"):
+KERNEL = os.path.join(ROOT, "kernel")
+
+
+def build(source, rt_dir, base, out_dir, name, debug=True, extra_includes=(), backend="own",
+          extra_asm=()):
     """Compile `source` against runtime `rt_dir`, linked at `base`.
     Returns (elf_path, img_path)."""
     os.makedirs(out_dir, exist_ok=True)
@@ -38,8 +42,15 @@ def build(source, rt_dir, base, out_dir, name, debug=True, extra_includes=(), ba
     s = os.path.join(out_dir, name + ".s")
     with open(s, "w", encoding="utf-8", newline="\n") as f:
         f.write(asm)
-    return assemble_and_link([os.path.join(rt_dir, "start.s"), s], link_script(rt_dir, base),
+    return assemble_and_link([os.path.join(rt_dir, "start.s"), *extra_asm, s], link_script(rt_dir, base),
                              out_dir, name, backend)
+
+
+def build_kernel(rt_dir, base, out_dir, name="kernel", debug=True, backend="own"):
+    """The ArmOS kernel (kernel/main.dull + kernel/arch.s) for the board in `rt_dir`."""
+    return build(os.path.join(KERNEL, "main.dull"), rt_dir, base, out_dir, name, debug=debug,
+                 extra_includes=[KERNEL], backend=backend,
+                 extra_asm=[os.path.join(KERNEL, "arch.s")])
 
 
 def assemble_and_link(sources, script, out_dir, name, backend="own"):

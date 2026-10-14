@@ -1,0 +1,75 @@
+-- Self-tests the kernel runs at boot. Each gives true when everything checked out.
+
+use io
+use pages
+use heap
+use timer
+
+-- How long a fixed piece of busy work takes, in timer counts (to see the caches work).
+to busy_work gives u64
+    new start = timer.now()
+    new sum u64 = 0
+    for each i in 0 until 20_000
+        sum = sum +% i
+    if sum is 0
+        io.line("?")
+    give timer.now() - start
+
+to fail (what string) gives bool
+    io.print("  FAILED: ")
+    io.line(what)
+    give false
+
+-- 64 pages: distinct, aligned, writable, and reused after being freed.
+to page_allocator gives bool
+    new got [64] u64
+    for each i in 0 until 64
+        new p = pages.alloc() else give fail("ran out of pages")
+        got[i] = p as u64
+        if got[i] & 0xFFF is not 0
+            give fail("a page is not 4 KB aligned")
+        new words = p as ptr u64
+        if words[0] is not 0 or words[511] is not 0
+            give fail("a new page is not zeroed")
+        words[0] = i
+        words[511] = i * 3
+    for each i in 0 until 64
+        new words = got[i] as ptr u64
+        if words[0] is not i or words[511] is not i * 3
+            give fail("pages overlap")
+        for each j in i + 1 until 64
+            if got[i] is got[j]
+                give fail("the same page was handed out twice")
+    new before = pages.available()
+    for each i in 0 until 64
+        pages.free(got[i] as ptr u8)
+    if pages.available() is not before + 64
+        give fail("freed pages were not counted")
+    new again = pages.alloc() else give fail("could not allocate after freeing")
+    if again as u64 is not got[63]
+        give fail("a freed page was not reused first")
+    pages.free(again)
+    give true
+
+-- Blocks of many sizes: zeroed, independent, reusable.
+to heap_allocator gives bool
+    new sizes [9] u64 = [1, 7, 16, 24, 100, 500, 2048, 3000, 10000]
+    new blocks [90] u64
+    for each round in 0 until 2
+        for each i in 0 until 90
+            new size = sizes[i % 9]
+            new p = heap.alloc(size) else give fail("the heap ran out")
+            blocks[i] = p as u64
+            for each k in 0 until size
+                if p[k] is not 0
+                    give fail("a heap block is not zeroed")
+                p[k] = (i & 0xFF) as u8
+        for each i in 0 until 90
+            new size = sizes[i % 9]
+            new p = blocks[i] as ptr u8
+            for each k in 0 until size
+                if p[k] is not (i & 0xFF) as u8
+                    give fail("heap blocks overlap")
+        for each i in 0 until 90
+            heap.free(blocks[i] as ptr u8, sizes[i % 9])
+    give true

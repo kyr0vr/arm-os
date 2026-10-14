@@ -21,7 +21,7 @@ KEYWORDS = {
     "is", "not", "and", "or", "if", "else", "while", "repeat", "hold", "until",
     "for", "each", "in", "stop", "skip", "after", "stream", "true", "false",
     "nothing", "maybe", "ptr", "addr", "deref", "span", "lanes", "of", "fix",
-    "on", "core", "asm", "use", "as", "through",
+    "on", "core", "asm", "use", "as", "through", "elsewhere",
 }
 
 # Longest first so the scanner is greedy.

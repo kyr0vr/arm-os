@@ -42,6 +42,22 @@ to call (m ptr u32) gives bool
             dsb()
             give m[1] is ok
 
+-- The end of the RAM the firmware leaves to the ARM cores (0 if it will not say).
+-- Call it before the MMU is on, like everything that talks to the firmware here.
+to arm_memory gives u64
+    new m = message()
+    m[0] = 8 * 4
+    m[1] = 0
+    m[2] = 0x10005     -- get ARM memory
+    m[3] = 8
+    m[4] = 0
+    m[5] = 0
+    m[6] = 0
+    m[7] = 0
+    if not call(m)
+        give 0
+    give (m[5] as u64) + (m[6] as u64)
+
 -- Ask for a `want_w` x `want_h` 32-bit screen. The monitor's own size wins if the
 -- firmware reports one.
 to open (want_w u32, want_h u32, s ptr screen) gives bool

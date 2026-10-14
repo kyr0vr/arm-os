@@ -38,6 +38,8 @@ SYSREGS = {
     "cnthctl_el2": (3, 4, 14, 1, 0), "cntvoff_el2": (3, 4, 14, 0, 3),
     "tpidr_el2": (3, 4, 13, 0, 2), "mair_el2": (3, 4, 10, 2, 0), "tcr_el2": (3, 4, 2, 0, 2),
     "ttbr0_el2": (3, 4, 2, 0, 0),
+    "vpidr_el2": (3, 4, 0, 0, 0), "vmpidr_el2": (3, 4, 0, 0, 5), "isr_el1": (3, 0, 12, 1, 0),
+    "id_aa64mmfr0_el1": (3, 0, 0, 7, 0), "ctr_el0": (3, 3, 0, 0, 1),
 }
 
 BARRIER_OPTS = {"sy": 15, "st": 14, "ld": 13, "ish": 11, "ishst": 10, "ishld": 9,
@@ -807,6 +809,70 @@ class Encoder:
 
     def i_hlt(self, ops):
         return self.exc(0xD4400000, ops)
+
+    # ---- exclusive and acquire/release (spinlocks)
+    def excl(self, base32, ops, mn, status=False):
+        if status:
+            self.need(ops, 3, mn)
+            s, t = reg(ops[0]), reg(ops[1])
+            if s.is64:
+                raise AsmError(f"`{mn}` status register is a w register")
+            rest = ops[2:]
+        else:
+            self.need(ops, 2, mn)
+            t = reg(ops[0])
+            s = None
+            rest = ops[1:]
+        base, kind, off, _ = self.parse_mem(rest)
+        if kind != "off" or off != 0:
+            raise AsmError(f"`{mn}` takes a plain [Xn] address")
+        word = base32 | ((1 << 30) if t.is64 else 0) | (base.num << 5) | t.num
+        if s is not None:
+            word = (word & ~(0x1F << 16)) | (s.num << 16)
+        return word
+
+    def i_ldxr(self, ops):
+        return self.excl(0x885F7C00, ops, "ldxr")
+
+    def i_ldaxr(self, ops):
+        return self.excl(0x885FFC00, ops, "ldaxr")
+
+    def i_stxr(self, ops):
+        return self.excl(0x88007C00, ops, "stxr", status=True)
+
+    def i_stlxr(self, ops):
+        return self.excl(0x8800FC00, ops, "stlxr", status=True)
+
+    def i_ldar(self, ops):
+        return self.excl(0x88DFFC00, ops, "ldar")
+
+    def i_stlr(self, ops):
+        return self.excl(0x889FFC00, ops, "stlr")
+
+    def i_clrex(self, ops):
+        return 0xD503305F | (15 << 8)
+
+    # ---- cache and TLB maintenance (SYS aliases)
+    def sys(self, op1, crn, crm, op2, rt=31):
+        return 0xD5080000 | (op1 << 16) | (crn << 12) | (crm << 8) | (op2 << 5) | rt
+
+    def i_tlbi(self, ops):
+        op = ops[0].strip().lower()
+        table = {"vmalle1": (0, 8, 7, 0), "vmalle1is": (0, 8, 3, 0), "alle2": (4, 8, 7, 0),
+                 "alle2is": (4, 8, 3, 0), "vae1": (0, 8, 7, 1), "vae1is": (0, 8, 3, 1)}
+        if op not in table:
+            raise AsmError(f"unsupported `tlbi {op}`")
+        rt = reg(ops[1]).num if len(ops) > 1 else 31
+        return self.sys(*table[op], rt)
+
+    def i_dc(self, ops):
+        self.need(ops, 2, "dc")
+        op = ops[0].strip().lower()
+        table = {"civac": (3, 7, 14, 1), "cvac": (3, 7, 10, 1), "cvau": (3, 7, 11, 1),
+                 "ivac": (0, 7, 6, 1), "zva": (3, 7, 4, 1), "cisw": (0, 7, 14, 2), "isw": (0, 7, 6, 2)}
+        if op not in table:
+            raise AsmError(f"unsupported `dc {op}`")
+        return self.sys(*table[op], reg(ops[1]).num)
 
     def i_ic(self, ops):
         op = ops[0].strip().lower()
