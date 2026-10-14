@@ -29,16 +29,31 @@ Generated code expects the platform to provide:
 
 `rt/virt/` provides both for QEMU's `virt` machine, plus `io.dull` for console output.
 
+## The assembler and linker (`aa64/`)
+
+`stage0/aa64` turns the compiler's assembly (and the hand-written boot files) into
+images, with no outside tools:
+
+- `assembler.py` - GNU-style syntax: sections, labels, numbered local labels (`1b`/`1f`),
+  `.rept`, data directives, relocations
+- `encode.py` - the AArch64 instruction encodings we use
+- `linker.py` - reads our `link.ld` files, places sections, resolves relocations, writes
+  a flat image and a minimal ELF (for QEMU)
+
+`tools/toolchain.py` drives compiler, assembler and linker together.
+
 ## Running the tests
 
-Needs Python 3, the `ziglang` package (for `clang`/`lld` as the temporary assembler and
-linker — replaced by our own in phase 2) and `qemu-system-aarch64`.
+Needs Python 3 and `qemu-system-aarch64`.
 
 ```
-pip install ziglang
-python tests/run.py            # everything
-python tests/run.py maybe      # tests whose file name contains "maybe"
+python tests/run.py               # everything
+python tests/run.py maybe         # tests whose file name contains "maybe"
+python tests/loader_test.py       # the serial loader, end to end on QEMU
 ```
+
+`python tests/toolchain_compare.py` checks our assembler and linker against clang + lld
+byte for byte; it is the only thing that needs the `ziglang` package (`pip install ziglang`).
 
 Each test is compiled, linked with `rt/virt`, and run on an emulated Cortex-A76.
 Test files state their expected output in header comments (see `tests/run.py`).

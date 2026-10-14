@@ -12,7 +12,8 @@ Each tests/errors/*.dull must fail to compile:
 
     -- error: text that must appear in the error message
 
-Usage: python tests/run.py [name-filter]
+Usage: python tests/run.py [name-filter] [--llvm]
+(--llvm builds with clang + lld instead of ArmOS's own assembler and linker)
 """
 
 import os
@@ -22,7 +23,9 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "stage0"))
+sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import toolchain  # noqa: E402
 from dullc import DullError, compile_file  # noqa: E402
 
 RT = os.path.join(ROOT, "rt", "virt")
@@ -38,12 +41,6 @@ def qemu_path():
         if c and os.path.isfile(c):
             return c
     raise SystemExit("qemu-system-aarch64 not found")
-
-
-def zig(*args):
-    r = subprocess.run([sys.executable, "-m", "ziglang", *args], capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(f"zig {args[0]} failed:\n{r.stderr}")
 
 
 def headers(path):
@@ -68,27 +65,9 @@ def headers(path):
     return h
 
 
-def build_runtime():
-    obj = os.path.join(BUILD, "start.o")
-    zig("cc", "-target", "aarch64-freestanding-none", "-c", os.path.join(RT, "start.s"), "-o", obj)
-    return obj
-
-
-def run_program(path, h, start_obj, qemu):
+def run_program(path, h, backend, qemu):
     name = os.path.splitext(os.path.basename(path))[0]
-    asm = compile_file(path, [RT], debug=not h["release"])
-    s = os.path.join(BUILD, name + ".s")
-    o = os.path.join(BUILD, name + ".o")
-    elf = os.path.join(BUILD, name + ".elf")
-    with open(s, "w", encoding="utf-8", newline="\n") as f:
-        f.write(asm)
-    zig("cc", "-target", "aarch64-freestanding-none", "-c", s, "-o", o)
-    with open(os.path.join(RT, "link.ld"), encoding="utf-8") as f:
-        script = f.read().replace("@BASE@", "0x40080000")
-    ld = os.path.join(BUILD, "link.ld")
-    with open(ld, "w", encoding="utf-8", newline="\n") as f:
-        f.write(script)
-    zig("ld.lld", "-T", ld, start_obj, o, "-o", elf)
+    elf, _ = toolchain.build(path, RT, 0x4008_0000, BUILD, name, debug=not h["release"], backend=backend)
     cmd = [qemu, "-M", "virt", "-cpu", "cortex-a76", "-m", "128M", "-display", "none",
            "-monitor", "none", "-serial", "stdio", "-semihosting-config",
            "enable=on,target=native", "-kernel", elf]
@@ -101,10 +80,11 @@ def run_program(path, h, start_obj, qemu):
 
 
 def main():
-    flt = sys.argv[1] if len(sys.argv) > 1 else ""
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    backend = "llvm" if "--llvm" in sys.argv else "own"
+    flt = args[0] if args else ""
     os.makedirs(BUILD, exist_ok=True)
     qemu = qemu_path()
-    start_obj = build_runtime()
     tdir = os.path.join(ROOT, "tests")
     passed = failed = 0
 
@@ -114,8 +94,8 @@ def main():
         path = os.path.join(tdir, fn)
         h = headers(path)
         try:
-            code, out = run_program(path, h, start_obj, qemu)
-        except (DullError, RuntimeError) as e:
+            code, out = run_program(path, h, backend, qemu)
+        except toolchain.BuildError as e:
             print(f"FAIL {fn}: {e}")
             failed += 1
             continue
