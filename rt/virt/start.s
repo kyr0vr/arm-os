@@ -71,12 +71,59 @@ dull_trap:
     b       dull_exit
 
 cpu_exception:
+    mrs     x20, esr_el1
+    mrs     x21, elr_el1
+    mrs     x22, far_el1
     adrp    x1, exc_msg
     add     x1, x1, :lo12:exc_msg
     mov     w0, #0x04
     hlt     #0xf000
+    adrp    x1, esr_msg
+    add     x1, x1, :lo12:esr_msg
+    mov     w0, #0x04
+    hlt     #0xf000
+    mov     x0, x20
+    bl      print_hex
+    adrp    x1, elr_msg
+    add     x1, x1, :lo12:elr_msg
+    mov     w0, #0x04
+    hlt     #0xf000
+    mov     x0, x21
+    bl      print_hex
+    adrp    x1, far_msg
+    add     x1, x1, :lo12:far_msg
+    mov     w0, #0x04
+    hlt     #0xf000
+    mov     x0, x22
+    bl      print_hex
+    adrp    x1, newline
+    add     x1, x1, :lo12:newline
+    mov     w0, #0x04
+    hlt     #0xf000
     mov     x0, #102
     b       dull_exit
+
+// print_hex(x0): 16 hex digits through semihosting. Clobbers x0-x5.
+print_hex:
+    adrp    x1, hex_buf
+    add     x1, x1, :lo12:hex_buf
+    mov     x2, #60
+1:  lsr     x3, x0, x2
+    and     x3, x3, #15
+    cmp     x3, #10
+    b.lo    2f
+    add     x3, x3, #('a' - 10)
+    b       3f
+2:  add     x3, x3, #'0'
+3:  strb    w3, [x1], #1
+    subs    x2, x2, #4
+    b.pl    1b
+    strb    wzr, [x1]
+    adrp    x1, hex_buf
+    add     x1, x1, :lo12:hex_buf
+    mov     w0, #0x04
+    hlt     #0xf000
+    ret
 
 .balign 2048
 vectors:
@@ -88,4 +135,10 @@ vectors:
 .section .rodata, "a"
 trap_prefix: .asciz "trap: "
 newline:     .asciz "\n"
-exc_msg:     .asciz "cpu exception\n"
+exc_msg:     .asciz "cpu exception"
+esr_msg:     .asciz " ESR "
+elr_msg:     .asciz " ELR "
+far_msg:     .asciz " FAR "
+
+.bss
+hex_buf:     .zero 24

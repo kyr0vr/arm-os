@@ -71,6 +71,7 @@ class Program:
         self.bss = []
         self.label_n = 0
         self.strings = {}       # bytes -> label
+        self.strdata = []       # string bytes, kept apart so they never land inside an array
 
     # ---- errors / labels ----
     def label(self, stem="L"):
@@ -83,11 +84,11 @@ class Program:
             lab = self.label("str")
             self.strings[key] = lab
             body = data + (b"\0" if nul else b"")
-            self.rodata.append(f"{lab}:")
+            self.strdata.append(f"{lab}:")
             for i in range(0, max(len(body), 1), 16):
                 chunk = body[i:i + 16]
                 if chunk:
-                    self.rodata.append("    .byte " + ", ".join(str(b) for b in chunk))
+                    self.strdata.append("    .byte " + ", ".join(str(b) for b in chunk))
         return self.strings[key]
 
     # ---- loading ----
@@ -573,9 +574,10 @@ class Program:
         lines.append(f".global {ENTRY_SYMBOL}")
         lines.append(f".set {ENTRY_SYMBOL}, {main.symbol}")
         lines += self.out
-        if self.rodata:
+        if self.rodata or self.strdata:
             lines.append('.section .rodata,"a"')
             lines += self.rodata
+            lines += self.strdata
         if self.data:
             lines.append('.data')
             lines += [l for l in self.data if l]

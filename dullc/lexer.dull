@@ -1,0 +1,346 @@
+-- The DULL lexer: source text -> tokens, including INDENT and DEDENT.
+-- A port of stage0/dullc/lexer.py; it must produce exactly the same tokens.
+
+use mem
+use text
+use buf
+use vec
+use map
+use diag
+
+fixed t_name u32 = 1
+fixed t_int u32 = 2
+fixed t_str u32 = 3
+fixed t_char u32 = 4
+fixed t_kw u32 = 5
+fixed t_sym u32 = 6
+fixed t_newline u32 = 7
+fixed t_indent u32 = 8
+fixed t_dedent u32 = 9
+fixed t_eof u32 = 10
+
+shape token
+    kind  u32
+    line  u64
+    value u64          -- INT and CHAR
+    text  string       -- NAME, KW, SYM: the word; STR: the bytes after escapes
+
+fixed keyword_list [44] string = ["to", "gives", "give", "new", "fixed", "shape", "choice",
+    "device", "at", "is", "not", "and", "or", "if", "else", "while", "repeat", "hold",
+    "until", "for", "each", "in", "stop", "skip", "after", "stream", "true", "false",
+    "nothing", "maybe", "ptr", "addr", "deref", "span", "lanes", "of", "fix", "on", "core",
+    "asm", "use", "as", "through", "elsewhere"]
+
+-- Longest first, so the scanner is greedy.
+fixed symbol_list [38] string = ["<<=", ">>=",
+    "->", "+%", "-%", "*%", "+|", "-|", "<<", ">>", "<=", ">=",
+    "+=", "-=", "*=", "/=", "&=", "|=", "^=",
+    "+", "-", "*", "/", "%", "&", "|", "^", "~", "<", ">", "=",
+    "(", ")", "[", "]", ",", ".", ":"]
+
+-- A line ending in one of these continues on the next line.
+fixed continue_list [37] string = ["->", "+%", "-%", "*%", "+|", "-|", "<<", ">>", "<=",
+    ">=", "+", "-", "*", "/", "%", "&", "|", "^", "<", ">", "=", ",", "(", "[", "and", "or",
+    "not", "is", "+=", "-=", "*=", "/=", "&=", "|=", "^=", "<<=", ">>="]
+
+new keywords ptr map.map
+new continues ptr map.map
+
+to setup
+    if keywords as u64 is not 0
+        give
+    keywords = map.make()
+    for each w in keyword_list
+        map.put(keywords, w, 1)
+    continues = map.make()
+    for each w in continue_list
+        map.put(continues, w, 1)
+
+to is_keyword (w string) gives bool
+    setup()
+    give map.has(keywords, w)
+
+-- ---------------------------------------------------------------- state
+
+new src string
+new file string
+new tokens ptr vec.vec
+
+to add (kind u32, line u64, value u64, word string)
+    new t = mem.alloc(size_of(token)) as ptr token
+    t.kind = kind
+    t.line = line
+    t.value = value
+    t.text = word
+    vec.push(tokens, t as u64)
+
+to token_at (i u64) gives ptr token
+    give vec.get(tokens, i) as ptr token
+
+to fail (line u64, message string)
+    diag.fail(file, line, message)
+
+-- ---------------------------------------------------------------- escapes
+
+to escape_value (e u8) gives maybe u8
+    if e is 'n'
+        give 10
+    if e is 't'
+        give 9
+    if e is 'r'
+        give 13
+    if e is '0'
+        give 0
+    if e is '\\'
+        give 92
+    if e is '"'
+        give 34
+    if e is '\''
+        give 39
+    give nothing
+
+to hex_value (c u8) gives maybe u64
+    if c >= '0' and c <= '9'
+        give (c - '0') as u64
+    if c >= 'a' and c <= 'f'
+        give (c - 'a' + 10) as u64
+    if c >= 'A' and c <= 'F'
+        give (c - 'A' + 10) as u64
+    give nothing
+
+to unescape (body string, line u64) gives string
+    new out buf.buf
+    new i u64 = 0
+    while i < body.len
+        new c = body[i]
+        if c is not '\\'
+            buf.byte(addr of out, c)
+            i += 1
+            skip
+        if i + 1 >= body.len
+            fail(line, "string ends in a lone backslash")
+        new e = body[i + 1]
+        if e is 'x'
+            if i + 4 > body.len
+                fail(line, "\\x needs two hex digits")
+            new hi = hex_value(body[i + 2]) else fail_hex(line)
+            new lo = hex_value(body[i + 3]) else fail_hex(line)
+            buf.byte(addr of out, (hi * 16 + lo) as u8)
+            i += 4
+        else
+            new v = escape_value(e) else fail_escape(line, e)
+            buf.byte(addr of out, v)
+            i += 2
+    give buf.text(addr of out)
+
+to fail_hex (line u64) gives u64
+    fail(line, "\\x needs two hex digits")
+    give 0
+
+to fail_escape (line u64, e u8) gives u8
+    new b buf.buf
+    buf.add(addr of b, "unknown escape \\")
+    buf.byte(addr of b, e)
+    fail(line, buf.text(addr of b))
+    give 0
+
+-- ---------------------------------------------------------------- numbers
+
+-- Digits of `s` (underscores ignored) in `base`. Fails on an empty digit string.
+to number_value (s string, base u64, line u64) gives u64
+    new v u64 = 0
+    new digits u64 = 0
+    for each c in s
+        if c is '_'
+            skip
+        new d = hex_value(c) else 99
+        if d >= base
+            fail(line, "malformed number")
+        if v > (0xFFFF_FFFF_FFFF_FFFF - d) / base
+            fail(line, "number is too large")
+        v = v * base + d
+        digits += 1
+    if digits is 0
+        fail(line, "malformed number")
+    give v
+
+-- ---------------------------------------------------------------- the scanner
+
+to is_word_char (c u8) gives bool
+    give text.is_alpha(c) or text.is_digit(c)
+
+to tokenize (source string, file_name string) gives ptr vec.vec
+    setup()
+    src = source
+    file = file_name
+    tokens = vec.make()
+    new indents = vec.make()
+    vec.push(indents, 0)
+    new depth u64 = 0
+    new continuing = false
+
+    -- split into lines on \n, \r\n or \r
+    new pos u64 = 0
+    new lineno u64 = 0
+    new last_line u64 = 0
+    while pos <= src.len
+        new start = pos
+        while pos < src.len and src[pos] is not '\n' and src[pos] is not '\r'
+            pos += 1
+        new raw = src[start until pos]
+        if pos < src.len and src[pos] is '\r' and pos + 1 < src.len and src[pos + 1] is '\n'
+            pos += 2
+        else
+            pos += 1
+        lineno += 1
+        last_line = lineno
+        scan_line(raw, lineno, indents, addr of depth, addr of continuing)
+
+    new end_line = last_line
+    if depth is not 0
+        fail(end_line, "unclosed ( or [ at end of file")
+    if tokens.len > 0
+        new k = token_at(tokens.len - 1).kind
+        if k is not t_newline and k is not t_dedent
+            add(t_newline, end_line, 0, "")
+    while indents.len > 1
+        vec.pop(indents)
+        add(t_dedent, end_line, 0, "")
+    add(t_eof, end_line, 0, "")
+    give tokens
+
+to scan_line (raw string, lineno u64, indents ptr vec.vec, depth ptr u64, continuing ptr bool)
+    new col u64 = 0
+    while col < raw.len and raw[col] is ' '
+        col += 1
+    if col < raw.len and raw[col] is '\t'
+        fail(lineno, "tabs are not allowed; indent with 4 spaces")
+    new rest = raw[col until raw.len]
+    if rest.len is 0 or text.starts_with(rest, "--")
+        give
+
+    if deref depth is 0 and not deref continuing
+        if col > vec.last(indents)
+            vec.push(indents, col)
+            add(t_indent, lineno, 0, "")
+        else
+            while col < vec.last(indents)
+                vec.pop(indents)
+                add(t_dedent, lineno, 0, "")
+            if col is not vec.last(indents)
+                fail(lineno, "indentation does not match any outer block")
+
+    new i = col
+    new first = tokens.len
+    while i < raw.len
+        new c = raw[i]
+        if c is ' '
+            i += 1
+            skip
+        if c is '\t'
+            fail(lineno, "tabs are not allowed")
+        if c is '-' and i + 1 < raw.len and raw[i + 1] is '-'
+            stop
+        if text.is_alpha(c)
+            new j = i
+            while j < raw.len and is_word_char(raw[j])
+                j += 1
+            new word = raw[i until j]
+            if map.has(keywords, word)
+                add(t_kw, lineno, 0, word)
+            else
+                add(t_name, lineno, 0, word)
+            i = j
+            skip
+        if text.is_digit(c)
+            i = scan_number(raw, i, lineno)
+            skip
+        if c is '"'
+            new j = i + 1
+            while j < raw.len and raw[j] is not '"'
+                if raw[j] is '\\'
+                    j += 2
+                else
+                    j += 1
+            if j >= raw.len
+                fail(lineno, "unterminated string")
+            add(t_str, lineno, 0, unescape(raw[i + 1 until j], lineno))
+            i = j + 1
+            skip
+        if c is '\''
+            new j = i + 1
+            while j < raw.len and raw[j] is not '\''
+                if raw[j] is '\\'
+                    j += 2
+                else
+                    j += 1
+            if j >= raw.len
+                fail(lineno, "unterminated character")
+            new bytes = unescape(raw[i + 1 until j], lineno)
+            if bytes.len is not 1
+                fail(lineno, "a character literal must be exactly one byte")
+            add(t_char, lineno, bytes[0] as u64, "")
+            i = j + 1
+            skip
+        new matched = false
+        for each s in symbol_list
+            if text.starts_with(raw[i until raw.len], s)
+                add(t_sym, lineno, 0, raw[i until i + s.len])
+                if s.len is 1 and (s[0] is '(' or s[0] is '[')
+                    deref depth = deref depth + 1
+                else if s.len is 1 and (s[0] is ')' or s[0] is ']')
+                    if deref depth > 0
+                        deref depth = deref depth - 1
+                i += s.len
+                matched = true
+                stop
+        if not matched
+            new b buf.buf
+            buf.add(addr of b, "unexpected character ")
+            diag.repr(addr of b, raw[i until i + 1])
+            fail(lineno, buf.text(addr of b))
+
+    if tokens.len is first
+        give
+    new last = token_at(tokens.len - 1)
+    deref continuing = (last.kind is t_sym or last.kind is t_kw) and map.has(continues, last.text)
+    if deref depth is 0 and not deref continuing
+        add(t_newline, lineno, 0, "")
+
+-- Scan a number starting at raw[i]; gives the index just after it.
+to scan_number (raw string, i u64, lineno u64) gives u64
+    new j = i
+    new base u64 = 10
+    new digits_start = i
+    if i + 1 < raw.len and raw[i] is '0' and (raw[i + 1] is 'x' or raw[i + 1] is 'X')
+        j = i + 2
+        while j < raw.len and (hex_value(raw[j]) is not nothing or raw[j] is '_')
+            j += 1
+        base = 16
+        digits_start = i + 2
+    else if i + 1 < raw.len and raw[i] is '0' and (raw[i + 1] is 'b' or raw[i + 1] is 'B')
+        j = i + 2
+        while j < raw.len and (raw[j] is '0' or raw[j] is '1' or raw[j] is '_')
+            j += 1
+        base = 2
+        digits_start = i + 2
+    else
+        while j < raw.len and (text.is_digit(raw[j]) or raw[j] is '_')
+            j += 1
+        if j < raw.len and raw[j] is '.' and j + 1 < raw.len and text.is_digit(raw[j + 1])
+            fail(lineno, "floats are not supported by the stage-0 compiler")
+    if all_underscores(raw[digits_start until j])
+        fail(lineno, "malformed number")
+    if j < raw.len and is_word_char(raw[j])
+        new b buf.buf
+        buf.add(addr of b, "malformed number ")
+        diag.repr(addr of b, raw[i until j + 1])
+        fail(lineno, buf.text(addr of b))
+    add(t_int, lineno, number_value(raw[digits_start until j], base, lineno), "")
+    give j
+
+to all_underscores (s string) gives bool
+    for each c in s
+        if c is not '_'
+            give false
+    give true

@@ -1,0 +1,92 @@
+-- dullc: the DULL compiler, written in DULL. Runs on the PC inside QEMU.
+--
+--   dullc tokens <file.dull> <out.txt>     dump the tokens (for checking the lexer)
+
+use sys
+use text
+use buf
+use vec
+use lexer
+use diag
+
+-- The command line, split on spaces.
+to arguments gives ptr vec.vec
+    new line = sys.command_line()
+    new out = vec.make()
+    new i u64 = 0
+    while i < line.len
+        while i < line.len and line[i] is ' '
+            i += 1
+        if i >= line.len
+            stop
+        new start = i
+        while i < line.len and line[i] is not ' '
+            i += 1
+        new word = mem_string(line[start until i])
+        vec.push(out, word.ptr as u64)
+        vec.push(out, word.len)
+    give out
+
+to mem_string (s string) gives string
+    give buf.copy(s)
+
+to argument (args ptr vec.vec, i u64) gives string
+    new s string
+    s.ptr = vec.get(args, i * 2) as ptr u8
+    s.len = vec.get(args, i * 2 + 1)
+    give s
+
+to usage
+    sys.print("usage: dullc tokens <file.dull> <out.txt>\n")
+    sys.exit(2)
+
+-- The file name stage 0 reports in messages: the last path component.
+to base_name (path string) gives string
+    new slash = text.find_last(path, '/') else nothing_found(path)
+    if slash is path.len
+        give path
+    give path[slash + 1 until path.len]
+
+to nothing_found (path string) gives u64
+    new back = text.find_last(path, '\\') else path.len
+    give back
+
+new kind_names [10] string = ["NAME", "INT", "STR", "CHAR", "KW", "SYM", "NEWLINE", "INDENT", "DEDENT", "EOF"]
+
+to dump_tokens (path string, out_path string)
+    new src string
+    if not sys.read_file(path, addr of src)
+        diag.fail("", 0, "cannot read the source file")
+    new tokens = lexer.tokenize(src, base_name(path))
+    new b buf.buf
+    for each i in 0 until tokens.len
+        new t = vec.get(tokens, i) as ptr lexer.token
+        buf.number(addr of b, t.line)
+        buf.byte(addr of b, ' ')
+        buf.add(addr of b, kind_names[t.kind - 1])
+        if t.kind is lexer.t_int or t.kind is lexer.t_char
+            buf.byte(addr of b, ' ')
+            buf.number(addr of b, t.value)
+        else if t.kind is lexer.t_str
+            buf.byte(addr of b, ' ')
+            for each c in t.text
+                buf.byte(addr of b, diag.hexdigit(c >> 4))
+                buf.byte(addr of b, diag.hexdigit(c & 15))
+        else if t.kind is lexer.t_name or t.kind is lexer.t_kw or t.kind is lexer.t_sym
+            buf.byte(addr of b, ' ')
+            buf.add(addr of b, t.text)
+        buf.byte(addr of b, '\n')
+    if not sys.write_file(out_path, buf.text(addr of b))
+        diag.fail("", 0, "cannot write the output file")
+
+to main gives u8
+    new args = arguments()
+    new count = args.len / 2               -- argument 0 is the tool's own name
+    if count < 2
+        usage()
+    new command = argument(args, 1)
+    if text.same(command, "tokens") and count is 4
+        dump_tokens(argument(args, 2), argument(args, 3))
+        give 0
+    usage()
+    give 2

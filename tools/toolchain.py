@@ -64,6 +64,9 @@ def assemble_and_link(sources, script, out_dir, name, backend="own"):
         image = aa64.link(objects, script)
         with open(img, "wb") as f:
             f.write(image.data)
+        with open(os.path.join(out_dir, name + ".map"), "w", encoding="utf-8", newline="\n") as f:
+            for sym, addr in sorted(image.symbols.items(), key=lambda kv: kv[1]):
+                f.write(f"{addr:016x} {sym}\n")
         with open(elf, "wb") as f:
             f.write(image.elf())
         return elf, img

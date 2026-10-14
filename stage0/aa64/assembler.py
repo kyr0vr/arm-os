@@ -139,7 +139,7 @@ NUMLABEL_REF = re.compile(r"(?<![\w#.$])(\d+)([bf])(?![\w.$])")
 class Expr:
     """Tiny expression evaluator: integers, constants, + - * / % << >> & | ^ ~ ( )."""
 
-    TOK = re.compile(r"\s*(0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*|<<|>>|[A-Za-z_.$][\w.$]*|.)")
+    TOK = re.compile(r"\s*(0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*|'[^']'|<<|>>|[A-Za-z_.$][\w.$]*|.)")
 
     def __init__(self, text, consts):
         self.toks = [t for t in self.TOK.findall(text) if t.strip()]
@@ -188,6 +188,8 @@ class Expr:
             if self.take() != ")":
                 raise AsmError("missing )")
             return v
+        if len(t) == 3 and t[0] == "'" and t[2] == "'":
+            return ord(t[1])
         if t[0].isdigit():
             t = t.replace("_", "")
             if t[:2].lower() == "0x":

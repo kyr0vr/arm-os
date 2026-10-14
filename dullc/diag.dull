@@ -1,0 +1,60 @@
+-- Compile errors. An error ends the compile: it is printed as
+-- "error: <file>:<line>: <message>" (the same text as the stage-0 compiler) and the
+-- program exits with status 1.
+
+use buf
+use sys
+
+-- Print an error and stop.
+to fail (file string, line u64, message string)
+    new b buf.buf
+    buf.add(addr of b, "error: ")
+    if file.len > 0
+        buf.add(addr of b, file)
+        buf.byte(addr of b, ':')
+        buf.number(addr of b, line)
+        buf.add(addr of b, ": ")
+    buf.add(addr of b, message)
+    buf.byte(addr of b, '\n')
+    sys.print(buf.text(addr of b))
+    sys.exit(1)
+
+-- Python's repr() of a string: 'text' with escapes (how stage 0 quotes things).
+to repr (b ptr buf.buf, s string)
+    new quote u8 = '\''
+    new has_single = false
+    new has_double = false
+    for each c in s
+        if c is '\''
+            has_single = true
+        if c is '"'
+            has_double = true
+    if has_single and not has_double
+        quote = '"'
+    buf.byte(b, quote)
+    for each c in s
+        if c is '\\'
+            buf.add(b, "\\\\")
+        else if c is quote
+            buf.byte(b, '\\')
+            buf.byte(b, c)
+        else if c is '\n'
+            buf.add(b, "\\n")
+        else if c is '\t'
+            buf.add(b, "\\t")
+        else if c is '\r'
+            buf.add(b, "\\r")
+        else if c < 32 or c is 127
+            buf.add(b, "\\x")
+            new hi = c >> 4
+            new lo = c & 15
+            buf.byte(b, hexdigit(hi))
+            buf.byte(b, hexdigit(lo))
+        else
+            buf.byte(b, c)
+    buf.byte(b, quote)
+
+to hexdigit (n u8) gives u8
+    if n < 10
+        give '0' + n
+    give 'a' + n - 10
