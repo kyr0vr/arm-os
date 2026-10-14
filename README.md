@@ -15,3 +15,15 @@ You need a Raspberry Pi Debug Probe on the Pi's 3-pin UART header and a FAT32 mi
 1. Once: `python tools/build_pi5.py --loader --card F:` puts the serial loader on the card (use your card's drive letter).
 2. Every build: `python tools/build_pi5.py --send COM4` builds the kernel, sends it over the cable and shows what it prints.
    A running ArmOS kernel reboots into the loader on request, so the card stays in the Pi.
+
+## What it looks like
+
+The boot screen (the arrow through the A is the progress bar; every fact on the right is read from the hardware) and the console, rendered by the kernel itself:
+
+![boot screen](docs/brand/boot-screen-1080p.png)
+
+![console](docs/brand/console-1080p.png)
+
+Type at the console over the serial cable: `python -m serial.tools.miniterm COM4 115200`.
+
+The console font, ArmOS Mono, is baked from Cascadia Mono and Cascadia Code (SIL Open Font License 1.1, see [fonts/](fonts/)).

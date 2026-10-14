@@ -21,6 +21,75 @@ device pm at 0x10_7d20_0000
 fixed password u32 = 0x5A00_0000
 fixed full_reset u32 = 0x20
 
+use line
+
+new revision u32               -- the firmware's board revision code
+new arm_hz u32                 -- the ARM cores' clock
+
+-- Ask the firmware what this board is (call before the MMU is on).
+to probe
+    revision = fb.board_revision()
+    arm_hz = fb.clock_rate(3)
+
+-- New-style revision codes (bit 23 set): type in bits 4-11, processor 12-15, memory 20-22.
+to host_name (l ptr line.line)
+    new t = (revision >> 4) & 0xFF
+    if revision >> 23 & 1 is 0
+        line.add(l, "Raspberry Pi (old-style revision ")
+        line.hex(l, revision as u64)
+        line.byte(l, ')')
+    else if t is 0x17
+        line.add(l, "Raspberry Pi 5 Model B")
+    else if t is 0x18
+        line.add(l, "Raspberry Pi Compute Module 5")
+    else if t is 0x19
+        line.add(l, "Raspberry Pi 500")
+    else if t is 0x1A
+        line.add(l, "Raspberry Pi Compute Module 5 Lite")
+    else
+        line.add(l, "Raspberry Pi (type ")
+        line.hex(l, t as u64)
+        line.byte(l, ')')
+
+to gpu_name (l ptr line.line)
+    new chip = (revision >> 12) & 0xF
+    if chip is 4
+        line.add(l, "VideoCore VII")
+    else if chip is 3
+        line.add(l, "VideoCore VI")
+    else
+        line.add(l, "VideoCore IV")
+
+to memory_mib gives u64
+    new code = (revision >> 20) & 7
+    give (256 as u64) << (code as u64)
+
+to cpu_mhz gives u64
+    give (arm_hz / 1_000_000) as u64
+
+-- The next key from the serial cable. "ARMR" (the PC asking for a new kernel)
+-- reboots into the loader instead.
+new matched u64
+
+to next_key gives maybe u8
+    new word [4] u8 = ['A', 'R', 'M', 'R']
+    new b = io.get()
+    if b is word[matched]
+        matched += 1
+        if matched is 4
+            io.line("")
+            io.line("rebooting")
+            reboot()
+    else if b is word[0]
+        matched = 1
+    else
+        matched = 0
+    give b
+
+-- Only QEMU saves screenshots.
+to save_screen (s ptr fb.screen, which u32)
+    give
+
 -- Cortex-A76 cores number themselves in affinity level 1: 0x000, 0x100, 0x200, 0x300.
 to core_mpidr (n u64) gives u64
     give n << 8

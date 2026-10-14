@@ -1,0 +1,137 @@
+-- Drawing: a canvas in ordinary (cached) memory, colors, rectangles and text in
+-- ArmOS Mono. A canvas is copied to the real screen with `present`.
+--
+-- Canvas pixels are 0x00RRGGBB; `present` converts for screens that store RGB bytes.
+
+use font
+use fb
+use pages
+
+shape canvas
+    pixels ptr u32
+    width  u32
+    height u32
+
+fixed regular u8 = 0
+fixed bold u8 = 1
+fixed small u8 = 2
+
+-- A canvas the size of the screen (gives false if there is no memory for it).
+to make (c ptr canvas, w u32, h u32) gives bool
+    new bytes = (w as u64) * (h as u64) * 4
+    new p = pages.alloc_run((bytes + pages.size - 1) / pages.size) else give false
+    c.pixels = p as ptr u32
+    c.width = w
+    c.height = h
+    give true
+
+to rgb (r u32, g u32, b u32) gives u32
+    give (r << 16) | (g << 8) | b
+
+to red_of (c u32) gives u32
+    give (c >> 16) & 0xFF
+
+to green_of (c u32) gives u32
+    give (c >> 8) & 0xFF
+
+to blue_of (c u32) gives u32
+    give c & 0xFF
+
+to fill (c ptr canvas, x u32, y u32, w u32, h u32, color u32)
+    if x >= c.width or y >= c.height
+        give
+    new x1 = x + w
+    if x1 > c.width
+        x1 = c.width
+    new y1 = y + h
+    if y1 > c.height
+        y1 = c.height
+    for each row in y until y1
+        new line = c.pixels + (row as u64) * (c.width as u64)
+        for each col in x until x1
+            line[col] = color
+
+-- Mix `color` over the pixel at (x, y) with coverage a/15.
+to blend (c ptr canvas, x u32, y u32, color u32, a u32)
+    if x >= c.width or y >= c.height or a is 0
+        give
+    new i = (y as u64) * (c.width as u64) + (x as u64)
+    if a >= 15
+        c.pixels[i] = color
+        give
+    new bg = c.pixels[i]
+    new r = (red_of(bg) * (15 - a) + red_of(color) * a) / 15
+    new g = (green_of(bg) * (15 - a) + green_of(color) * a) / 15
+    new b = (blue_of(bg) * (15 - a) + blue_of(color) * a) / 15
+    c.pixels[i] = rgb(r, g, b)
+
+to advance_of (style u8) gives u32
+    if style is small
+        give font.small_advance
+    give font.advance
+
+to height_of (style u8) gives u32
+    if style is small
+        give font.small_height
+    give font.height
+
+-- One character with its top-left corner at (x, y).
+to glyph (c ptr canvas, x u32, y u32, ch u8, style u8, color u32)
+    if ch < font.first or ch >= font.first + font.glyphs
+        give
+    new index = (ch - font.first) as u64
+    new stride = font.stride
+    new h = font.height
+    if style is small
+        stride = font.small_stride
+        h = font.small_height
+    new base = index * (h as u64) * stride
+    for each row in 0 until h
+        for each b in 0 until stride
+            new k = base + (row as u64) * stride + b
+            new packed u8 = 0
+            if style is bold
+                packed = font.bold[k]
+            else if style is small
+                packed = font.small[k]
+            else
+                packed = font.regular[k]
+            if packed is 0
+                skip
+            new px = x + (b as u32) * 2
+            blend(c, px, y + row, color, (packed & 15) as u32)
+            blend(c, px + 1, y + row, color, (packed >> 4) as u32)
+
+-- A string; gives the x just after it.
+to string (c ptr canvas, x u32, y u32, s string, style u8, color u32) gives u32
+    new adv = advance_of(style)
+    for each ch in s
+        if ch is not ' '
+            glyph(c, x, y, ch, style, color)
+        x += adv
+    give x
+
+to width_of (s string, style u8) gives u32
+    give (s.len as u32) * advance_of(style)
+
+-- Copy a rectangle of the canvas to the screen.
+to present (c ptr canvas, s ptr fb.screen, x u32, y u32, w u32, h u32)
+    new x1 = x + w
+    if x1 > c.width
+        x1 = c.width
+    new y1 = y + h
+    if y1 > c.height
+        y1 = c.height
+    for each row in y until y1
+        new src = c.pixels + (row as u64) * (c.width as u64)
+        new dst = s.base + (row as u64) * (s.pitch as u64) / 4
+        if s.order is 0
+            for each col in x until x1
+                dst[col] = src[col]
+        else
+            for each col in x until x1
+                new v = src[col]
+                dst[col] = (blue_of(v) << 16) | (green_of(v) << 8) | red_of(v)
+
+to present_all (c ptr canvas, s ptr fb.screen)
+    present(c, s, 0, 0, c.width, c.height)

@@ -1,0 +1,95 @@
+-- A text console on the screen: a grid of ArmOS Mono cells that scrolls when full.
+-- Draws into the canvas and copies only what changed to the real screen.
+
+use text
+use fb
+use fetch
+
+fixed margin u32 = 40
+
+new canvas ptr text.canvas
+new screen ptr fb.screen
+new cols u32
+new rows u32
+new cx u32
+new cy u32
+new active bool
+
+to start (c ptr text.canvas, s ptr fb.screen)
+    canvas = c
+    screen = s
+    cols = (c.width - margin * 2) / fetch.cw
+    rows = (c.height - margin * 2) / fetch.lh
+    cx = 0
+    cy = 0
+    active = true
+    text.fill(c, 0, 0, c.width, c.height, fetch.bg)
+    draw_cursor(true)
+    text.present_all(c, s)
+
+to cell_x (col u32) gives u32
+    give margin + col * fetch.cw
+
+to cell_y (row u32) gives u32
+    give margin + row * fetch.lh
+
+to show_cell (col u32, row u32)
+    text.present(canvas, screen, cell_x(col), cell_y(row), fetch.cw, fetch.lh)
+
+to draw_cursor (visible bool)
+    new color = fetch.bg
+    if visible
+        color = fetch.amber
+    text.fill(canvas, cell_x(cx), cell_y(cy) + 4, fetch.cw * 6 / 10, fetch.lh - 8, color)
+    show_cell(cx, cy)
+
+to clear_cell (col u32, row u32)
+    text.fill(canvas, cell_x(col), cell_y(row), fetch.cw, fetch.lh, fetch.bg)
+
+-- Move everything up one line and blank the last one.
+to scroll
+    new top = cell_y(0)
+    new bottom = cell_y(rows)
+    new w = canvas.width as u64
+    for each y in top until bottom - fetch.lh
+        new dst = canvas.pixels + (y as u64) * w
+        new src = canvas.pixels + ((y + fetch.lh) as u64) * w
+        for each x in 0 until canvas.width
+            dst[x] = src[x]
+    text.fill(canvas, 0, bottom - fetch.lh, canvas.width, fetch.lh, fetch.bg)
+    text.present(canvas, screen, 0, top, canvas.width, bottom - top)
+
+to newline
+    cx = 0
+    if cy + 1 < rows
+        cy += 1
+    else
+        scroll()
+
+to put (ch u8, color u32, style u8)
+    if not active
+        give
+    draw_cursor(false)
+    if ch is '\n'
+        newline()
+    else if ch is 8 or ch is 127          -- backspace
+        if cx > 0
+            cx -= 1
+            clear_cell(cx, cy)
+            show_cell(cx, cy)
+    else if ch >= 32 and ch < 127
+        clear_cell(cx, cy)
+        text.glyph(canvas, cell_x(cx), cell_y(cy), ch, style, color)
+        show_cell(cx, cy)
+        cx += 1
+        if cx >= cols
+            newline()
+    draw_cursor(true)
+
+to print (s string, color u32)
+    for each ch in s
+        put(ch, color, text.regular)
+
+to print_bold (s string, color u32)
+    for each ch in s
+        put(ch, color, text.bold)

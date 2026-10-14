@@ -1,0 +1,57 @@
+-- A short line of text built up in place (the kernel has no heap strings).
+
+shape line
+    bytes [160] u8
+    len   u64
+
+to clear (l ptr line)
+    l.len = 0
+
+to byte (l ptr line, c u8)
+    if l.len < 160
+        l.bytes[l.len] = c
+        l.len += 1
+
+to add (l ptr line, s string)
+    for each c in s
+        byte(l, c)
+
+to number (l ptr line, v u64)
+    new digits [20] u8
+    new n u64 = 0
+    if v is 0
+        byte(l, '0')
+        give
+    while v > 0
+        digits[n] = (v % 10) as u8 + '0'
+        v = v / 10
+        n += 1
+    while n > 0
+        n -= 1
+        byte(l, digits[n])
+
+-- v / 100 with two decimals: 240 -> "2.40".
+to hundredths (l ptr line, v u64)
+    number(l, v / 100)
+    byte(l, '.')
+    byte(l, ((v / 10) % 10) as u8 + '0')
+    byte(l, (v % 10) as u8 + '0')
+
+to hex (l ptr line, v u64)
+    add(l, "0x")
+    new started = false
+    for each i in 0 until 16
+        new nib = ((v >> (60 - i * 4)) & 0xF) as u8
+        if nib is not 0 or i is 15
+            started = true
+        if started
+            if nib < 10
+                byte(l, '0' + nib)
+            else
+                byte(l, 'a' + nib - 10)
+
+to text (l ptr line) gives string
+    new s string
+    s.ptr = addr of l.bytes[0]
+    s.len = l.len
+    give s

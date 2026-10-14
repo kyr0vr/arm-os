@@ -5,7 +5,7 @@ Raspberry Pi 5, built from the ground up: our own language, compiler, assembler,
 linker, kernel, drivers, file system, codecs and GUI. No borrowed toolchain in the
 final product.
 
-Status: **draft v0** (2026-10-08). Phases 0 to 5 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
+Status: **draft v0** (2026-10-08). Phases 0 to 6 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
 
 ---
 
@@ -121,7 +121,7 @@ Each phase ends with something visible on the Pi or the PC.
 | 3 | **Serial chainloader** | ✅ `tools/build_pi5.py --send COM4` builds a kernel, reboots the Pi into the loader over the cable and runs the new kernel; no SD swaps |
 | 4 | **Kernel core** | ✅ EL2 -> EL1, exception vectors, MMU + caches (168x faster), page allocator + heap self-tests, GIC + 100 Hz timer, all 4 cores via PSCI - on the Pi 5 and on QEMU (`tests/kernel_test.py`) |
 | 5 | **Self-host** | ✅ `dullc/`: compiler, assembler and linker in DULL; compiles itself to a fixed point; every image byte-identical to stage 0 and clang + lld; all builds now use it, stage 0 only bootstraps |
-| 6 | **Text console** | Bitmap font, scrolling console on HDMI, keyboard input over serial |
+| 6 | **Text console** | ✅ ArmOS Mono bitmap font, the designed boot screen drawn live (progress arrow with glow, facts read from the hardware), a scrolling console and a tiny shell taking keys over serial - on the Pi and in QEMU (screenshots) |
 | 7 | **Storage** | SDHCI driver + FAT32 read; list and print a `.txt` from the card |
 | 8 | **Processes** | EL0 apps, syscalls, scheduler; the console is an app |
 | 9 | **GUI + Text** | Compositor, launcher with Text/Music/Video tiles, **Text reader done** (serial keys) |

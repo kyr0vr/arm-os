@@ -42,6 +42,29 @@ to call (m ptr u32) gives bool
             dsb()
             give m[1] is ok
 
+-- One-value firmware query: tag, request value; gives the first answer word (0 if none).
+to ask (tag u32, request u32, answer_index u64) gives u32
+    new m = message()
+    m[0] = 8 * 4
+    m[1] = 0
+    m[2] = tag
+    m[3] = 8
+    m[4] = 0
+    m[5] = request
+    m[6] = 0
+    m[7] = 0
+    if not call(m)
+        give 0
+    give m[5 + answer_index]
+
+-- The board revision code (0x00d04170 on a Raspberry Pi 5 with 8 GB).
+to board_revision gives u32
+    give ask(0x10002, 0, 0)
+
+-- A clock's rate in Hz (clock 3 is the ARM cores).
+to clock_rate (clock u32) gives u32
+    give ask(0x30002, clock, 1)
+
 -- The end of the RAM the firmware leaves to the ARM cores (0 if it will not say).
 -- Call it before the MMU is on, like everything that talks to the firmware here.
 to arm_memory gives u64

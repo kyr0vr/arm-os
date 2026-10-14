@@ -1,0 +1,152 @@
+-- A tiny shell. Keys come in over the serial cable (board.next_key); everything goes
+-- out both to the serial cable and, once a key has been pressed, to the screen console.
+
+use io
+use board
+use console
+use fetch
+use facts
+use text
+use fb
+use line
+use timer
+use pages
+
+new canvas ptr text.canvas
+new screen ptr fb.screen
+new has_screen bool
+
+to say (s string, color u32)
+    io.print(s)
+    if has_screen
+        console.print(s, color)
+
+to say_bold (s string, color u32)
+    io.print(s)
+    if has_screen
+        console.print_bold(s, color)
+
+to say_line (l ptr line.line, color u32)
+    say(line.text(l), color)
+
+to prompt
+    say_bold("root", fetch.amber)
+    say_bold("@", fetch.putty)
+    say_bold("armos", fetch.amber)
+    say(":~$ ", fetch.putty)
+
+-- The prompt on the screen only (the serial side already has one).
+to screen_prompt
+    console.print_bold("root", fetch.amber)
+    console.print_bold("@", fetch.putty)
+    console.print_bold("armos", fetch.amber)
+    console.print(":~$ ", fetch.putty)
+
+to help
+    say("commands:\n", fetch.muted)
+    say("  fetch    show the boot screen again\n", fetch.putty)
+    say("  clear    clear the screen\n", fetch.putty)
+    say("  mem      memory in use\n", fetch.putty)
+    say("  uptime   time since the kernel started\n", fetch.putty)
+    say("  cpu      the processor\n", fetch.putty)
+    say("  echo ... say something back\n", fetch.putty)
+    say("  reboot   restart the Pi\n", fetch.putty)
+
+to show (key string, value ptr line.line)
+    say_bold(key, fetch.amber)
+    say(": ", fetch.putty)
+    say_line(value, fetch.putty)
+    say("\n", fetch.putty)
+
+to run_command (cmd string)
+    new t = trim(cmd)
+    if t.len is 0
+        give
+    if same(t, "help")
+        help()
+    else if same(t, "fetch")
+        facts.uptime(fetch.value(3))
+        fetch.step(canvas, 1000, fetch.info_rows)
+        if has_screen
+            text.present_all(canvas, screen)
+            console.active = false
+        say("(press a key to get the console back)\n", fetch.muted)
+    else if same(t, "clear")
+        if has_screen
+            console.start(canvas, screen)
+    else if same(t, "mem")
+        new l line.line
+        facts.memory(addr of l)
+        show("Memory", addr of l)
+    else if same(t, "uptime")
+        new l line.line
+        facts.uptime(addr of l)
+        show("Uptime", addr of l)
+    else if same(t, "cpu")
+        new l line.line
+        facts.cpu(addr of l)
+        show("CPU", addr of l)
+    else if starts(t, "echo ")
+        say(t[5 until t.len], fetch.putty)
+        say("\n", fetch.putty)
+    else if same(t, "reboot")
+        say("rebooting\n", fetch.muted)
+        board.reboot()
+    else
+        say("not a command: ", fetch.deep)
+        say(t, fetch.putty)
+        say(" (try help)\n", fetch.muted)
+
+to same (a string, b string) gives bool
+    if a.len is not b.len
+        give false
+    for each i in 0 until a.len
+        if a[i] is not b[i]
+            give false
+    give true
+
+to starts (a string, prefix string) gives bool
+    give a.len >= prefix.len and same(a[0 until prefix.len], prefix)
+
+to trim (s string) gives string
+    new a u64 = 0
+    new b = s.len
+    while a < b and s[a] is ' '
+        a += 1
+    while b > a and s[b - 1] is ' '
+        b -= 1
+    give s[a until b]
+
+-- Read keys and run commands until the board has no more keys (only QEMU's
+-- scripted keys run out; on the Pi this never returns).
+to run (c ptr text.canvas, s ptr fb.screen, with_screen bool)
+    canvas = c
+    screen = s
+    has_screen = with_screen
+    new typed line.line
+    io.line("")
+    prompt()
+    repeat
+        new key = board.next_key() else stop
+        if has_screen and not console.active
+            console.start(canvas, screen)
+            screen_prompt()
+            console.print(line.text(addr of typed), fetch.putty)
+        if key is '\r' or key is '\n'
+            say("\n", fetch.putty)
+            run_command(line.text(addr of typed))
+            line.clear(addr of typed)
+            if has_screen and not console.active
+                skip
+            prompt()
+        else if key is 8 or key is 127
+            if typed.len > 0
+                typed.len -= 1
+                io.print("\x08 \x08")
+                if has_screen
+                    console.put(8, fetch.putty, text.regular)
+        else if key >= 32 and key < 127
+            line.byte(addr of typed, key)
+            io.put(key)
+            if has_screen
+                console.put(key, fetch.putty, text.regular)

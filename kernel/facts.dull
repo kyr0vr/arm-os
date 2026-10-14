@@ -1,0 +1,101 @@
+-- Facts about this machine, as text, for the boot screen and the shell. Everything
+-- here is read from the hardware or the kernel's own state - nothing is made up.
+
+use line
+use board
+use timer
+use pages
+use smp
+use fb
+
+elsewhere new _start u8          -- the first byte of the kernel image
+elsewhere new __stack_top u8     -- the last byte of the kernel's image and stack
+
+fixed version string = "0.6"     -- ArmOS version: 0.<phase>
+fixed language string = "DULL 0.3"
+
+new boot_time u64                -- timer count when the kernel started
+new screen_w u32
+new screen_h u32
+new screen_depth u32
+
+to os (l ptr line.line)
+    line.clear(l)
+    line.add(l, "ArmOS ")
+    line.add(l, version)
+    line.add(l, " aarch64")
+
+to kernel (l ptr line.line)
+    line.clear(l)
+    line.add(l, "armos ")
+    line.add(l, version)
+    line.add(l, ".0-dull")
+
+to host (l ptr line.line)
+    line.clear(l)
+    board.host_name(l)
+
+-- Seconds since the kernel started, two decimals.
+to uptime (l ptr line.line)
+    line.clear(l)
+    new ticks = timer.now() - boot_time
+    line.hundredths(l, ticks * 100 / timer.frequency())
+    line.add(l, " s")
+
+-- From MIDR_EL1: who made the core and which design it is.
+to core_name (l ptr line.line)
+    new midr = read_sysreg(midr_el1)
+    new implementer = midr[31:24]
+    new part = midr[15:4]
+    if implementer is 0x41 and part is 0xD0B
+        line.add(l, "Cortex-A76")
+    else if implementer is 0x41 and part is 0xD08
+        line.add(l, "Cortex-A72")
+    else if implementer is 0x41 and part is 0xD03
+        line.add(l, "Cortex-A53")
+    else
+        line.add(l, "Arm core ")
+        line.hex(l, midr)
+
+to cpu (l ptr line.line)
+    line.clear(l)
+    core_name(l)
+    line.add(l, " (")
+    line.number(l, smp.arrived + 1)
+    line.byte(l, ')')
+    new mhz = board.cpu_mhz()
+    if mhz > 0
+        line.add(l, " @ ")
+        line.hundredths(l, mhz / 10)
+        line.add(l, " GHz")
+
+to gpu (l ptr line.line)
+    line.clear(l)
+    board.gpu_name(l)
+
+-- Memory ArmOS is using (its image and stack, plus pages handed out) / all of it.
+to memory (l ptr line.line)
+    line.clear(l)
+    new image = (addr of __stack_top) as u64 - (addr of _start) as u64
+    new used = image + pages.in_use * pages.size
+    line.number(l, (used + 1024 * 1024 - 1) / (1024 * 1024))
+    line.add(l, " MiB / ")
+    line.number(l, board.memory_mib())
+    line.add(l, " MiB")
+
+to display (l ptr line.line)
+    line.clear(l)
+    line.number(l, screen_w as u64)
+    line.byte(l, 'x')
+    line.number(l, screen_h as u64)
+    line.add(l, ", ")
+    line.number(l, screen_depth as u64)
+    line.add(l, " bpp")
+
+to lang (l ptr line.line)
+    line.clear(l)
+    line.add(l, language)
+
+to shell_name (l ptr line.line)
+    line.clear(l)
+    line.add(l, "tiny. still mundane.")

@@ -1,5 +1,6 @@
--- QEMU `virt` has no firmware screen; the same interface as rt/pi5/fb.dull, always
--- saying no.
+-- QEMU `virt` has no firmware screen, so this pretends: a 1920x1080 screen in
+-- ordinary RAM at 0x4700_0000 (kept out of the page allocator by board.dull). The
+-- kernel draws into it exactly as on the Pi, and the test saves it as a picture.
 
 shape screen
     base   ptr u32
@@ -9,14 +10,24 @@ shape screen
     order  u32
     depth  u32
 
+fixed ram_screen u64 = 0x4700_0000
+
 to arm_memory gives u64
     give 0
 
 to open (want_w u32, want_h u32, s ptr screen) gives bool
-    give false
+    s.base = ram_screen as ptr u32
+    s.width = 1920
+    s.height = 1080
+    s.pitch = 1920 * 4
+    s.order = 0
+    s.depth = 32
+    give true
 
 to color (s ptr screen, r u8, g u8, b u8) gives u32
-    give 0
+    give (r as u32) << 16 | (g as u32) << 8 | (b as u32)
 
 to fill_rect (s ptr screen, x u32, y u32, w u32, h u32, color u32)
-    give
+    for each row in y until y + h
+        for each col in x until x + w
+            s.base[(row as u64) * (s.pitch as u64) / 4 + (col as u64)] = color

@@ -1,0 +1,281 @@
+-- The boot screen: the ArmOS mark on the left, facts about the machine on the right
+-- (neofetch style). The arrow through the A is the boot progress bar, and every fact
+-- is read from the hardware as the kernel brings it up.
+--
+-- Layout, colors and font follow the approved design for a 1920x1080 screen
+-- (25 px ArmOS Mono, 31 px lines, a soft glow around the lit arrow).
+
+use text
+use logo
+use font
+use line
+
+fixed bg u32 = 0x12_12_11
+fixed putty u32 = 0xE6_DB_C1
+fixed amber u32 = 0xFF_9A_1F
+fixed muted u32 = 0x8C_84_6F
+fixed deep u32 = 0xE0_56_1B
+fixed slot u32 = 0x2A_29_26
+fixed palette [8] u32 = [0x12_12_11, 0x2A_29_26, 0x8C_84_6F, 0xE6_DB_C1, 0xE0_56_1B, 0xF0_7A_1D, 0xFF_9A_1F, 0xFF_C2_66]
+
+fixed cw u32 = 15                -- character width
+fixed lh u32 = 31                -- line height
+fixed info_rows u32 = 10
+
+fixed keys [10] string = ["OS", "Host", "Kernel", "Uptime", "CPU", "GPU", "Memory", "Display", "Language", "Shell"]
+
+new values [10] line.line       -- what each key says
+new shown u32                   -- info rows visible so far
+new progress u32                -- boot progress, per mille
+new cursor bool                 -- the blinking block below the last row while booting
+
+new left u32
+new top u32
+new ix u32
+new iy u32
+
+new glow text.canvas            -- the lit arrow, blurred
+new glow_x u32
+new glow_y u32
+new have_glow bool
+
+to set_value (i u32, s string)
+    line.clear(addr of values[i])
+    line.add(addr of values[i], s)
+
+to value (i u32) gives ptr line.line
+    give addr of values[i]
+
+to layout (c ptr text.canvas)
+    new art_w = logo.cols * cw
+    new info_w = 42 * cw
+    new gap = 4 * cw
+    left = (c.width - (art_w + gap + info_w)) / 2
+    top = (c.height - logo.rows * lh) / 2 - 40
+    ix = left + art_w + gap
+    iy = top + lh / 2
+
+to lerp (a u32, b u32, t u32, scale u32) gives u32
+    -- a + (b - a) * t / scale, per channel, rounded
+    new r = mix(text.red_of(a), text.red_of(b), t, scale)
+    new g = mix(text.green_of(a), text.green_of(b), t, scale)
+    new bl = mix(text.blue_of(a), text.blue_of(b), t, scale)
+    give text.rgb(r, g, bl)
+
+to mix (a u32, b u32, t u32, scale u32) gives u32
+    new v = (a as i64) * (scale as i64) + ((b as i64) - (a as i64)) * (t as i64)
+    give ((v + (scale as i64) / 2) / (scale as i64)) as u32
+
+-- How many arrow columns are lit at the current progress.
+to reveal gives u32
+    new arrow_span = logo.arrow_last - logo.arrow_first + 1
+    give logo.arrow_first + arrow_span * progress / 1000
+
+to arrow_color (col u32) gives u32
+    new arrow_span = logo.arrow_last - logo.arrow_first
+    if arrow_span < 1
+        arrow_span = 1
+    give lerp(deep, amber, col - logo.arrow_first, arrow_span)
+
+-- Draw the lit arrow cells into the glow canvas (black background).
+to arrow_cells (into ptr text.canvas, ox u32, oy u32, lit u32)
+    for each r in 0 until logo.rows
+        new chars = logo.chars[r]
+        new kinds = logo.kinds[r]
+        for each col in 0 until logo.cols
+            if kinds[col] is 'a' and col < lit and chars[col] is not ' '
+                text.glyph(into, left + col * cw - ox, top + r * lh - oy, chars[col], text.bold, arrow_color(col))
+
+-- Three box blurs (13, 13, 14 px) approximate the design's 14 px Gaussian blur.
+to blur (c ptr text.canvas, scratch ptr text.canvas)
+    for each pass in 0 until 3
+        new radius u32 = 13
+        if pass is 2
+            radius = 14
+        box(c, scratch, radius, true)
+        box(scratch, c, radius, false)
+
+-- One box blur pass, horizontal or vertical, from `src` into `dst`.
+to box (src ptr text.canvas, dst ptr text.canvas, radius u32, horizontal bool)
+    new w = src.width
+    new h = src.height
+    new width = radius * 2 + 1
+    new lines = h
+    new length = w
+    if not horizontal
+        lines = w
+        length = h
+    for each ln in 0 until lines
+        new r u32 = 0
+        new g u32 = 0
+        new b u32 = 0
+        for each k in 0 until radius + 1
+            if k < length
+                new v = pixel_at(src, ln, k, horizontal)
+                r += text.red_of(v)
+                g += text.green_of(v)
+                b += text.blue_of(v)
+        for each k in 0 until length
+            put(dst, ln, k, horizontal, text.rgb(r / width, g / width, b / width))
+            if k + radius + 1 < length
+                new v = pixel_at(src, ln, k + radius + 1, horizontal)
+                r += text.red_of(v)
+                g += text.green_of(v)
+                b += text.blue_of(v)
+            if k >= radius
+                new v = pixel_at(src, ln, k - radius, horizontal)
+                r -= text.red_of(v)
+                g -= text.green_of(v)
+                b -= text.blue_of(v)
+
+to pixel_at (c ptr text.canvas, ln u32, k u32, horizontal bool) gives u32
+    if horizontal
+        give c.pixels[(ln as u64) * (c.width as u64) + (k as u64)]
+    give c.pixels[(k as u64) * (c.width as u64) + (ln as u64)]
+
+to put (c ptr text.canvas, ln u32, k u32, horizontal bool, v u32)
+    if horizontal
+        c.pixels[(ln as u64) * (c.width as u64) + (k as u64)] = v
+    else
+        c.pixels[(k as u64) * (c.width as u64) + (ln as u64)] = v
+
+-- Add 55% of the glow onto the screen canvas.
+to add_glow (c ptr text.canvas)
+    for each y in 0 until glow.height
+        for each x in 0 until glow.width
+            new gv = glow.pixels[(y as u64) * (glow.width as u64) + (x as u64)]
+            if gv is 0
+                skip
+            new sx = glow_x + x
+            new sy = glow_y + y
+            if sx >= c.width or sy >= c.height
+                skip
+            new i = (sy as u64) * (c.width as u64) + (sx as u64)
+            new v = c.pixels[i]
+            c.pixels[i] = text.rgb(clamp(text.red_of(v) + text.red_of(gv) * 55 / 100),
+                                   clamp(text.green_of(v) + text.green_of(gv) * 55 / 100),
+                                   clamp(text.blue_of(v) + text.blue_of(gv) * 55 / 100))
+
+to clamp (v u32) gives u32
+    if v > 255
+        give 255
+    give v
+
+-- Set up the glow canvases (once). False if there is no memory: then no glow.
+to prepare_glow gives bool
+    if have_glow
+        give true
+    new pad u32 = 45
+    glow_x = left - pad
+    glow_y = top + 6 * lh - pad
+    new w = logo.cols * cw + pad * 2
+    new h = 8 * lh + pad * 2
+    if not text.make(addr of glow, w, h)
+        give false
+    have_glow = true
+    give true
+
+new scratch text.canvas
+new have_scratch bool
+
+to render_glow (lit u32)
+    if not have_glow
+        give
+    text.fill(addr of glow, 0, 0, glow.width, glow.height, 0)
+    if lit <= logo.arrow_first
+        give
+    arrow_cells(addr of glow, glow_x, glow_y, lit)
+    if not have_scratch
+        if not text.make(addr of scratch, glow.width, glow.height)
+            give
+        have_scratch = true
+    blur(addr of glow, addr of scratch)
+
+-- ---------------------------------------------------------------- the whole screen
+
+to draw (c ptr text.canvas)
+    layout(c)
+    text.fill(c, 0, 0, c.width, c.height, bg)
+    new lit = reveal()
+
+    -- the mark
+    for each r in 0 until logo.rows
+        new chars = logo.chars[r]
+        new kinds = logo.kinds[r]
+        for each col in 0 until logo.cols
+            new ch = chars[col]
+            if ch is ' '
+                skip
+            new x = left + col * cw
+            new y = top + r * lh
+            if kinds[col] is 'p'
+                text.glyph(c, x, y, ch, text.bold, putty)
+            else if col < lit
+                text.glyph(c, x, y, ch, text.bold, arrow_color(col))
+            else
+                text.glyph(c, x, y, '-', text.regular, slot)
+
+    -- the facts
+    new x = text.string(c, ix, iy, "root", text.bold, amber)
+    x = text.string(c, x, iy, "@", text.bold, putty)
+    text.string(c, x, iy, "armos", text.bold, amber)
+    text.string(c, ix, iy + lh, "----------", text.regular, muted)
+    for each i in 0 until shown
+        new y = iy + lh * (2 + i)
+        new kx = text.string(c, ix, y, keys[i], text.bold, amber)
+        kx = text.string(c, kx, y, ": ", text.regular, putty)
+        text.string(c, kx, y, line.text(addr of values[i]), text.regular, putty)
+    if cursor and shown < info_rows
+        new y = iy + lh * (2 + shown)
+        text.fill(c, ix, y + 4, cw * 6 / 10, lh - 8, amber)
+
+    -- the palette
+    new by = iy + lh * (3 + info_rows)
+    new sw = cw * 3
+    for each i in 0 until 8 as u32
+        text.fill(c, ix + i * sw, by, sw, lh, palette[i])
+    outline(c, ix, by, sw, lh, slot)
+
+    -- the boot bar: the arrow again, in text
+    new bar_y = by + lh * 16 / 10
+    new bx = text.string(c, ix, bar_y, "boot ", text.regular, muted)
+    text.string(c, bx, bar_y, "[", text.regular, muted)
+    new filled = 30 * progress / 1000
+    new bar line.line
+    for each i in 1 until filled
+        line.byte(addr of bar, '=')
+    if filled > 0
+        line.byte(addr of bar, '>')
+    text.string(c, bx + cw, bar_y, line.text(addr of bar), text.bold, amber)
+    new tail line.line
+    line.add(addr of tail, "] ")
+    new pct = (progress + 5) / 10
+    if pct < 100
+        line.byte(addr of tail, ' ')
+    if pct < 10
+        line.byte(addr of tail, ' ')
+    line.number(addr of tail, pct as u64)
+    line.byte(addr of tail, '%')
+    text.string(c, bx + cw * 31, bar_y, line.text(addr of tail), text.regular, muted)
+
+    -- the tagline
+    new tag string = "a rather mundane operating system"
+    text.string(c, (c.width - text.width_of(tag, text.small)) / 2, c.height - 110, tag, text.small, muted)
+
+    -- the phosphor glow of the lit arrow
+    if prepare_glow()
+        render_glow(lit)
+        add_glow(c)
+
+to outline (c ptr text.canvas, x u32, y u32, w u32, h u32, color u32)
+    text.fill(c, x, y, w, 1, color)
+    text.fill(c, x, y + h - 1, w, 1, color)
+    text.fill(c, x, y, 1, h, color)
+    text.fill(c, x + w - 1, y, 1, h, color)
+
+-- Move the boot along: progress (per mille) and how many facts are visible.
+to step (c ptr text.canvas, permille u32, rows u32)
+    progress = permille
+    shown = rows
+    cursor = rows < info_rows
+    draw(c)

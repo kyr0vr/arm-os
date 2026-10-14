@@ -3,13 +3,41 @@
 -- Run with: -M virt,gic-version=2 -cpu cortex-a76 -smp 4 -m 128M
 
 use pages
+use line
+use fb
 
 elsewhere new __stack_top u8
 
 fixed gic_dist u64 = 0x0800_0000
 fixed gic_cpu  u64 = 0x0801_0000
 fixed cores u64 = 4
-fixed ram_end u64 = 0x4800_0000       -- 128 MB of RAM from 0x4000_0000
+fixed ram_end u64 = 0x4700_0000       -- RAM from 0x4000_0000; the pretend screen sits above this
+
+-- The shell reads these keys, then stops (there is no keyboard in the test).
+fixed script string = "help\nmem\nuptime\ncpu\necho hello from armos\nnot-a-command\nhelp\nhelp\necho the console scrolled\n"
+new script_pos u64
+
+to probe
+    give
+
+to host_name (l ptr line.line)
+    line.add(l, "QEMU virt (emulated)")
+
+to gpu_name (l ptr line.line)
+    line.add(l, "none (QEMU)")
+
+to memory_mib gives u64
+    give 128
+
+to cpu_mhz gives u64
+    give 0
+
+to next_key gives maybe u8
+    if script_pos >= script.len
+        give nothing
+    new k = script[script_pos]
+    script_pos += 1
+    give k
 
 to core_mpidr (n u64) gives u64
     give n
@@ -29,16 +57,40 @@ to memory_kind (g u64) gives u8
 to add_ram
     pages.add((addr of __stack_top) as u64, ram_end)
 
+-- Semihosting: ask QEMU (on the PC) to do something.
+to semihost (op u64, block ptr u64) gives u64
+    new r u64 = 0
+    asm
+        "mov x0, {op}"
+        "mov x1, {block}"
+        "hlt #0xf000"
+        "mov {r}, x0"
+    give r
+
+-- Write the screen to build/kernel_virt/screen<which>.raw (BGRA bytes, 1920x1080).
+to save_screen (s ptr fb.screen, which u32)
+    new path string = "build/kernel_virt/screen0.raw\0"
+    path.ptr[24] = '0' + (which as u8)
+    new block [3] u64
+    block[0] = path.ptr as u64
+    block[1] = 5                      -- "wb"
+    block[2] = path.len - 1
+    new h = semihost(0x01, addr of block[0])
+    if h as i64 < 0
+        give
+    block[0] = h
+    block[1] = s.base as u64
+    block[2] = (s.pitch as u64) * (s.height as u64)
+    semihost(0x05, addr of block[0])
+    block[0] = h
+    semihost(0x02, addr of block[0])
+
 -- Stop QEMU with exit status `code` (semihosting).
 to exit (code u64)
     new block [2] u64
     block[0] = 0x2_0026               -- ADP_Stopped_ApplicationExit
     block[1] = code
-    new p = addr of block[0]
-    asm
-        "mov x1, {p}"
-        "mov w0, #0x18"
-        "hlt #0xf000"
+    semihost(0x18, addr of block[0])
     repeat
         wfe()
 
