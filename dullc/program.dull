@@ -1,0 +1,1002 @@
+-- The whole program: loads modules, declares and resolves every symbol, evaluates
+-- constants, and drives code generation (gen.dull does function bodies).
+-- A port of the Program class in stage0/dullc/compiler.py; its output must be the
+-- same assembly text, byte for byte.
+
+use mem
+use text
+use buf
+use vec
+use map
+use sys
+use diag
+use lexer
+use parser
+use ast
+use types
+use wide
+use gen
+
+-- ---------------------------------------------------------------- symbols
+
+fixed s_func u32 = 1
+fixed s_global u32 = 2
+fixed s_fixed u32 = 3
+fixed s_shape u32 = 4
+fixed s_choice u32 = 5
+fixed s_device u32 = 6
+fixed s_module u32 = 7
+
+shape module
+    name  string
+    path  string
+    file  string
+    tree  ptr ast.node
+    syms  ptr map.map            -- name -> ptr sym, in declaration order
+
+shape param
+    name string
+    ty   ptr types.ty
+
+shape bitrange
+    hi u64
+    lo u64
+
+shape reg
+    name   string
+    offset u64
+    ty     ptr types.ty
+    fields ptr map.map           -- name -> ptr bitrange
+
+shape sym
+    kind        u32
+    name        string
+    module      ptr module
+    node        ptr ast.node
+    symbol      string
+    ty          ptr types.ty
+    params      ptr vec.vec      -- ptr param
+    ret         ptr types.ty
+    value       ptr wide.wide    -- fixed: the constant (0 if not a constant)
+    data_label  string           -- fixed arrays: their data
+    has_data    bool
+    str_value   string           -- fixed strings
+    has_str     bool
+    target      ptr module       -- modules
+    base_const  ptr wide.wide    -- devices: constant base address (0 if none)
+    base_global ptr sym          -- devices: or the global/fixed holding it
+    regs        ptr map.map      -- devices: name -> ptr reg
+
+-- What a name or field chain resolved to.
+fixed r_local u32 = 1
+fixed r_global u32 = 2
+fixed r_fixed u32 = 3
+fixed r_func u32 = 4
+fixed r_module u32 = 5
+fixed r_device u32 = 6
+fixed r_reg u32 = 7
+fixed r_devfield u32 = 8
+fixed r_choice_type u32 = 9
+fixed r_variant u32 = 10
+fixed r_shape_type u32 = 11
+fixed r_builtin u32 = 12
+
+shape local
+    name     string
+    ty       ptr types.ty
+    offset   u64
+    readonly bool
+
+shape ref
+    kind   u32
+    sym    ptr sym
+    module ptr module
+    ty     ptr types.ty
+    value  u64
+    loc    ptr local
+    dev    ptr sym
+    reg    ptr reg
+    hi     u64
+    lo     u64
+    name   string
+
+-- ---------------------------------------------------------------- state
+
+new include_dirs ptr vec.vec     -- (ptr, len) pairs
+new debug bool
+new modules ptr vec.vec          -- ptr module, in load order
+new by_path ptr map.map
+new by_name ptr map.map
+new out buf.buf                  -- text section lines
+new rodata buf.buf
+new data buf.buf
+new bss buf.buf
+new strdata buf.buf              -- string bytes, kept apart so they never land inside an array
+new label_n u64
+new strings ptr map.map          -- string bytes (+ NUL flag) -> label
+
+to setup (includes ptr vec.vec, debug_build bool)
+    include_dirs = includes
+    debug = debug_build
+    modules = vec.make()
+    by_path = map.make()
+    by_name = map.make()
+    strings = map.make()
+
+-- ---------------------------------------------------------------- small helpers
+
+to module_at (i u64) gives ptr module
+    give vec.get(modules, i) as ptr module
+
+to sym_at (m ptr module, i u64) gives ptr sym
+    give map.value_at(m.syms, i) as ptr sym
+
+to lookup (m ptr module, name string) gives ptr sym
+    give (map.get(m.syms, name) else 0) as ptr sym
+
+to fail (m ptr module, line u64, message string)
+    diag.fail(m.file, line, message)
+
+to fail_at (m ptr module, n ptr ast.node, message string)
+    diag.fail(m.file, n.line, message)
+
+-- "<a><x><b>" into a fresh string (the usual shape of an error message).
+to say (a string, x string, b string) gives string
+    new m buf.buf
+    buf.add(addr of m, a)
+    buf.add(addr of m, x)
+    buf.add(addr of m, b)
+    give buf.text(addr of m)
+
+to type_text (t ptr types.ty) gives string
+    new b buf.buf
+    types.text(addr of b, t)
+    give buf.text(addr of b)
+
+to number_text (v u64) gives string
+    new b buf.buf
+    buf.number(addr of b, v)
+    give buf.text(addr of b)
+
+to wide_text (v ptr wide.wide) gives string
+    new b buf.buf
+    wide.text(addr of b, v)
+    give buf.text(addr of b)
+
+to line (b ptr buf.buf, s string)
+    buf.add(b, s)
+    buf.byte(b, '\n')
+
+-- ---------------------------------------------------------------- labels and strings
+
+to label (stem string) gives string
+    label_n += 1
+    new b buf.buf
+    buf.add(addr of b, ".L")
+    buf.add(addr of b, stem)
+    buf.number(addr of b, label_n)
+    give buf.text(addr of b)
+
+to string_label (bytes string, nul bool) gives string
+    new key buf.buf
+    buf.add(addr of key, bytes)
+    if nul
+        buf.byte(addr of key, 1)
+    else
+        buf.byte(addr of key, 0)
+    new k = buf.text(addr of key)
+    new found = map.get(strings, k)
+    if found is not nothing
+        give label_string(found else 0)
+    new lab = label("str")
+    new keep = mem.alloc(size_of(string)) as ptr string
+    deref keep = lab
+    map.put(strings, k, keep as u64)
+    buf.add(addr of strdata, lab)
+    buf.add(addr of strdata, ":\n")
+    new size = bytes.len
+    if nul
+        size += 1
+    new i u64 = 0
+    while i < size
+        buf.add(addr of strdata, "    .byte ")
+        new j = i
+        while j < size and j < i + 16
+            if j > i
+                buf.add(addr of strdata, ", ")
+            if j < bytes.len
+                buf.number(addr of strdata, bytes[j] as u64)
+            else
+                buf.byte(addr of strdata, '0')
+            j += 1
+        buf.byte(addr of strdata, '\n')
+        i = j
+    give lab
+
+to label_string (p u64) gives string
+    give deref (p as ptr string)
+
+-- ---------------------------------------------------------------- loading
+
+to dir_of (path string) gives string
+    new i = path.len
+    while i > 0
+        i -= 1
+        if path[i] is '/' or path[i] is '\\'
+            give path[0 until i]
+    give ""
+
+to file_of (path string) gives string
+    new i = path.len
+    while i > 0
+        i -= 1
+        if path[i] is '/' or path[i] is '\\'
+            give path[i + 1 until path.len]
+    give path
+
+to join (dir string, name string) gives string
+    new b buf.buf
+    if dir.len > 0
+        buf.add(addr of b, dir)
+        buf.byte(addr of b, '/')
+    buf.add(addr of b, name)
+    buf.add(addr of b, ".dull")
+    give buf.text(addr of b)
+
+to exists (path string) gives bool
+    new h = sys.open(path, sys.mode_read_binary)
+    if h < 0
+        give false
+    sys.close(h)
+    give true
+
+to include_dir (i u64) gives string
+    new s string
+    s.ptr = vec.get(include_dirs, i * 2) as ptr u8
+    s.len = vec.get(include_dirs, i * 2 + 1)
+    give s
+
+-- The path of module `name` used from a file in `from_dir`, or "" if there is none.
+to find_module (name string, from_dir string) gives string
+    new p = join(from_dir, name)
+    if exists(p)
+        give p
+    for each i in 0 until include_dirs.len / 2
+        p = join(include_dir(i), name)
+        if exists(p)
+            give p
+    give ""
+
+to load (path string) gives ptr module
+    new known = map.get(by_path, path)
+    if known is not nothing
+        give (known else 0) as ptr module
+    new src string
+    if not sys.read_file(path, addr of src)
+        diag.fail("", 0, say("cannot read ", path, ""))
+    new file = file_of(path)
+    new tree = parser.parse(lexer.tokenize(src, file), file)
+    new name = file[0 until file.len - 5]
+    if map.has(by_name, name)
+        diag.fail("", 0, say("two different modules are both called `", name, "`"))
+    new m = mem.alloc(size_of(module)) as ptr module
+    m.name = name
+    m.path = path
+    m.file = file
+    m.tree = tree
+    m.syms = map.make()
+    vec.push(modules, m as u64)
+    map.put(by_path, path, m as u64)
+    map.put(by_name, name, m as u64)
+    for each i in 0 until tree.list.len
+        new d = ast.item(tree.list, i)
+        if d.kind is ast.k_use
+            new target = find_module(d.name, dir_of(path))
+            if target.len is 0
+                fail_at(m, d, say("cannot find module `", d.name, "`"))
+            new used = load(target)
+            new s = new_sym(s_module, d.name2, m, d)
+            s.target = used
+            declare(m, d.name2, s, d)
+    give m
+
+to new_sym (kind u32, name string, m ptr module, d ptr ast.node) gives ptr sym
+    new s = mem.alloc(size_of(sym)) as ptr sym
+    s.kind = kind
+    s.name = name
+    s.module = m
+    s.node = d
+    give s
+
+to declare (m ptr module, name string, s ptr sym, d ptr ast.node)
+    if map.has(m.syms, name)
+        fail_at(m, d, say("`", name, "` is declared twice"))
+    map.put(m.syms, name, s as u64)
+
+to qualified (m ptr module, name string) gives string
+    give say(m.name, ".", name)
+
+-- ---------------------------------------------------------------- declarations
+
+to declare_all
+    for each mi in 0 until modules.len
+        new m = module_at(mi)
+        for each i in 0 until m.tree.list.len
+            new d = ast.item(m.tree.list, i)
+            new k = d.kind
+            if k is ast.k_use
+                skip
+            new outside = ast.has(d, ast.f_elsewhere)
+            if k is ast.k_func or k is ast.k_global
+                new kind = s_func
+                if k is ast.k_global
+                    kind = s_global
+                new s = new_sym(kind, d.name, m, d)
+                if outside
+                    s.symbol = d.name
+                else
+                    s.symbol = qualified(m, d.name)
+                declare(m, d.name, s, d)
+            else if k is ast.k_fixed
+                new s = new_sym(s_fixed, d.name, m, d)
+                s.symbol = qualified(m, d.name)
+                declare(m, d.name, s, d)
+            else if k is ast.k_shape
+                new s = new_sym(s_shape, d.name, m, d)
+                s.ty = types.shape_named(d.name, qualified(m, d.name))
+                declare(m, d.name, s, d)
+            else if k is ast.k_choice
+                new variants = map.make()
+                for each j in 0 until d.list.len
+                    new v = ast.item(d.list, j)
+                    if map.has(variants, v.name)
+                        fail(m, v.line, say("variant `", v.name, "` appears twice"))
+                    map.put(variants, v.name, j)
+                new s = new_sym(s_choice, d.name, m, d)
+                s.ty = types.choice_named(d.name, qualified(m, d.name), variants)
+                declare(m, d.name, s, d)
+            else if k is ast.k_device
+                declare(m, d.name, new_sym(s_device, d.name, m, d), d)
+    -- everything that does not depend on function bodies
+    for each mi in 0 until modules.len
+        new m = module_at(mi)
+        for each i in 0 until map.count(m.syms)
+            new s = sym_at(m, i)
+            if s.kind is s_shape
+                layout_shape(s, vec.make())
+    for each mi in 0 until modules.len
+        new m = module_at(mi)
+        for each i in 0 until map.count(m.syms)
+            new s = sym_at(m, i)
+            if s.kind is s_func
+                resolve_sig(s)
+            else if s.kind is s_fixed
+                resolve_fixed(s)
+            else if s.kind is s_device
+                resolve_device(s)
+    for each mi in 0 until modules.len
+        new m = module_at(mi)
+        for each i in 0 until map.count(m.syms)
+            new s = sym_at(m, i)
+            if s.kind is s_global
+                resolve_global(s)
+
+-- ---------------------------------------------------------------- types
+
+to resolve_type (n ptr ast.node, m ptr module) gives ptr types.ty
+    new k = n.kind
+    if k is ast.k_t_name
+        new s = 0 as ptr sym
+        if not ast.has(n, ast.f_has_module)
+            new it = types.int_named(n.name)
+            if it as u64 is not 0
+                give it
+            if text.same(n.name, "bool")
+                give types.boolean()
+            if text.same(n.name, "string")
+                give types.string_type()
+            if text.same(n.name, "f32") or text.same(n.name, "f64")
+                fail_at(m, n, "floats are not supported by the stage-0 compiler")
+            s = lookup(m, n.name)
+        else
+            new ms = lookup(m, n.name2)
+            if ms as u64 is 0 or ms.kind is not s_module
+                fail_at(m, n, say("unknown module `", n.name2, "`"))
+            s = lookup(ms.target, n.name)
+        if s as u64 is 0 or (s.kind is not s_shape and s.kind is not s_choice)
+            fail_at(m, n, say("unknown type `", n.name, "`"))
+        give s.ty
+    if k is ast.k_t_ptr
+        give types.ptr_to(resolve_type(n.a as ptr ast.node, m))
+    if k is ast.k_t_span
+        give types.span_of(resolve_type(n.a as ptr ast.node, m), false)
+    if k is ast.k_t_maybe
+        new inner = resolve_type(n.a as ptr ast.node, m)
+        if not types.is_scalar(inner)
+            fail_at(m, n, say("the stage-0 compiler only supports `maybe` of numbers, bools, choices and pointers (not `",
+                              type_text(inner), "`); use `maybe ptr`"))
+        give types.maybe_of(inner)
+    if k is ast.k_t_array
+        new c = const_eval(n.a as ptr ast.node, m, false)
+        if c as u64 is 0 or not wide.lt(wide.of_u64(0), c)
+            fail_at(m, n, "an array size must be a positive constant")
+        give types.array_of(resolve_type(n.b as ptr ast.node, m), c.lo)
+    fail_at(m, n, "bad type")
+    give types.void()
+
+to layout_shape (s ptr sym, stack ptr vec.vec)
+    new st = s.ty
+    if st.done
+        give
+    for each i in 0 until stack.len
+        if vec.get(stack, i) is s as u64
+            fail_at(s.module, s.node, say("shape `", s.name, "` contains itself"))
+    new off u64 = 0
+    new align u64 = 1
+    new fs = s.node.list
+    for each i in 0 until fs.len
+        new f = ast.item(fs, i)
+        if map.has(st.fields, f.name)
+            fail(s.module, f.line, say("field `", f.name, "` appears twice"))
+        new fty = resolve_type(f.a as ptr ast.node, s.module)
+        new inner = fty
+        while inner.kind is types.k_array
+            inner = inner.inner
+        if inner.kind is types.k_shape and not inner.done
+            new owner = shape_sym(inner)
+            new deeper = vec.make()
+            for each j in 0 until stack.len
+                vec.push(deeper, vec.get(stack, j))
+            vec.push(deeper, s as u64)
+            layout_shape(owner, deeper)
+            fty = resolve_type(f.a as ptr ast.node, s.module)
+        new a = fty.align
+        if a < 1
+            a = 1
+        off = (off + a - 1) / a * a
+        new fld = mem.alloc(size_of(types.field)) as ptr types.field
+        fld.name = f.name
+        fld.ty = fty
+        fld.offset = off
+        map.put(st.fields, f.name, fld as u64)
+        off += fty.size
+        if a > align
+            align = a
+    st.size = (off + align - 1) / align * align
+    if st.size < 1
+        st.size = 1
+    st.align = align
+    st.done = true
+
+to shape_sym (t ptr types.ty) gives ptr sym
+    for each mi in 0 until modules.len
+        new m = module_at(mi)
+        for each i in 0 until map.count(m.syms)
+            new s = sym_at(m, i)
+            if s.kind is s_shape and s.ty as u64 is t as u64
+                give s
+    diag.fail("", 0, "shape without symbol")
+    give 0 as ptr sym
+
+to resolve_sig (s ptr sym)
+    new d = s.node
+    s.params = vec.make()
+    new seen = map.make()
+    new regs u64 = 0
+    for each i in 0 until d.list.len
+        new p = ast.item(d.list, i)
+        if map.has(seen, p.name)
+            fail(s.module, p.line, say("parameter `", p.name, "` appears twice"))
+        map.put(seen, p.name, 1)
+        new t = resolve_type(p.a as ptr ast.node, s.module)
+        if t.repr is types.r_mem
+            new b buf.buf
+            buf.add(addr of b, "`")
+            types.text(addr of b, t)
+            buf.add(addr of b, "` cannot be passed by value; pass a `ptr ")
+            types.text(addr of b, t)
+            buf.add(addr of b, "`")
+            fail(s.module, p.line, buf.text(addr of b))
+        new rec = mem.alloc(size_of(param)) as ptr param
+        rec.name = p.name
+        rec.ty = t
+        vec.push(s.params, rec as u64)
+        if t.repr is types.r_pair
+            regs += 2
+        else
+            regs += 1
+    s.ret = types.void()
+    if d.a is not 0
+        s.ret = resolve_type(d.a as ptr ast.node, s.module)
+        if s.ret.repr is types.r_mem
+            new b buf.buf
+            buf.add(addr of b, "`")
+            types.text(addr of b, s.ret)
+            buf.add(addr of b, "` cannot be given back by value; give a `ptr ")
+            types.text(addr of b, s.ret)
+            buf.add(addr of b, "`")
+            fail_at(s.module, d, buf.text(addr of b))
+    if regs > 8
+        fail_at(s.module, d, "too many parameters (at most 8 registers' worth)")
+
+to param_at (s ptr sym, i u64) gives ptr param
+    give vec.get(s.params, i) as ptr param
+
+-- ---------------------------------------------------------------- constants
+
+-- The value of a constant expression, or 0 (no pointer) if it is not constant.
+-- With `locals`, names declared in the function being compiled are not constants.
+to const_eval (e ptr ast.node, m ptr module, locals bool) gives ptr wide.wide
+    new k = e.kind
+    if k is ast.k_int
+        give wide.of_u64(e.value)
+    if k is ast.k_bool
+        give wide.of_u64(e.value)
+    if k is ast.k_size_of
+        give wide.of_u64(resolve_type(e.a as ptr ast.node, m).size)
+    if k is ast.k_name or k is ast.k_field
+        new r = try_resolve_static(e, m, locals)
+        if r as u64 is 0
+            give 0 as ptr wide.wide
+        if r.kind is r_fixed and r.sym.value as u64 is not 0
+            give r.sym.value
+        if r.kind is r_variant
+            give wide.of_u64(r.value)
+        give 0 as ptr wide.wide
+    if k is ast.k_unary
+        new v = const_eval(e.a as ptr ast.node, m, locals)
+        if v as u64 is 0
+            give v
+        if text.same(e.name, "-")
+            give wide.neg(v)
+        if text.same(e.name, "~")
+            give wide.bit_not(v)
+        give 0 as ptr wide.wide
+    if k is ast.k_cast
+        new v = const_eval(e.a as ptr ast.node, m, locals)
+        if v as u64 is 0
+            give v
+        new target_ty = resolve_type(e.b as ptr ast.node, m)
+        if target_ty.kind is types.k_int
+            give wide.wrap(v, target_ty.bits, target_ty.signed)
+        if target_ty.kind is types.k_bool
+            if wide.is_zero(v)
+                give wide.of_u64(0)
+            give wide.of_u64(1)
+        give 0 as ptr wide.wide
+    if k is ast.k_binary
+        new a = const_eval(e.a as ptr ast.node, m, locals)
+        if a as u64 is 0
+            give a
+        new b = const_eval(e.b as ptr ast.node, m, locals)
+        if b as u64 is 0
+            give b
+        new op = e.name
+        new r = 0 as ptr wide.wide
+        if text.same(op, "+") or text.same(op, "+%") or text.same(op, "+|")
+            r = wide.add(a, b)
+        else if text.same(op, "-") or text.same(op, "-%") or text.same(op, "-|")
+            r = wide.sub(a, b)
+        else if text.same(op, "*") or text.same(op, "*%")
+            r = wide.mul(a, b)
+        else if text.same(op, "/")
+            if wide.is_zero(b)
+                fail_at(m, e, "division by zero in a constant")
+            r = wide.div(a, b)
+        else if text.same(op, "%")
+            if wide.is_zero(b)
+                fail_at(m, e, "division by zero in a constant")
+            r = wide.rem(a, b)
+        else if text.same(op, "<<")
+            r = wide.shl(a, b.lo)
+        else if text.same(op, ">>")
+            r = wide.shr(a, b.lo)
+        else if text.same(op, "&")
+            r = wide.bit_and(a, b)
+        else if text.same(op, "|")
+            r = wide.bit_or(a, b)
+        else if text.same(op, "^")
+            r = wide.bit_xor(a, b)
+        else
+            give 0 as ptr wide.wide
+        new t = e.ty as ptr types.ty
+        if types.is_int(t)
+            if text.same(op, "+%") or text.same(op, "-%") or text.same(op, "*%") or text.same(op, "<<") or
+                    text.same(op, "&") or text.same(op, "|") or text.same(op, "^")
+                r = wide.wrap(r, t.bits, t.signed)
+            else if text.same(op, "+|") or text.same(op, "-|")
+                r = wide.clamp(r, types.min_of(t), types.max_of(t))
+        give r
+    if k is ast.k_bits
+        new v = const_eval(e.a as ptr ast.node, m, locals)
+        new hi = const_eval(e.b as ptr ast.node, m, locals)
+        new lo = const_eval(e.c as ptr ast.node, m, locals)
+        if v as u64 is 0 or hi as u64 is 0 or lo as u64 is 0
+            give 0 as ptr wide.wide
+        new width = hi.lo - lo.lo + 1
+        new mask = wide.sub(wide.shl(wide.of_u64(1), width), wide.of_u64(1))
+        give wide.bit_and(wide.shr(v, lo.lo), mask)
+    give 0 as ptr wide.wide
+
+-- Resolve a name or field chain that does not involve run-time values (0 if it does).
+to try_resolve_static (e ptr ast.node, m ptr module, locals bool) gives ptr ref
+    if e.kind is ast.k_name
+        if locals and gen.has_local(e.name)
+            give 0 as ptr ref
+        new s = lookup(m, e.name)
+        if s as u64 is 0
+            give 0 as ptr ref
+        give sym_ref(s)
+    if e.kind is ast.k_field
+        new base = try_resolve_static(e.a as ptr ast.node, m, locals)
+        if base as u64 is 0
+            give base
+        give member_ref(base, e, m)
+    give 0 as ptr ref
+
+to new_ref (kind u32) gives ptr ref
+    new r = mem.alloc(size_of(ref)) as ptr ref
+    r.kind = kind
+    give r
+
+to sym_ref (s ptr sym) gives ptr ref
+    new k = s.kind
+    if k is s_module
+        new r = new_ref(r_module)
+        r.module = s.target
+        give r
+    if k is s_shape
+        new r = new_ref(r_shape_type)
+        r.ty = s.ty
+        give r
+    if k is s_choice
+        new r = new_ref(r_choice_type)
+        r.ty = s.ty
+        give r
+    new kind = r_func
+    if k is s_global
+        kind = r_global
+    else if k is s_fixed
+        kind = r_fixed
+    else if k is s_device
+        kind = r_device
+    new r = new_ref(kind)
+    r.sym = s
+    give r
+
+to member_ref (base ptr ref, e ptr ast.node, m ptr module) gives ptr ref
+    if base.kind is r_module
+        new s = lookup(base.module, e.name)
+        if s as u64 is 0 or s.kind is s_module
+            new b buf.buf
+            buf.add(addr of b, "module `")
+            buf.add(addr of b, base.module.name)
+            buf.add(addr of b, "` has no `")
+            buf.add(addr of b, e.name)
+            buf.add(addr of b, "`")
+            fail_at(m, e, buf.text(addr of b))
+        give sym_ref(s)
+    if base.kind is r_choice_type
+        new v = map.get(base.ty.variants, e.name)
+        if v is nothing
+            new b buf.buf
+            buf.add(addr of b, "`")
+            types.text(addr of b, base.ty)
+            buf.add(addr of b, "` has no variant `")
+            buf.add(addr of b, e.name)
+            buf.add(addr of b, "`")
+            fail_at(m, e, buf.text(addr of b))
+        new r = new_ref(r_variant)
+        r.ty = base.ty
+        r.value = v else 0
+        give r
+    if base.kind is r_device
+        new dev = base.sym
+        new rg = map.get(dev.regs, e.name)
+        if rg is nothing
+            new b buf.buf
+            buf.add(addr of b, "device `")
+            buf.add(addr of b, dev.name)
+            buf.add(addr of b, "` has no register `")
+            buf.add(addr of b, e.name)
+            buf.add(addr of b, "`")
+            fail_at(m, e, buf.text(addr of b))
+        new r = new_ref(r_reg)
+        r.dev = dev
+        r.reg = (rg else 0) as ptr reg
+        give r
+    if base.kind is r_reg
+        new rg = base.reg
+        new f = map.get(rg.fields, e.name)
+        if f is nothing
+            new b buf.buf
+            buf.add(addr of b, "register `")
+            buf.add(addr of b, rg.name)
+            buf.add(addr of b, "` has no field `")
+            buf.add(addr of b, e.name)
+            buf.add(addr of b, "`")
+            fail_at(m, e, buf.text(addr of b))
+        new range = (f else 0) as ptr bitrange
+        new r = new_ref(r_devfield)
+        r.dev = base.dev
+        r.reg = rg
+        r.hi = range.hi
+        r.lo = range.lo
+        give r
+    give 0 as ptr ref
+
+to resolve_fixed (s ptr sym)
+    new d = s.node
+    new m = s.module
+    new ty = 0 as ptr types.ty
+    if d.a is not 0
+        ty = resolve_type(d.a as ptr ast.node, m)
+    new v = d.b as ptr ast.node
+    if v.kind is ast.k_array_lit
+        if not types.is_kind(ty, types.k_array)
+            fail_at(m, d, "a fixed array needs a type, e.g. `fixed t [4] u32 = [...]`")
+        if v.list.len is not ty.count
+            new b buf.buf
+            buf.add(addr of b, "expected ")
+            buf.number(addr of b, ty.count)
+            buf.add(addr of b, " values, found ")
+            buf.number(addr of b, v.list.len)
+            fail_at(m, d, buf.text(addr of b))
+        line(addr of rodata, "    .balign 8")
+        buf.add(addr of rodata, s.symbol)
+        buf.add(addr of rodata, ":\n")
+        for each i in 0 until v.list.len
+            emit_const_item(addr of rodata, ast.item(v.list, i), ty.inner, m)
+        s.ty = ty
+        s.data_label = s.symbol
+        s.has_data = true
+        give
+    if v.kind is ast.k_str
+        if ty as u64 is not 0 and ty.kind is not types.k_span
+            fail_at(m, d, say("a string cannot be a `", type_text(ty), "`"))
+        s.ty = types.string_type()
+        s.str_value = v.name
+        s.has_str = true
+        give
+    new c = const_eval(v, m, false)
+    if c as u64 is 0
+        fail_at(m, d, "a `fixed` value must be a constant")
+    if ty as u64 is 0
+        if v.kind is ast.k_bool
+            ty = types.boolean()
+        else
+            new r = 0 as ptr ref
+            if v.kind is ast.k_name or v.kind is ast.k_field
+                r = try_resolve_static(v, m, false)
+            if r as u64 is not 0 and r.kind is r_variant
+                ty = r.ty
+            else if r as u64 is not 0 and r.kind is r_fixed
+                ty = r.sym.ty
+            else
+                ty = types.intlit()
+    if ty.kind is types.k_int and not types.fits(ty, c)
+        fail_at(m, d, say(wide_text(c), " does not fit in `", say(type_text(ty), "`", "")))
+    new tk = ty.kind
+    if tk is not types.k_int and tk is not types.k_intlit and tk is not types.k_bool and tk is not types.k_choice
+        fail_at(m, d, say("`fixed` cannot hold a `", type_text(ty), "`"))
+    s.ty = ty
+    s.value = c
+
+to emit_const_item (o ptr buf.buf, item ptr ast.node, ty ptr types.ty, m ptr module)
+    if item.kind is ast.k_str and ty.kind is types.k_span
+        new lab = string_label(item.name, false)
+        buf.add(o, "    .xword ")
+        line(o, lab)
+        buf.add(o, "    .xword ")
+        buf.number(o, item.name.len)
+        buf.byte(o, '\n')
+        give
+    new c = const_eval(item, m, false)
+    if c as u64 is 0
+        fail_at(m, item, "expected a constant")
+    if ty.kind is types.k_int and not types.fits(ty, c)
+        fail_at(m, item, say(wide_text(c), " does not fit in `", say(type_text(ty), "`", "")))
+    new tk = ty.kind
+    if tk is not types.k_int and tk is not types.k_bool and tk is not types.k_choice
+        fail_at(m, item, say("cannot write a constant `", type_text(ty), "` here"))
+    new w = wide.wrap(c, ty.size * 8, false)
+    if ty.size is 1
+        buf.add(o, "    .byte ")
+    else if ty.size is 2
+        buf.add(o, "    .hword ")
+    else if ty.size is 4
+        buf.add(o, "    .word ")
+    else
+        buf.add(o, "    .xword ")
+    buf.number(o, w.lo)
+    buf.byte(o, '\n')
+
+to resolve_device (s ptr sym)
+    new d = s.node
+    new m = s.module
+    s.base_const = const_eval(d.a as ptr ast.node, m, false)
+    if s.base_const as u64 is 0
+        new r = try_resolve_static(d.a as ptr ast.node, m, false)
+        if r as u64 is 0 or (r.kind is not r_global and r.kind is not r_fixed)
+            fail_at(m, d, "a device address must be a constant or a global")
+        s.base_global = r.sym
+    s.regs = map.make()
+    for each i in 0 until d.list.len
+        new r = ast.item(d.list, i)
+        if map.has(s.regs, r.name)
+            fail_at(m, r, say("register `", r.name, "` appears twice"))
+        new off = const_eval(r.a as ptr ast.node, m, false)
+        if off as u64 is 0
+            fail_at(m, r, "a register offset must be a constant")
+        new rty = resolve_type(r.b as ptr ast.node, m)
+        if rty.kind is not types.k_int
+            fail_at(m, r, "a register must have an integer type")
+        if off.lo % rty.size is not 0
+            fail_at(m, r, say("register `", r.name, "` is not aligned to its size"))
+        new fields = map.make()
+        for each j in 0 until r.list.len
+            new f = ast.item(r.list, j)
+            new h = const_eval(f.a as ptr ast.node, m, false)
+            new l = const_eval(f.b as ptr ast.node, m, false)
+            if h as u64 is 0 or l as u64 is 0 or wide.negative(l) or wide.lt(h, l) or not wide.lt(h, wide.of_u64(rty.bits))
+                fail(m, f.line, say("bad bit range for `", f.name, "`"))
+            new range = mem.alloc(size_of(bitrange)) as ptr bitrange
+            range.hi = h.lo
+            range.lo = l.lo
+            map.put(fields, f.name, range as u64)
+        new rec = mem.alloc(size_of(reg)) as ptr reg
+        rec.name = r.name
+        rec.offset = off.lo
+        rec.ty = rty
+        rec.fields = fields
+        map.put(s.regs, r.name, rec as u64)
+
+to resolve_global (s ptr sym)
+    new d = s.node
+    new m = s.module
+    new ty = 0 as ptr types.ty
+    if d.a is not 0
+        ty = resolve_type(d.a as ptr ast.node, m)
+    new v = d.b as ptr ast.node
+    if ty as u64 is 0
+        if v as u64 is not 0 and v.kind is ast.k_str
+            ty = types.string_type()
+        else if v as u64 is not 0 and v.kind is ast.k_bool
+            ty = types.boolean()
+        else
+            fail_at(m, d, say("global `", d.name, "` needs a type"))
+    s.ty = ty
+    if ast.has(d, ast.f_elsewhere)
+        give
+    if v as u64 is 0
+        new align = ty.align
+        if ty.repr is not types.r_word
+            if align < 8
+                align = 8
+        else if align < 1
+            align = 1
+        buf.add(addr of bss, "    .balign ")
+        buf.number(addr of bss, align)
+        buf.byte(addr of bss, '\n')
+        buf.add(addr of bss, s.symbol)
+        buf.add(addr of bss, ":\n")
+        buf.add(addr of bss, "    .zero ")
+        new size = ty.size
+        if size < 1
+            size = 1
+        buf.number(addr of bss, size)
+        buf.byte(addr of bss, '\n')
+        give
+    line(addr of data, "    .balign 8")
+    buf.add(addr of data, s.symbol)
+    buf.add(addr of data, ":\n")
+    if v.kind is ast.k_array_lit
+        if ty.kind is not types.k_array or v.list.len is not ty.count
+            fail_at(m, d, "array value does not match the global's type")
+        for each i in 0 until v.list.len
+            emit_const_item(addr of data, ast.item(v.list, i), ty.inner, m)
+    else if v.kind is ast.k_str
+        emit_const_item(addr of data, v, ty, m)
+    else if v.kind is ast.k_nothing and ty.kind is types.k_maybe
+        buf.add(addr of data, "    .zero ")
+        buf.number(addr of data, ty.size)
+        buf.byte(addr of data, '\n')
+    else if ty.kind is types.k_maybe
+        emit_const_item(addr of data, v, ty.inner, m)
+        if ty.repr is types.r_pair
+            if ty.inner.size < 8
+                buf.add(addr of data, "    .zero ")
+                buf.number(addr of data, 8 - ty.inner.size)
+                buf.byte(addr of data, '\n')
+            line(addr of data, "    .xword 1")
+    else
+        emit_const_item(addr of data, v, ty, m)
+
+-- ---------------------------------------------------------------- the driver
+
+-- Compile the program whose main module is at `root_path`. Gives the assembly text.
+to compile (root_path string) gives string
+    new root = load(root_path)
+    declare_all()
+    new main = lookup(root, "main")
+    if main as u64 is 0 or main.kind is not s_func
+        diag.fail("", 0, say(root.file, ": no `to main` function", ""))
+    if main.params.len > 0
+        fail_at(root, main.node, "`main` takes no parameters")
+    for each mi in 0 until modules.len
+        new m = module_at(mi)
+        for each i in 0 until m.tree.list.len
+            new d = ast.item(m.tree.list, i)
+            if d.kind is ast.k_func and d.list2 as u64 is not 0
+                gen.generate(m, lookup(m, d.name))
+    new o buf.buf
+    buf.add(addr of o, "// generated by the DULL stage-0 compiler from ")
+    line(addr of o, root.file)
+    line(addr of o, ".text")
+    line(addr of o, ".global dull_main")
+    buf.add(addr of o, ".set dull_main, ")
+    line(addr of o, main.symbol)
+    buf.add(addr of o, buf.text(addr of out))
+    if rodata.len > 0 or strdata.len > 0
+        line(addr of o, ".section .rodata,\"a\"")
+        buf.add(addr of o, buf.text(addr of rodata))
+        buf.add(addr of o, buf.text(addr of strdata))
+    if data.len > 0
+        line(addr of o, ".data")
+        buf.add(addr of o, buf.text(addr of data))
+    if bss.len > 0
+        line(addr of o, ".bss")
+        buf.add(addr of o, buf.text(addr of bss))
+    give buf.text(addr of o)
+
+-- ---------------------------------------------------------------- constants in registers
+
+-- movz/movn/movk lines loading a 64-bit constant (stage 0's imm_ops), each indented.
+to imm_lines (b ptr buf.buf, reg string, v u64)
+    new chunks [4] u64
+    new inv [4] u64
+    new nonzero u64 = 0
+    new nonzero_inv u64 = 0
+    for each i in 0 until 4
+        chunks[i] = (v >> (i * 16)) & 0xFFFF
+        inv[i] = (~v >> (i * 16)) & 0xFFFF
+        if chunks[i] is not 0
+            nonzero += 1
+        if inv[i] is not 0
+            nonzero_inv += 1
+    new first = true
+    if nonzero_inv < nonzero
+        for each i in 0 until 4
+            if inv[i] is not 0 or (first and i is 3)
+                if first
+                    wide_op(b, "movn", reg, inv[i], i)
+                    first = false
+                else
+                    wide_op(b, "movk", reg, chunks[i], i)
+        if first
+            buf.add(b, "    movn ")
+            buf.add(b, reg)
+            buf.add(b, ", #0\n")
+        give
+    for each i in 0 until 4
+        if chunks[i] is not 0
+            if first
+                wide_op(b, "movz", reg, chunks[i], i)
+                first = false
+            else
+                wide_op(b, "movk", reg, chunks[i], i)
+    if first
+        buf.add(b, "    movz ")
+        buf.add(b, reg)
+        buf.add(b, ", #0\n")
+
+to wide_op (b ptr buf.buf, op string, reg string, value u64, i u64)
+    buf.add(b, "    ")
+    buf.add(b, op)
+    buf.byte(b, ' ')
+    buf.add(b, reg)
+    buf.add(b, ", #")
+    buf.number(b, value)
+    buf.add(b, ", lsl #")
+    buf.number(b, i * 16)
+    buf.byte(b, '\n')

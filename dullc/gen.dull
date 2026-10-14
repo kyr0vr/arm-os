@@ -1,0 +1,2025 @@
+-- Type checking and code generation for function bodies. A port of the FuncGen class
+-- in stage0/dullc/compiler.py: naive AArch64, every value through x0/x1 and the
+-- stack, every local in the frame. The text it writes must match stage 0's exactly.
+
+use mem
+use text
+use buf
+use vec
+use map
+use diag
+use ast
+use types
+use wide
+use program
+
+-- ---------------------------------------------------------------- state
+
+shape scope
+    names  ptr map.map          -- name -> ptr program.local
+    afters ptr vec.vec          -- `after` calls, in order
+
+shape loop
+    cont  string
+    brk   string
+    scope_index u64
+
+-- An lvalue: memory of type `ty`, or bits hi..lo of a `ty` in memory.
+shape lv
+    bits bool
+    ty   ptr types.ty
+    hi   u64
+    lo   u64
+
+new mod ptr program.module
+new fsym ptr program.sym
+new body buf.buf
+new scopes ptr vec.vec
+new loops ptr vec.vec
+new frame u64
+new depth u64                   -- 16-byte pushes currently on the stack
+new traps ptr vec.vec           -- (label, message label) as ptr string pairs
+new end_label string
+new active bool
+
+fixed b_dsb u64 = 1
+fixed b_dmb u64 = 2
+fixed b_isb u64 = 3
+fixed b_wfe u64 = 4
+fixed b_wfi u64 = 5
+fixed b_sev u64 = 6
+fixed b_read u64 = 7
+fixed b_write u64 = 8
+fixed builtin_names [8] string = ["dsb", "dmb", "isb", "wfe", "wfi", "sev", "read_sysreg", "write_sysreg"]
+fixed builtin_text [6] string = ["dsb sy", "dmb sy", "isb", "wfe", "wfi", "sev"]
+
+-- ---------------------------------------------------------------- text helpers
+
+to n (v u64) gives string
+    give program.number_text(v)
+
+to cat (a string, b string) gives string
+    give program.say(a, b, "")
+
+to cat3 (a string, b string, c string) gives string
+    give program.say(a, b, c)
+
+to xr (r u64) gives string
+    give cat("x", n(r))
+
+to wr (r u64) gives string
+    give cat("w", n(r))
+
+to emit (s string)
+    buf.add(addr of body, "    ")
+    buf.add(addr of body, s)
+    buf.byte(addr of body, '\n')
+
+to lab (name string)
+    buf.add(addr of body, name)
+    buf.add(addr of body, ":\n")
+
+to fail (node ptr ast.node, message string)
+    diag.fail(mod.file, node.line, message)
+
+to tt (t ptr types.ty) gives string
+    give program.type_text(t)
+
+to ty_of (e ptr ast.node) gives ptr types.ty
+    give e.ty as ptr types.ty
+
+to ref_of (e ptr ast.node) gives ptr program.ref
+    give e.ref as ptr program.ref
+
+to node_a (e ptr ast.node) gives ptr ast.node
+    give e.a as ptr ast.node
+
+to node_b (e ptr ast.node) gives ptr ast.node
+    give e.b as ptr ast.node
+
+to node_c (e ptr ast.node) gives ptr ast.node
+    give e.c as ptr ast.node
+
+to same (a string, b string) gives bool
+    give text.same(a, b)
+
+to imm (reg string, value u64)
+    program.imm_lines(addr of body, reg, value)
+
+to push (repr u32)
+    if repr is types.r_pair
+        emit("stp x0, x1, [sp, #-16]!")
+    else
+        emit("str x0, [sp, #-16]!")
+    depth += 1
+
+to pop1 (r0 string)
+    emit(cat3("ldr ", r0, ", [sp], #16"))
+    depth -= 1
+
+to pop2 (r0 string, r1 string)
+    emit(cat3(cat3("ldp ", r0, ", "), r1, ", [sp], #16"))
+    depth -= 1
+
+to keep (s string) gives u64
+    new p = mem.alloc(size_of(string)) as ptr string
+    deref p = s
+    give p as u64
+
+to kept (p u64) gives string
+    give deref (p as ptr string)
+
+to trap (node ptr ast.node, what string) gives string
+    new label = program.label("trap")
+    new msg buf.buf
+    buf.add(addr of msg, mod.file)
+    buf.byte(addr of msg, ':')
+    buf.number(addr of msg, node.line)
+    buf.add(addr of msg, ": ")
+    buf.add(addr of msg, what)
+    vec.push(traps, keep(label))
+    vec.push(traps, keep(program.string_label(buf.text(addr of msg), true)))
+    give label
+
+to alloc_local (t ptr types.ty) gives u64
+    new size = t.size
+    if size < 1
+        size = 1
+    new align = t.align
+    if t.repr is not types.r_word
+        if align < 8
+            align = 8
+    else if align < 1
+        align = 1
+    frame = (frame + size + align - 1) / align * align
+    give frame
+
+to addr_local (offset u64, reg string)
+    if offset <= 4095
+        emit(cat3(cat3("sub ", reg, ", x29, #"), n(offset), ""))
+    else
+        imm("x16", offset)
+        emit(cat3("sub ", reg, ", x29, x16"))
+
+to addr_symbol (symbol string, reg string)
+    emit(cat3(cat3("adrp ", reg, ", "), symbol, ""))
+    emit(cat3(cat3(cat3("add ", reg, ", "), reg, ", :lo12:"), symbol, ""))
+
+to scope_at (i u64) gives ptr scope
+    give vec.get(scopes, i) as ptr scope
+
+to new_scope gives ptr scope
+    new s = mem.alloc(size_of(scope)) as ptr scope
+    s.names = map.make()
+    s.afters = vec.make()
+    give s
+
+to lookup_local (name string) gives ptr program.local
+    new i = scopes.len
+    while i > 0
+        i -= 1
+        new found = map.get(scope_at(i).names, name)
+        if found is not nothing
+            give (found else 0) as ptr program.local
+    give 0 as ptr program.local
+
+-- Used by program.const_eval: is `name` a local of the function being compiled?
+to has_local (name string) gives bool
+    if not active
+        give false
+    give lookup_local(name) as u64 is not 0
+
+to declare_local (name string, t ptr types.ty, node ptr ast.node, readonly bool) gives ptr program.local
+    new s = scope_at(scopes.len - 1)
+    if map.has(s.names, name)
+        fail(node, cat3("`", name, "` is already declared in this block"))
+    new msym = program.lookup(mod, name)
+    if msym as u64 is not 0 and msym.kind is program.s_module
+        fail(node, cat3("`", name, "` is the name of a module"))
+    new loc = mem.alloc(size_of(program.local)) as ptr program.local
+    loc.name = name
+    loc.ty = t
+    loc.offset = alloc_local(t)
+    loc.readonly = readonly
+    map.put(s.names, name, loc as u64)
+    give loc
+
+-- ---------------------------------------------------------------- loads and stores
+
+-- x0 holds an address; load a value of `t` into x0 (/x1).
+to load_from_x0 (t ptr types.ty)
+    if t.repr is types.r_mem
+        give
+    if t.repr is types.r_pair
+        emit("mov x2, x0")
+        emit("ldp x0, x1, [x2]")
+        give
+    if t.kind is types.k_int
+        new op = "ldr x0"
+        if t.bits is 8 and not t.signed
+            op = "ldrb w0"
+        else if t.bits is 8
+            op = "ldrsb x0"
+        else if t.bits is 16 and not t.signed
+            op = "ldrh w0"
+        else if t.bits is 16
+            op = "ldrsh x0"
+        else if t.bits is 32 and not t.signed
+            op = "ldr w0"
+        else if t.bits is 32
+            op = "ldrsw x0"
+        emit(cat(op, ", [x0]"))
+    else if t.kind is types.k_bool
+        emit("ldrb w0, [x0]")
+    else if t.kind is types.k_choice
+        emit("ldr w0, [x0]")
+    else
+        emit("ldr x0, [x0]")
+
+to store_op (size u64) gives string
+    if size is 1
+        give "strb w"
+    if size is 2
+        give "strh w"
+    if size is 4
+        give "str w"
+    give "str x"
+
+-- Store the value in x0 (/x1) to the address in x2.
+to store_x0_to_x2 (t ptr types.ty)
+    if t.repr is types.r_pair
+        emit("stp x0, x1, [x2]")
+        give
+    if t.repr is types.r_mem
+        copy_mem(t.size)
+        give
+    emit(cat(store_op(t.size), "0, [x2]"))
+
+-- Copy `size` bytes from [x0] to [x2].
+to copy_mem (size u64)
+    new top = program.label("cp")
+    new done = program.label("cpd")
+    imm("x3", size)
+    lab(top)
+    emit(cat("cbz x3, ", done))
+    emit("ldrb w4, [x0], #1")
+    emit("strb w4, [x2], #1")
+    emit("sub x3, x3, #1")
+    emit(cat("b ", top))
+    lab(done)
+
+-- Zero `size` bytes at [x0].
+to zero_mem (size u64)
+    new top = program.label("z")
+    new done = program.label("zd")
+    imm("x3", size)
+    lab(top)
+    emit(cat("cbz x3, ", done))
+    emit("strb wzr, [x0], #1")
+    emit("sub x3, x3, #1")
+    emit(cat("b ", top))
+    lab(done)
+
+-- Bring x0 back to the canonical 64-bit form of `t`.
+to normalize (t ptr types.ty)
+    if t.kind is not types.k_int or t.bits is 64
+        give
+    if t.signed
+        if t.bits is 8
+            emit("sxtb x0, w0")
+        else if t.bits is 16
+            emit("sxth x0, w0")
+        else
+            emit("sxtw x0, w0")
+    else
+        if t.bits is 8
+            emit("uxtb w0, w0")
+        else if t.bits is 16
+            emit("uxth w0, w0")
+        else
+            emit("mov w0, w0")
+
+-- ---------------------------------------------------------------- one function
+
+to generate (m ptr program.module, s ptr program.sym)
+    mod = m
+    fsym = s
+    body.len = 0
+    body.cap = 0
+    scopes = vec.make()
+    loops = vec.make()
+    frame = 0
+    depth = 0
+    traps = vec.make()
+    end_label = program.label("ret")
+    active = true
+    vec.push(scopes, new_scope() as u64)
+    new param_locals = vec.make()
+    for each i in 0 until s.params.len
+        new p = program.param_at(s, i)
+        new pnode = ast.make(ast.k_param, ast.item(s.node.list, i).line)
+        vec.push(param_locals, declare_local(p.name, p.ty, pnode, false) as u64)
+    new reg u64 = 0
+    for each i in 0 until param_locals.len
+        new loc = vec.get(param_locals, i) as ptr program.local
+        addr_local(loc.offset, "x16")
+        if loc.ty.repr is types.r_pair
+            emit(cat3(cat3(cat3("stp ", xr(reg), ", "), xr(reg + 1), ", [x16]"), "", ""))
+            reg += 2
+        else
+            emit(cat3(store_op(loc.ty.size), n(reg), ", [x16]"))
+            reg += 1
+    block(s.node.list2, false)
+    run_afters(0, false)
+    if not types.is_kind(s.ret, types.k_void)
+        emit(cat("b ", trap(s.node, cat3("`", s.name, "` ended without `give`"))))
+    vec.pop(scopes)
+    new size = (frame + 15) / 16 * 16
+    new o = addr of program.out
+    program.line(o, ".balign 4")
+    program.line(o, cat(".global ", s.symbol))
+    program.line(o, cat3(".type ", s.symbol, ", %function"))
+    program.line(o, cat(s.symbol, ":"))
+    program.line(o, "    stp x29, x30, [sp, #-16]!")
+    program.line(o, "    mov x29, sp")
+    if size > 0
+        if size <= 4095
+            program.line(o, cat("    sub sp, sp, #", n(size)))
+        else
+            program.imm_lines(o, "x16", size)
+            program.line(o, "    sub sp, sp, x16")
+    buf.add(o, buf.text(addr of body))
+    program.line(o, cat(end_label, ":"))
+    program.line(o, "    mov sp, x29")
+    program.line(o, "    ldp x29, x30, [sp], #16")
+    program.line(o, "    ret")
+    new i u64 = 0
+    while i < traps.len
+        new label = kept(vec.get(traps, i))
+        new msg = kept(vec.get(traps, i + 1))
+        program.line(o, cat(label, ":"))
+        program.line(o, cat("    adrp x0, ", msg))
+        program.line(o, cat3("    add x0, x0, :lo12:", msg, ""))
+        program.line(o, "    bl dull_trap")
+        i += 2
+    active = false
+
+-- ---------------------------------------------------------------- statements
+
+to block (stmts ptr vec.vec, fresh bool)
+    if fresh
+        vec.push(scopes, new_scope() as u64)
+    for each i in 0 until stmts.len
+        stmt(ast.item(stmts, i))
+    if fresh
+        run_afters(scopes.len - 1, true)
+        vec.pop(scopes)
+
+-- Emit pending `after` code for scopes [down_to .. innermost], innermost first.
+to run_afters (down_to u64, only_innermost bool)
+    new top = scopes.len - 1
+    new bottom = down_to
+    if only_innermost
+        bottom = top
+    new i = top + 1
+    while i > bottom
+        i -= 1
+        new s = scope_at(i)
+        new j = s.afters.len
+        while j > 0
+            j -= 1
+            new a = ast.item(s.afters, j)
+            new saved = scopes
+            new partial = vec.make()
+            for each k in 0 until i
+                vec.push(partial, vec.get(saved, k))
+            new upto = new_scope()
+            upto.names = a.aux3 as ptr map.map          -- the names visible at the `after`
+            vec.push(partial, upto as u64)
+            scopes = partial
+            expr_for_effect(a)
+            scopes = saved
+
+to any_afters (down_to u64) gives bool
+    for each i in down_to until scopes.len
+        if scope_at(i).afters.len > 0
+            give true
+    give false
+
+to stmt (s ptr ast.node)
+    new k = s.kind
+    if k is ast.k_new
+        s_new(s)
+    else if k is ast.k_assign
+        s_assign(s)
+    else if k is ast.k_expr_stmt
+        s_expr_stmt(s)
+    else if k is ast.k_if
+        s_if(s)
+    else if k is ast.k_while
+        s_while(s)
+    else if k is ast.k_repeat
+        s_repeat(s)
+    else if k is ast.k_hold
+        s_hold(s)
+    else if k is ast.k_for_range
+        s_for_range(s)
+    else if k is ast.k_for_each
+        s_for_each(s)
+    else if k is ast.k_give
+        s_give(s)
+    else if k is ast.k_stop
+        jump_loop(s, false)
+    else if k is ast.k_skip
+        jump_loop(s, true)
+    else if k is ast.k_after
+        s_after(s)
+    else if k is ast.k_stream
+        s_stream(s)
+    else if k is ast.k_asm
+        s_asm(s)
+
+to s_new (s ptr ast.node)
+    new t = 0 as ptr types.ty
+    if s.a is not 0
+        t = program.resolve_type(node_a(s), mod)
+    if s.b is 0
+        new loc = declare_local(s.name, t, s, false)
+        addr_local(loc.offset, "x0")
+        zero_mem(t.size)
+        give
+    new v = node_b(s)
+    if v.kind is ast.k_array_lit
+        if not types.is_kind(t, types.k_array)
+            fail(s, "an array value needs an array type, e.g. `new a [3] u8 = [1, 2, 3]`")
+        if v.list.len is not t.count
+            fail(s, cat3(cat3("expected ", n(t.count), " values, found "), n(v.list.len), ""))
+        new loc = declare_local(s.name, t, s, false)
+        for each i in 0 until v.list.len
+            value_as(ast.item(v.list, i), t.inner)
+            addr_local(loc.offset - i * t.inner.size, "x2")
+            store_x0_to_x2(t.inner)
+        give
+    new vt = infer(v, t)
+    if t as u64 is 0
+        if vt.kind is types.k_intlit
+            fail(s, cat3(cat3(cat3("cannot work out the type of `", s.name, "`; write `new "), s.name, " u32 = ...` (or another type)"), "", ""))
+        if vt.kind is types.k_nothing
+            fail(s, cat3(cat3("cannot work out the type of `", s.name, "`; write `new "), s.name, " maybe ... = nothing`"))
+        if vt.kind is types.k_void
+            fail(s, "this gives nothing back, so it cannot be stored")
+        t = vt
+    value_as(v, t)
+    new loc = declare_local(s.name, t, s, false)
+    addr_local(loc.offset, "x2")
+    if t.repr is types.r_mem
+        copy_mem(t.size)
+    else
+        store_x0_to_x2(t)
+
+-- Evaluate `e` as a value of type `t` (checking and converting).
+to value_as (e ptr ast.node, t ptr types.ty)
+    new vt = infer(e, t)
+    check_assign(e, vt, t)
+    value(e)
+    coerce(vt, t)
+
+to check_assign (node ptr ast.node, src ptr types.ty, dst ptr types.ty)
+    if types.same(src, dst)
+        give
+    if dst.kind is types.k_maybe and (types.same(src, dst.inner) or src.kind is types.k_nothing)
+        give
+    if src.kind is types.k_intlit and dst.kind is types.k_int
+        give
+    fail(node, cat3(cat3("expected `", tt(dst), "`, found `"), tt(src), "`"))
+
+to coerce (src ptr types.ty, dst ptr types.ty)
+    if dst.kind is types.k_maybe and types.same(src, dst.inner) and dst.repr is types.r_pair
+        emit("mov x1, #1")
+
+to s_assign (s ptr ast.node)
+    new target = node_a(s)
+    new lt = infer(target, 0 as ptr types.ty)
+    check_writable(target)
+    if not is_lvalue(target)
+        fail(s, "cannot assign to this")
+    new v = node_b(s)
+    if same(s.name, "=")
+        if lt.repr is types.r_mem
+            value_as(v, lt)
+            push(types.r_word)
+            address(target)
+            emit("mov x2, x0")
+            pop1("x0")
+            copy_mem(lt.size)
+            give
+        value_as(v, lt)
+        push(lt.repr)
+        new l = address(target)
+        emit("mov x2, x0")
+        if lt.repr is types.r_pair
+            pop2("x0", "x1")
+        else
+            pop1("x0")
+        store_lv(l)
+        give
+    new op = s.name[0 until s.name.len - 1]
+    if lt.kind is not types.k_int
+        fail(s, cat3("`", s.name, "` needs a number"))
+    new fake = ast.make(ast.k_binary, s.line)
+    fake.name = op
+    new tmp = ast.make(ast.k_lvtmp, s.line)
+    tmp.ty = lt as u64
+    fake.a = tmp as u64
+    fake.b = v as u64
+    new rt = binary_type(fake, lt)
+    if not types.same(rt, lt)
+        fail(s, cat3(cat3("`", s.name, "` would change the type to `"), tt(rt), "`"))
+    new l = address(target)
+    push(types.r_word)
+    load_lv(l)
+    push(types.r_word)
+    value(v)
+    emit("mov x1, x0")
+    pop1("x0")
+    binop(fake, op, lt)
+    pop1("x2")
+    store_lv(l)
+
+to check_writable (target ptr ast.node)
+    if target.kind is ast.k_name
+        new r = ref_of(target)
+        if r.kind is program.r_fixed
+            fail(target, cat3("`", target.name, "` is fixed and cannot change"))
+        if r.kind is program.r_local and r.loc.readonly
+            fail(target, cat3("`", target.name, "` cannot be assigned here"))
+    if target.kind is ast.k_index or target.kind is ast.k_field or target.kind is ast.k_bits
+        new base = node_a(target)
+        if base.kind is ast.k_name and base.ref is not 0 and ref_of(base).kind is program.r_fixed
+            fail(target, cat3("`", base.name, "` is fixed and cannot change"))
+
+to s_expr_stmt (s ptr ast.node)
+    new e = node_a(s)
+    if e.kind is not ast.k_call and e.kind is not ast.k_unwrap
+        fail(s, "this value is not used; did you mean to assign it?")
+    expr_for_effect(e)
+
+to expr_for_effect (e ptr ast.node)
+    infer(e, 0 as ptr types.ty)
+    value(e)
+
+to cond (e ptr ast.node, false_label string)
+    new t = infer(e, types.boolean())
+    if t.kind is not types.k_bool
+        fail(e, cat3("a condition must be a bool, found `", tt(t), "`"))
+    value(e)
+    emit(cat("cbz w0, ", false_label))
+
+to s_if (s ptr ast.node)
+    new done = program.label("fi")
+    for each i in 0 until s.list.len
+        new arm = ast.item(s.list, i)
+        new next = program.label("el")
+        cond(node_a(arm), next)
+        block(arm.list2, true)
+        emit(cat("b ", done))
+        lab(next)
+    if s.list2 as u64 is not 0
+        block(s.list2, true)
+    lab(done)
+
+to loop_body (stmts ptr vec.vec, cont string, brk string)
+    new l = mem.alloc(size_of(loop)) as ptr loop
+    l.cont = cont
+    l.brk = brk
+    l.scope_index = scopes.len
+    vec.push(loops, l as u64)
+    block(stmts, true)
+    vec.pop(loops)
+
+to s_while (s ptr ast.node)
+    new top = program.label("wh")
+    new done = program.label("we")
+    lab(top)
+    cond(node_a(s), done)
+    loop_body(s.list2, top, done)
+    emit(cat("b ", top))
+    lab(done)
+
+to s_repeat (s ptr ast.node)
+    new top = program.label("rp")
+    new done = program.label("re")
+    lab(top)
+    loop_body(s.list2, top, done)
+    emit(cat("b ", top))
+    lab(done)
+
+to s_hold (s ptr ast.node)
+    new top = program.label("hd")
+    new done = program.label("hde")
+    lab(top)
+    new t = infer(node_a(s), types.boolean())
+    if t.kind is not types.k_bool
+        fail(s, "`hold until` needs a bool")
+    value(node_a(s))
+    emit(cat("cbnz w0, ", done))
+    emit("yield")
+    emit(cat("b ", top))
+    lab(done)
+
+to load_local (loc ptr program.local, t ptr types.ty)
+    addr_local(loc.offset, "x0")
+    load_from_x0(t)
+
+to s_for_range (s ptr ast.node)
+    new start = node_a(s)
+    new finish = node_b(s)
+    new st = infer(start, 0 as ptr types.ty)
+    new want = 0 as ptr types.ty
+    if st.kind is types.k_int
+        want = st
+    new et = infer(finish, want)
+    if st.kind is types.k_intlit and et.kind is types.k_int
+        st = infer(start, et)
+    if st.kind is types.k_intlit and et.kind is types.k_intlit
+        st = infer(start, types.u64())
+        et = infer(finish, types.u64())
+    if st.kind is not types.k_int or not types.same(st, et)
+        fail(s, cat3(cat3("a range needs two numbers of the same type, found `", tt(st), "` and `"), tt(et), "`"))
+    new t = st
+    vec.push(scopes, new_scope() as u64)
+    new end_loc = declare_local(cat(" end", n(program.label_n)), t, s, false)
+    value(start)
+    push(types.r_word)
+    value(finish)
+    addr_local(end_loc.offset, "x2")
+    store_x0_to_x2(t)
+    pop1("x0")
+    new var = declare_local(s.name, t, s, true)
+    addr_local(var.offset, "x2")
+    store_x0_to_x2(t)
+    new top = program.label("fr")
+    new step = program.label("fs")
+    new done = program.label("fd")
+    new inclusive = s.value is 1
+    if inclusive
+        load_local(var, t)
+        emit("mov x1, x0")
+        load_local(end_loc, t)
+        emit("cmp x1, x0")
+        if t.signed
+            emit(cat("b.gt ", done))
+        else
+            emit(cat("b.hi ", done))
+    lab(top)
+    if not inclusive
+        load_local(var, t)
+        emit("mov x1, x0")
+        load_local(end_loc, t)
+        emit("cmp x1, x0")
+        if t.signed
+            emit(cat("b.ge ", done))
+        else
+            emit(cat("b.hs ", done))
+    loop_body(s.list2, step, done)
+    lab(step)
+    if inclusive
+        load_local(var, t)
+        emit("mov x1, x0")
+        load_local(end_loc, t)
+        emit("cmp x1, x0")
+        emit(cat("b.eq ", done))
+    addr_local(var.offset, "x2")
+    emit("mov x0, x2")
+    load_from_x0(t)
+    emit("add x0, x0, #1")
+    normalize(t)
+    store_x0_to_x2(t)
+    emit(cat("b ", top))
+    lab(done)
+    vec.pop(scopes)
+
+to s_for_each (s ptr ast.node)
+    new seq = node_a(s)
+    new st = infer(seq, 0 as ptr types.ty)
+    if st.kind is not types.k_array and st.kind is not types.k_span
+        fail(s, cat3("cannot loop over a `", tt(st), "`; loop over a span, array or string"))
+    new elem = st.inner
+    if elem.repr is types.r_mem
+        fail(s, cat3("the stage-0 compiler cannot copy `", tt(elem), "` items in a loop; loop over indexes"))
+    vec.push(scopes, new_scope() as u64)
+    new ptr_loc = declare_local(cat(" ptr", n(program.label_n)), types.u64(), s, false)
+    new len_loc = declare_local(cat(" len", n(program.label_n)), types.u64(), s, false)
+    new idx_loc = declare_local(cat(" idx", n(program.label_n)), types.u64(), s, false)
+    if st.kind is types.k_array
+        if not is_lvalue(seq)
+            fail(s, "can only loop over a stored array")
+        address(seq)
+        imm("x1", st.count)
+    else
+        value(seq)
+    addr_local(ptr_loc.offset, "x2")
+    emit("str x0, [x2]")
+    addr_local(len_loc.offset, "x2")
+    emit("str x1, [x2]")
+    addr_local(idx_loc.offset, "x2")
+    emit("str xzr, [x2]")
+    new var = declare_local(s.name, elem, s, true)
+    new top = program.label("fe")
+    new step = program.label("fes")
+    new done = program.label("fed")
+    lab(top)
+    addr_local(idx_loc.offset, "x2")
+    emit("ldr x0, [x2]")
+    addr_local(len_loc.offset, "x2")
+    emit("ldr x1, [x2]")
+    emit("cmp x0, x1")
+    emit(cat("b.hs ", done))
+    addr_local(ptr_loc.offset, "x2")
+    emit("ldr x2, [x2]")
+    scale_add(elem.size)
+    load_from_x0(elem)
+    addr_local(var.offset, "x2")
+    store_x0_to_x2(elem)
+    loop_body(s.list2, step, done)
+    lab(step)
+    addr_local(idx_loc.offset, "x2")
+    emit("ldr x0, [x2]")
+    emit("add x0, x0, #1")
+    emit("str x0, [x2]")
+    emit(cat("b ", top))
+    lab(done)
+    vec.pop(scopes)
+
+to power_of_two (size u64) gives bool
+    give size & (size - 1) is 0
+
+to log2 (size u64) gives u64
+    new k u64 = 0
+    while size > 1
+        size = size >> 1
+        k += 1
+    give k
+
+-- x0 = x2 + x0 * size.
+to scale_add (size u64)
+    if power_of_two(size)
+        emit(cat("add x0, x2, x0, lsl #", n(log2(size))))
+    else
+        imm("x16", size)
+        emit("madd x0, x0, x16, x2")
+
+to s_give (s ptr ast.node)
+    new ret = fsym.ret
+    if s.a is 0
+        if ret.kind is not types.k_void and ret.kind is not types.k_maybe
+            fail(s, cat3(cat3("`", fsym.name, "` must give a `"), tt(ret), "`"))
+        if ret.kind is types.k_maybe
+            emit("mov x0, #0")
+            emit("mov x1, #0")
+    else
+        if ret.kind is types.k_void
+            fail(s, cat3("`", fsym.name, "` gives nothing back"))
+        value_as(node_a(s), ret)
+    leave_function()
+
+to leave_function
+    if any_afters(0)
+        push(types.r_pair)
+        new saved = depth
+        run_afters(0, false)
+        depth = saved
+        pop2("x0", "x1")
+    emit(cat("b ", end_label))
+
+to jump_loop (node ptr ast.node, is_skip bool)
+    if loops.len is 0
+        if is_skip
+            fail(node, "`skip` outside a loop")
+        fail(node, "`stop` outside a loop")
+    new l = vec.last(loops) as ptr loop
+    if depth > 0
+        emit(cat("add sp, sp, #", n(16 * depth)))
+    new saved = depth
+    depth = 0
+    run_afters(l.scope_index, false)
+    depth = saved
+    if is_skip
+        emit(cat("b ", l.cont))
+    else
+        emit(cat("b ", l.brk))
+
+to copy_names (from ptr map.map) gives ptr map.map
+    new m = map.make()
+    for each i in 0 until map.count(from)
+        map.put(m, map.key_at(from, i), map.value_at(from, i))
+    give m
+
+to s_after (s ptr ast.node)
+    new e = node_a(s)
+    e.aux3 = copy_names(scope_at(scopes.len - 1).names) as u64
+    infer(e, 0 as ptr types.ty)
+    if e.kind is not ast.k_call
+        fail(s, "`after` needs a call, e.g. `after free(buf)`")
+    vec.push(scope_at(scopes.len - 1).afters, e as u64)
+
+to name_node (line u64, name string) gives ptr ast.node
+    new x = ast.make(ast.k_name, line)
+    x.name = name
+    give x
+
+to unwrap_node (line u64, value ptr ast.node, action string) gives ptr ast.node
+    new u = ast.make(ast.k_unwrap, line)
+    u.a = value as u64
+    u.name = action
+    give u
+
+to new_node (line u64, name string, value ptr ast.node) gives ptr ast.node
+    new x = ast.make(ast.k_new, line)
+    x.name = name
+    x.b = value as u64
+    give x
+
+to s_stream (s ptr ast.node)
+    new stages = vec.make()
+    new nd = node_a(s)
+    while nd.kind is ast.k_call and ast.has(nd, ast.f_piped)
+        vec.push(stages, nd as u64)
+        nd = ast.item(nd.list, 0)
+    if stages.len is 0
+        fail(s, "`stream` needs a pipe chain, e.g. `stream next(f) -> decode -> play`")
+    new source = nd
+    new reversed = vec.make()
+    new r = stages.len
+    while r > 0
+        r -= 1
+        vec.push(reversed, vec.get(stages, r))
+    new top = program.label("st")
+    new done = program.label("ste")
+    lab(top)
+    new l = mem.alloc(size_of(loop)) as ptr loop
+    l.cont = top
+    l.brk = done
+    l.scope_index = scopes.len
+    vec.push(loops, l as u64)
+    vec.push(scopes, new_scope() as u64)
+    new tag = program.label_n
+    new src_t = infer(source, 0 as ptr types.ty)
+    if src_t.kind is not types.k_maybe
+        fail(s, cat3("a stream starts with a call that gives `maybe ...`, found `", tt(src_t), "`"))
+    new prev = cat3(" chunk", n(tag), "_0")
+    s_new(new_node(s.line, prev, unwrap_node(s.line, source, "stop")))
+    for each i in 0 until reversed.len
+        new stage = ast.item(reversed, i)
+        vec.set(stage.list, 0, name_node(stage.line, prev) as u64)
+        stage.flags = stage.flags & ~ast.f_piped
+        new t = infer(stage, 0 as ptr types.ty)
+        if i is reversed.len - 1
+            if t.kind is types.k_maybe
+                expr_for_effect(unwrap_node(stage.line, stage, "skip"))
+            else
+                expr_for_effect(stage)
+        else
+            new name = cat3(cat3(" chunk", n(tag), "_"), n(i + 1), "")
+            new v = stage
+            if t.kind is types.k_maybe
+                v = unwrap_node(stage.line, stage, "skip")
+            s_new(new_node(stage.line, name, v))
+            prev = name
+    run_afters(scopes.len - 1, true)
+    vec.pop(scopes)
+    vec.pop(loops)
+    emit(cat("b ", top))
+    lab(done)
+
+-- {name} in an asm line: the name, or "" if there is none starting at `i`.
+to bound_name (line string, i u64) gives string
+    if line[i] is not '{' or i + 1 >= line.len or not text.is_alpha(line[i + 1])
+        give ""
+    new j = i + 1
+    while j < line.len and (text.is_alpha(line[j]) or text.is_digit(line[j]))
+        j += 1
+    if j >= line.len or line[j] is not '}'
+        give ""
+    give line[i + 1 until j]
+
+to s_asm (s ptr ast.node)
+    new bound = vec.make()          -- (ptr, len) of each name, in first-seen order
+    new names = map.make()          -- name -> index
+    for each li in 0 until s.list.len
+        new line = ast.item(s.list, li).name
+        for each i in 0 until line.len
+            new nm = bound_name(line, i)
+            if nm.len > 0 and not map.has(names, nm)
+                map.put(names, nm, bound.len / 2)
+                vec.push(bound, nm.ptr as u64)
+                vec.push(bound, nm.len)
+    new count = bound.len / 2
+    if count > 7
+        fail(s, "at most 7 bound names per `asm` statement")
+    new nodes = vec.make()
+    new regnames = vec.make()
+    for each i in 0 until count
+        new nm string
+        nm.ptr = vec.get(bound, i * 2) as ptr u8
+        nm.len = vec.get(bound, i * 2 + 1)
+        new node = name_node(s.line, nm)
+        new t = infer(node, 0 as ptr types.ty)
+        if not is_lvalue(node) or t.repr is not types.r_word
+            fail(s, cat3("`{", nm, "}` must be a variable holding a number, bool or pointer"))
+        new r = 9 + i
+        if t.size <= 4
+            vec.push(regnames, keep(wr(r)))
+        else
+            vec.push(regnames, keep(xr(r)))
+        vec.push(nodes, node as u64)
+        address(node)
+        load_from_x0(t)
+        emit(cat3("mov ", xr(r), ", x0"))
+    for each li in 0 until s.list.len
+        new line = ast.item(s.list, li).name
+        new out buf.buf
+        new i u64 = 0
+        while i < line.len
+            new nm = bound_name(line, i)
+            if nm.len > 0
+                buf.add(addr of out, kept(vec.get(regnames, map.get(names, nm) else 0)))
+                i += nm.len + 2
+            else
+                buf.byte(addr of out, line[i])
+                i += 1
+        emit(buf.text(addr of out))
+    for each i in 0 until count
+        new node = vec.get(nodes, i) as ptr ast.node
+        if is_readonly(node)
+            skip
+        new t = ty_of(node)
+        emit(cat3("mov x0, ", xr(9 + i), ""))
+        normalize(t)
+        push(types.r_word)
+        new l = address(node)
+        emit("mov x2, x0")
+        pop1("x0")
+        store_lv(l)
+
+to is_readonly (node ptr ast.node) gives bool
+    new r = ref_of(node)
+    give r.kind is program.r_fixed or (r.kind is program.r_local and r.loc.readonly)
+
+-- ---------------------------------------------------------------- name resolution
+
+to builtin_index (name string) gives u64
+    for each i in 0 until 8
+        if same(builtin_names[i], name)
+            give i + 1
+    give 0
+
+-- Resolve a name or field chain; 0 for a field of a run-time value.
+to resolve (e ptr ast.node) gives ptr program.ref
+    if e.kind is ast.k_name
+        new loc = lookup_local(e.name)
+        if loc as u64 is not 0
+            new r = program.new_ref(program.r_local)
+            r.loc = loc
+            give r
+        new s = program.lookup(mod, e.name)
+        if s as u64 is not 0
+            give program.sym_ref(s)
+        new b = builtin_index(e.name)
+        if b > 0
+            new r = program.new_ref(program.r_builtin)
+            r.name = e.name
+            r.value = b
+            give r
+        fail(e, cat3("unknown name `", e.name, "`"))
+    if e.kind is ast.k_field
+        new base = node_a(e)
+        if base.kind is ast.k_name or base.kind is ast.k_field
+            new br = resolve(base)
+            base.ref = br as u64
+            if br as u64 is not 0
+                new bk = br.kind
+                if bk is program.r_module or bk is program.r_choice_type or bk is program.r_device or bk is program.r_reg
+                    give program.member_ref(br, e, mod)
+    give 0 as ptr program.ref
+
+-- ---------------------------------------------------------------- type inference
+
+to infer (e ptr ast.node, want ptr types.ty) gives ptr types.ty
+    new t = infer_kind(e, want)
+    e.ty = t as u64
+    give t
+
+to infer_kind (e ptr ast.node, want ptr types.ty) gives ptr types.ty
+    new k = e.kind
+    new none = 0 as ptr types.ty
+    if k is ast.k_lvtmp
+        give ty_of(e)
+    if k is ast.k_int
+        if types.is_kind(want, types.k_maybe) and want.inner.kind is types.k_int
+            want = want.inner
+        if types.is_int(want)
+            if not types.fits(want, wide.of_u64(e.value))
+                fail(e, cat3(cat3(n(e.value), " does not fit in `", tt(want)), "`", ""))
+            give want
+        give types.intlit()
+    if k is ast.k_bool
+        give types.boolean()
+    if k is ast.k_str
+        give types.string_type()
+    if k is ast.k_nothing
+        if types.is_kind(want, types.k_maybe)
+            give want
+        give types.nothing_lit()
+    if k is ast.k_size_of
+        program.resolve_type(node_a(e), mod)
+        if types.is_int(want)
+            give want
+        give types.intlit()
+    if k is ast.k_array_lit
+        fail(e, "an array value can only initialize an array variable")
+    if k is ast.k_name or k is ast.k_field
+        new r = resolve(e)
+        e.ref = r as u64
+        if r as u64 is 0
+            give infer_value_field(e)
+        give ref_type(e, r, want)
+    if k is ast.k_call
+        give infer_call(e, want)
+    if k is ast.k_index
+        new bt = infer(node_a(e), none)
+        if bt.kind is types.k_int
+            new it = infer(node_b(e), none)
+            if it.kind is types.k_intlit
+                infer(node_b(e), types.u64())
+            else if it.kind is not types.k_int
+                fail(e, "a bit index must be a number")
+            give types.unsigned_of(bt)
+        new it = infer(node_b(e), types.u64())
+        if it.kind is not types.k_int
+            fail(e, cat3("an index must be a number, found `", tt(it), "`"))
+        if bt.kind is types.k_array or bt.kind is types.k_span or bt.kind is types.k_ptr
+            give bt.inner
+        fail(e, cat3("cannot index a `", tt(bt), "`"))
+    if k is ast.k_bits
+        new bt = infer(node_a(e), none)
+        if bt.kind is not types.k_int
+            fail(e, cat3("bit ranges need a number, found `", tt(bt), "`"))
+        new hi = program.const_eval(node_b(e), mod, true)
+        new lo = program.const_eval(node_c(e), mod, true)
+        if hi as u64 is 0 or lo as u64 is 0
+            fail(e, "the stage-0 compiler needs constant bit ranges")
+        if wide.negative(lo) or wide.lt(hi, lo) or not wide.lt(hi, wide.of_u64(bt.bits))
+            new b buf.buf
+            buf.add(addr of b, "bit range [")
+            wide.text(addr of b, hi)
+            buf.byte(addr of b, ':')
+            wide.text(addr of b, lo)
+            buf.add(addr of b, "] is outside a `")
+            types.text(addr of b, bt)
+            buf.byte(addr of b, '`')
+            fail(e, buf.text(addr of b))
+        e.aux2 = hi.lo
+        e.aux3 = lo.lo
+        give types.unsigned_of(bt)
+    if k is ast.k_slice
+        new bt = infer(node_a(e), none)
+        for each which in 1 through 2
+            new part = node_b(e)
+            if which is 2
+                part = node_c(e)
+            new pt = infer(part, types.u64())
+            if pt.kind is not types.k_int
+                fail(e, "slice bounds must be numbers")
+        if bt.kind is types.k_span
+            give bt
+        if bt.kind is types.k_array
+            give types.span_of(bt.inner, false)
+        fail(e, cat3("cannot slice a `", tt(bt), "`"))
+    if k is ast.k_unary
+        if same(e.name, "not")
+            new t = infer(node_a(e), types.boolean())
+            if t.kind is not types.k_bool
+                fail(e, cat3("`not` needs a bool, found `", tt(t), "`"))
+            give types.boolean()
+        new w = none
+        if types.is_int(want)
+            w = want
+        new t = infer(node_a(e), w)
+        if t.kind is types.k_intlit
+            give t
+        if t.kind is not types.k_int
+            fail(e, cat3(cat3("`", e.name, "` needs a number, found `"), tt(t), "`"))
+        if same(e.name, "-") and not t.signed
+            fail(e, cat3("cannot negate an unsigned `", tt(t), "`; use `0 -% x` to wrap"))
+        give t
+    if k is ast.k_deref
+        new t = infer(node_a(e), none)
+        if t.kind is not types.k_ptr
+            fail(e, cat3("`deref` needs a pointer, found `", tt(t), "`"))
+        give t.inner
+    if k is ast.k_addr_of
+        new t = infer(node_a(e), none)
+        if not is_lvalue(node_a(e)) or is_bits_lvalue(node_a(e))
+            fail(e, "`addr of` needs a variable, field or element")
+        give types.ptr_to(t)
+    if k is ast.k_cast
+        new target_ty = program.resolve_type(node_b(e), mod)
+        new t = infer(node_a(e), none)
+        if t.kind is types.k_intlit
+            if target_ty.kind is types.k_int
+                t = infer(node_a(e), target_ty)
+            else
+                t = infer(node_a(e), types.u64())
+        new tk = t.kind
+        new ok = ((target_ty.kind is types.k_int or target_ty.kind is types.k_bool) and (tk is types.k_int or tk is types.k_bool or tk is types.k_choice)) or
+            (target_ty.kind is types.k_choice and tk is types.k_int) or
+            (target_ty.kind is types.k_ptr and (tk is types.k_ptr or tk is types.k_int)) or
+            (target_ty.kind is types.k_int and tk is types.k_ptr) or
+            (target_ty.kind is types.k_span and tk is types.k_array and types.same(target_ty.inner, t.inner)) or
+            (target_ty.kind is types.k_span and tk is types.k_span and types.same(target_ty.inner, t.inner))
+        if not ok
+            fail(e, cat3(cat3("cannot convert `", tt(t), "` to `"), tt(target_ty), "`"))
+        if target_ty.kind is types.k_span and tk is types.k_array and not is_lvalue(node_a(e))
+            fail(e, "only a stored array can become a span")
+        give target_ty
+    if k is ast.k_binary
+        give binary_type(e, want)
+    if k is ast.k_compare
+        give compare_type(e)
+    if k is ast.k_logic
+        for each which in 1 through 2
+            new side = node_a(e)
+            if which is 2
+                side = node_b(e)
+            new t = infer(side, types.boolean())
+            if t.kind is not types.k_bool
+                fail(e, cat3(cat3("`", e.name, "` needs bools, found `"), tt(t), "`"))
+        give types.boolean()
+    if k is ast.k_unwrap
+        new t = infer(node_a(e), none)
+        if t.kind is not types.k_maybe
+            fail(e, cat3("`else` unwraps a `maybe`, but this is a `", tt(t), "`"))
+        if same(e.name, "value")
+            new ft = infer(node_b(e), t.inner)
+            check_assign(node_b(e), ft, t.inner)
+        else if same(e.name, "give") and e.b is not 0
+            new ft = infer(node_b(e), fsym.ret)
+            check_assign(node_b(e), ft, fsym.ret)
+        give t.inner
+    fail(e, cat3("cannot use `", ast.kind_names[k - 1], "` here"))
+    give none
+
+to ref_type (e ptr ast.node, r ptr program.ref, want ptr types.ty) gives ptr types.ty
+    new k = r.kind
+    if k is program.r_local
+        give r.loc.ty
+    if k is program.r_global
+        give r.sym.ty
+    if k is program.r_fixed
+        new t = r.sym.ty
+        if t.kind is types.k_intlit and types.is_int(want)
+            if not types.fits(want, r.sym.value)
+                new b buf.buf
+                buf.add(addr of b, "`")
+                buf.add(addr of b, r.sym.name)
+                buf.add(addr of b, "` (")
+                wide.text(addr of b, r.sym.value)
+                buf.add(addr of b, ") does not fit in `")
+                types.text(addr of b, want)
+                buf.byte(addr of b, '`')
+                fail(e, buf.text(addr of b))
+            give want
+        give t
+    if k is program.r_variant
+        give r.ty
+    if k is program.r_reg
+        give r.reg.ty
+    if k is program.r_devfield
+        give types.unsigned_of(r.reg.ty)
+    if k is program.r_func
+        fail(e, cat3("`", e.name, "` is a function; call it with ()"))
+    if k is program.r_module
+        fail(e, "a module is not a value")
+    if k is program.r_device
+        fail(e, "a device is not a value; use one of its registers")
+    if k is program.r_shape_type or k is program.r_choice_type
+        fail(e, "a type is not a value")
+    if k is program.r_builtin
+        fail(e, cat3("`", r.name, "` is a built-in; call it with ()"))
+    fail(e, "cannot use this as a value")
+    give 0 as ptr types.ty
+
+to field_of (t ptr types.ty, name string) gives ptr types.field
+    give (map.get(t.fields, name) else 0) as ptr types.field
+
+to infer_value_field (e ptr ast.node) gives ptr types.ty
+    new bt = infer(node_a(e), 0 as ptr types.ty)
+    if bt.kind is types.k_ptr and (bt.inner.kind is types.k_shape or bt.inner.kind is types.k_span)
+        bt = bt.inner
+    if bt.kind is types.k_shape
+        if not map.has(bt.fields, e.name)
+            fail(e, cat3(cat3("`", tt(bt), "` has no field `"), e.name, "`"))
+        give field_of(bt, e.name).ty
+    if bt.kind is types.k_span
+        if same(e.name, "len")
+            give types.u64()
+        if same(e.name, "ptr")
+            give types.ptr_to(bt.inner)
+        fail(e, cat3("a span only has `.ptr` and `.len`, not `.", e.name, "`"))
+    if bt.kind is types.k_array and same(e.name, "len")
+        e.flags = e.flags | 16
+        e.value = bt.count
+        give types.u64()
+    fail(e, cat3("`", tt(bt), "` has no fields"))
+    give 0 as ptr types.ty
+
+to has_const_len (e ptr ast.node) gives bool
+    give e.kind is ast.k_field and e.flags & 16 is not 0
+
+to infer_call (e ptr ast.node, want ptr types.ty) gives ptr types.ty
+    new f = node_a(e)
+    if f.kind is not ast.k_name and f.kind is not ast.k_field
+        fail(e, "can only call a named function")
+    new r = resolve(f)
+    f.ref = r as u64
+    if r as u64 is 0
+        fail(e, "can only call a named function")
+    if r.kind is program.r_builtin
+        e.aux = r.value
+        if r.value <= b_sev
+            if e.list.len > 0
+                fail(e, cat3("`", r.name, "()` takes nothing"))
+            give types.void()
+        if r.value is b_read
+            if e.list.len is not 1 or ast.item(e.list, 0).kind is not ast.k_name
+                fail(e, "`read_sysreg` takes a system register name, e.g. read_sysreg(CurrentEL)")
+            give types.u64()
+        if r.value is b_write
+            if e.list.len is not 2 or ast.item(e.list, 0).kind is not ast.k_name
+                fail(e, "`write_sysreg` takes a register name and a value")
+            new t = infer(ast.item(e.list, 1), types.u64())
+            if t.kind is not types.k_int
+                fail(e, "`write_sysreg` needs a number")
+            give types.void()
+    if r.kind is not program.r_func
+        fail(e, "this is not a function")
+    new s = r.sym
+    e.aux = 0
+    e.sym = s as u64
+    if e.list.len is not s.params.len
+        new b buf.buf
+        buf.add(addr of b, "`")
+        buf.add(addr of b, s.name)
+        buf.add(addr of b, "` takes ")
+        buf.number(addr of b, s.params.len)
+        buf.add(addr of b, " value(s), given ")
+        buf.number(addr of b, e.list.len)
+        fail(e, buf.text(addr of b))
+    for each i in 0 until e.list.len
+        new arg = ast.item(e.list, i)
+        new pty = program.param_at(s, i).ty
+        new arg_t = infer(arg, pty)
+        check_assign(arg, arg_t, pty)
+    give s.ret
+
+to binary_type (e ptr ast.node, want ptr types.ty) gives ptr types.ty
+    new op = e.name
+    new none = 0 as ptr types.ty
+    if same(op, "<<") or same(op, ">>")
+        new w = none
+        if types.is_int(want)
+            w = want
+        new lt = infer(node_a(e), w)
+        new rt = infer(node_b(e), types.u64())
+        if rt.kind is not types.k_int
+            fail(e, "a shift amount must be a number")
+        if lt.kind is types.k_intlit
+            give lt
+        if lt.kind is not types.k_int
+            fail(e, cat3(cat3("`", op, "` needs a number, found `"), tt(lt), "`"))
+        give lt
+    new lw = none
+    if types.is_int(want) or types.is_kind(want, types.k_ptr)
+        lw = want
+    new lwi = none
+    if types.is_int(lw)
+        lwi = lw
+    new lt = infer(node_a(e), lwi)
+    if lt.kind is types.k_ptr
+        if not same(op, "+") and not same(op, "-")
+            fail(e, cat3("`", op, "` does not work on pointers"))
+        new rt = infer(node_b(e), types.u64())
+        if rt.kind is not types.k_int
+            fail(e, "a pointer can only move by a number")
+        give lt
+    new rw = lwi
+    if lt.kind is types.k_int
+        rw = lt
+    new rt = infer(node_b(e), rw)
+    if lt.kind is types.k_intlit and rt.kind is types.k_int
+        lt = infer(node_a(e), rt)
+    if lt.kind is types.k_intlit and rt.kind is types.k_intlit
+        give types.intlit()
+    if lt.kind is not types.k_int or not types.same(lt, rt)
+        new b buf.buf
+        buf.add(addr of b, "`")
+        buf.add(addr of b, op)
+        buf.add(addr of b, "` needs two numbers of the same type, found `")
+        types.text(addr of b, lt)
+        buf.add(addr of b, "` and `")
+        types.text(addr of b, rt)
+        buf.byte(addr of b, '`')
+        fail(e, buf.text(addr of b))
+    give lt
+
+to compare_type (e ptr ast.node) gives ptr types.ty
+    new none = 0 as ptr types.ty
+    new left = node_a(e)
+    new right = node_b(e)
+    new lt = infer(left, none)
+    if lt.kind is types.k_maybe or lt.kind is types.k_nothing
+        new w = none
+        if lt.kind is types.k_maybe
+            w = lt
+        new rt = infer(right, w)
+        new rk = ty_of(right).kind
+        new eq_op = same(e.name, "==") or same(e.name, "!=")
+        if not eq_op or not ((rk is types.k_maybe or rk is types.k_nothing) and (right.kind is ast.k_nothing or left.kind is ast.k_nothing))
+            fail(e, "a `maybe` can only be compared with `is nothing` / `is not nothing`")
+        if lt.kind is types.k_nothing
+            infer(left, rt)
+        give types.boolean()
+    new w = lt
+    if lt.kind is types.k_intlit
+        w = none
+    new rt = infer(right, w)
+    if lt.kind is types.k_intlit and rt.kind is types.k_int
+        lt = infer(left, rt)
+    if lt.kind is types.k_intlit and rt.kind is types.k_intlit
+        lt = infer(left, types.i64())
+        rt = infer(right, types.i64())
+    if not types.same(lt, rt)
+        fail(e, cat3(cat3("cannot compare `", tt(lt), "` with `"), tt(rt), "`"))
+    if not same(e.name, "==") and not same(e.name, "!=") and lt.kind is not types.k_int and lt.kind is not types.k_ptr
+        fail(e, cat3("`", e.name, "` needs numbers"))
+    if lt.repr is not types.r_word
+        fail(e, cat3("cannot compare `", tt(lt), "` values with `is`"))
+    give types.boolean()
+
+-- ---------------------------------------------------------------- lvalues
+
+to is_lvalue (e ptr ast.node) gives bool
+    new k = e.kind
+    if k is ast.k_name
+        if e.ref is 0
+            give false
+        new r = ref_of(e)
+        give r.kind is program.r_local or r.kind is program.r_global or (r.kind is program.r_fixed and r.sym.has_data)
+    if k is ast.k_field
+        if e.ref is not 0
+            new rk = ref_of(e).kind
+            give rk is program.r_reg or rk is program.r_devfield or rk is program.r_global or
+                (rk is program.r_fixed and ref_of(e).sym.has_data)
+        new bt = ty_of(node_a(e))
+        if bt.kind is types.k_ptr
+            give true
+        if has_const_len(e)
+            give false
+        give is_lvalue(node_a(e))
+    if k is ast.k_index
+        new bt = ty_of(node_a(e))
+        if bt.kind is types.k_int
+            give is_lvalue(node_a(e)) and program.const_eval(node_b(e), mod, true) as u64 is not 0
+        if bt.kind is types.k_array
+            give is_lvalue(node_a(e))
+        give true
+    if k is ast.k_deref
+        give true
+    if k is ast.k_bits
+        give is_lvalue(node_a(e))
+    give false
+
+to is_bits_lvalue (e ptr ast.node) gives bool
+    if e.kind is ast.k_bits
+        give true
+    if e.kind is ast.k_index and ty_of(node_a(e)).kind is types.k_int
+        give true
+    if e.kind is ast.k_field and e.ref is not 0 and ref_of(e).kind is program.r_devfield
+        give true
+    give false
+
+to mem_lv (t ptr types.ty) gives ptr lv
+    new l = mem.alloc(size_of(lv)) as ptr lv
+    l.ty = t
+    give l
+
+to bits_lv (t ptr types.ty, hi u64, lo u64) gives ptr lv
+    new l = mem.alloc(size_of(lv)) as ptr lv
+    l.bits = true
+    l.ty = t
+    l.hi = hi
+    l.lo = lo
+    give l
+
+to add_imm (off u64)
+    if off <= 4095
+        emit(cat("add x0, x0, #", n(off)))
+    else
+        imm("x16", off)
+        emit("add x0, x0, x16")
+
+-- Leave the address of lvalue `e` in x0.
+to address (e ptr ast.node) gives ptr lv
+    new k = e.kind
+    if k is ast.k_name
+        new r = ref_of(e)
+        if r.kind is program.r_local
+            addr_local(r.loc.offset, "x0")
+        else if r.kind is program.r_global
+            addr_symbol(r.sym.symbol, "x0")
+        else if r.kind is program.r_fixed
+            addr_symbol(r.sym.data_label, "x0")
+        give mem_lv(ty_of(e))
+    if k is ast.k_field
+        new r = ref_of(e)
+        if e.ref is not 0 and (r.kind is program.r_reg or r.kind is program.r_devfield)
+            new dev = r.dev
+            new off = r.reg.offset
+            if dev.base_const as u64 is not 0
+                imm("x0", dev.base_const.lo + off)
+            else
+                new g = dev.base_global
+                if g.kind is program.s_fixed
+                    imm("x0", g.value.lo + off)
+                else
+                    addr_symbol(g.symbol, "x0")
+                    emit("ldr x0, [x0]")
+                    if off > 0
+                        imm("x16", off)
+                        emit("add x0, x0, x16")
+            if r.kind is program.r_devfield
+                give bits_lv(r.reg.ty, r.hi, r.lo)
+            give mem_lv(ty_of(e))
+        if e.ref is not 0 and r.kind is program.r_global
+            addr_symbol(r.sym.symbol, "x0")
+            give mem_lv(ty_of(e))
+        if e.ref is not 0 and r.kind is program.r_fixed          -- another module's fixed array
+            addr_symbol(r.sym.data_label, "x0")
+            give mem_lv(ty_of(e))
+        new bt = ty_of(node_a(e))
+        new container = bt
+        if bt.kind is types.k_ptr
+            value(node_a(e))
+            container = bt.inner
+        else
+            address(node_a(e))
+        new off u64 = 0
+        if container.kind is types.k_span
+            if not same(e.name, "ptr")
+                off = 8
+        else
+            off = field_of(container, e.name).offset
+        if off > 0
+            add_imm(off)
+        give mem_lv(ty_of(e))
+    if k is ast.k_index
+        new bt = ty_of(node_a(e))
+        if bt.kind is types.k_int
+            new c = program.const_eval(node_b(e), mod, true)
+            new inner = address(node_a(e))
+            give sub_bits(inner, bt, c.lo, c.lo, e)
+        if bt.kind is types.k_array
+            address(node_a(e))
+            push(types.r_word)
+            value(node_b(e))
+            if program.debug
+                imm("x1", bt.count)
+                emit("cmp x0, x1")
+                emit(cat("b.hs ", trap(e, "index out of range")))
+            pop1("x2")
+            scale_add(bt.inner.size)
+            give mem_lv(ty_of(e))
+        if bt.kind is types.k_span
+            value(node_a(e))
+            push(types.r_pair)
+            value(node_b(e))
+            pop2("x2", "x3")
+            if program.debug
+                emit("cmp x0, x3")
+                emit(cat("b.hs ", trap(e, "index out of range")))
+            scale_add(bt.inner.size)
+            give mem_lv(ty_of(e))
+        if bt.kind is types.k_ptr
+            value(node_a(e))
+            push(types.r_word)
+            value(node_b(e))
+            pop1("x2")
+            scale_add(bt.inner.size)
+            give mem_lv(ty_of(e))
+    if k is ast.k_deref
+        value(node_a(e))
+        give mem_lv(ty_of(e))
+    if k is ast.k_bits
+        new inner = address(node_a(e))
+        give sub_bits(inner, ty_of(node_a(e)), e.aux2, e.aux3, e)
+    fail(e, "cannot take the address of this")
+    give mem_lv(ty_of(e))
+
+to sub_bits (inner ptr lv, base_ty ptr types.ty, hi u64, lo u64, node ptr ast.node) gives ptr lv
+    if inner.bits
+        if hi > inner.hi - inner.lo
+            fail(node, "bit range is wider than the field")
+        give bits_lv(inner.ty, inner.lo + hi, inner.lo + lo)
+    give bits_lv(base_ty, hi, lo)
+
+-- x0 holds the lvalue's address; load its value.
+to load_lv (l ptr lv)
+    if not l.bits
+        load_from_x0(l.ty)
+        give
+    load_from_x0(types.unsigned_of(l.ty))
+    emit(cat3(cat3("ubfx x0, x0, #", n(l.lo), ", #"), n(l.hi - l.lo + 1), ""))
+
+-- Store x0 (/x1) into the lvalue whose address is in x2.
+to store_lv (l ptr lv)
+    if not l.bits
+        store_x0_to_x2(l.ty)
+        give
+    new ut = types.unsigned_of(l.ty)
+    emit("mov x5, x0")
+    emit("mov x0, x2")
+    load_from_x0(ut)
+    emit(cat3(cat3("bfi x0, x5, #", n(l.lo), ", #"), n(l.hi - l.lo + 1), ""))
+    store_x0_to_x2(ut)
+
+-- ---------------------------------------------------------------- values
+
+fixed wrap_ops [9] string = ["+%", "-%", "*%", "+|", "-|", "&", "|", "^", "<<"]
+
+to is_wrap_op (op string) gives bool
+    for each w in wrap_ops
+        if same(w, op)
+            give true
+    give false
+
+to value (e ptr ast.node)
+    new t = ty_of(e)
+    if t.kind is types.k_intlit
+        fail(e, "cannot work out the type of this number; add a type, e.g. `as u32`")
+    if t.kind is types.k_nothing
+        fail(e, "cannot work out which `maybe` this `nothing` is")
+    if (t.kind is types.k_int or t.kind is types.k_bool or t.kind is types.k_choice) and e.kind is not ast.k_call
+        new c = program.const_eval(e, mod, true)
+        if c as u64 is not 0
+            if t.kind is types.k_int
+                if e.kind is ast.k_binary and not is_wrap_op(e.name) and not types.fits(t, c)
+                    fail(e, cat3(cat3(program.wide_text(c), " does not fit in `", tt(t)), "`", ""))
+                c = wide.wrap(c, t.bits, t.signed)
+            imm("x0", c.lo)
+            give
+    new k = e.kind
+    if k is ast.k_int
+        imm("x0", e.value)
+    else if k is ast.k_bool
+        imm("x0", e.value)
+    else if k is ast.k_str
+        addr_symbol(program.string_label(e.name, false), "x0")
+        imm("x1", e.name.len)
+    else if k is ast.k_nothing
+        emit("mov x0, #0")
+        if t.repr is types.r_pair
+            emit("mov x1, #0")
+    else if k is ast.k_lvtmp
+        give
+    else if k is ast.k_name
+        v_name(e)
+    else if k is ast.k_field
+        v_field(e)
+    else if k is ast.k_index
+        v_index(e)
+    else if k is ast.k_bits
+        v_bits(e)
+    else if k is ast.k_deref
+        load_lv(address(e))
+    else if k is ast.k_addr_of
+        new l = address(node_a(e))
+        if l.bits
+            fail(e, "cannot take the address of a bit field")
+    else if k is ast.k_size_of
+        imm("x0", program.resolve_type(node_a(e), mod).size)
+    else if k is ast.k_slice
+        v_slice(e)
+    else if k is ast.k_call
+        v_call(e)
+    else if k is ast.k_unary
+        v_unary(e)
+    else if k is ast.k_cast
+        v_cast(e)
+    else if k is ast.k_binary
+        v_binary(e)
+    else if k is ast.k_compare
+        v_compare(e)
+    else if k is ast.k_logic
+        v_logic(e)
+    else if k is ast.k_unwrap
+        v_unwrap(e)
+
+to v_name (e ptr ast.node)
+    new r = ref_of(e)
+    if r.kind is program.r_fixed
+        new s = r.sym
+        if s.has_str
+            addr_symbol(program.string_label(s.str_value, false), "x0")
+            imm("x1", s.str_value.len)
+            give
+        if s.has_data
+            addr_symbol(s.data_label, "x0")
+            give
+    load_lv(address(e))
+
+to v_field (e ptr ast.node)
+    if has_const_len(e)
+        imm("x0", e.value)
+        give
+    if e.ref is 0 and not is_lvalue(e)
+        new bt = ty_of(node_a(e))
+        if bt.kind is types.k_span
+            value(node_a(e))
+            if same(e.name, "len")
+                emit("mov x0, x1")
+            give
+        fail(e, "cannot read a field of this value")
+    if e.ref is not 0 and ref_of(e).kind is program.r_fixed
+        new copy = name_node(e.line, e.name)
+        copy.ref = e.ref
+        copy.ty = e.ty
+        v_name(copy)
+        give
+    load_lv(address(e))
+
+to v_index (e ptr ast.node)
+    new bt = ty_of(node_a(e))
+    if bt.kind is types.k_int and not is_lvalue(e)
+        value(node_a(e))
+        push(types.r_word)
+        value(node_b(e))
+        emit("mov x1, x0")
+        pop1("x0")
+        emit("lsr x0, x0, x1")
+        emit("and x0, x0, #1")
+        give
+    load_lv(address(e))
+
+to v_bits (e ptr ast.node)
+    if is_lvalue(e)
+        load_lv(address(e))
+        give
+    value(node_a(e))
+    emit(cat3(cat3("ubfx x0, x0, #", n(e.aux3), ", #"), n(e.aux2 - e.aux3 + 1), ""))
+
+to v_slice (e ptr ast.node)
+    new bt = ty_of(node_a(e))
+    if bt.kind is types.k_array
+        address(node_a(e))
+        imm("x1", bt.count)
+    else
+        value(node_a(e))
+    push(types.r_pair)
+    value(node_b(e))
+    push(types.r_word)
+    value(node_c(e))
+    emit("mov x4, x0")
+    pop1("x3")
+    pop2("x0", "x1")
+    if program.debug
+        new l = trap(e, "slice out of range")
+        emit("cmp x3, x4")
+        emit(cat("b.hi ", l))
+        emit("cmp x4, x1")
+        emit(cat("b.hi ", l))
+    emit("sub x1, x4, x3")
+    emit("mov x2, x0")
+    emit("mov x0, x3")
+    scale_add(bt.inner.size)
+
+to v_call (e ptr ast.node)
+    new b = e.aux
+    if b >= b_dsb and b <= b_sev
+        emit(builtin_text[b - 1])
+        give
+    if b is b_read
+        emit(cat("mrs x0, ", ast.item(e.list, 0).name))
+        give
+    if b is b_write
+        value(ast.item(e.list, 1))
+        emit(cat3("msr ", ast.item(e.list, 0).name, ", x0"))
+        give
+    new s = e.sym as ptr program.sym
+    new reprs = vec.make()
+    for each i in 0 until e.list.len
+        new arg = ast.item(e.list, i)
+        new pty = program.param_at(s, i).ty
+        value(arg)
+        coerce(ty_of(arg), pty)
+        push(pty.repr)
+        vec.push(reprs, pty.repr as u64)
+    new regs = vec.make()
+    new r u64 = 0
+    for each i in 0 until reprs.len
+        vec.push(regs, r)
+        if vec.get(reprs, i) is types.r_pair as u64
+            r += 2
+        else
+            r += 1
+    new i = reprs.len
+    while i > 0
+        i -= 1
+        new reg = vec.get(regs, i)
+        if vec.get(reprs, i) is types.r_pair as u64
+            pop2(xr(reg), xr(reg + 1))
+        else
+            pop1(xr(reg))
+    emit(cat("bl ", s.symbol))
+
+to v_unary (e ptr ast.node)
+    new t = ty_of(e)
+    if same(e.name, "not")
+        value(node_a(e))
+        emit("eor x0, x0, #1")
+        give
+    value(node_a(e))
+    if same(e.name, "~")
+        emit("mvn x0, x0")
+        normalize(t)
+        give
+    emit("mov x1, x0")
+    emit("mov x0, #0")
+    binop(e, "-", t)
+
+to v_cast (e ptr ast.node)
+    new target_ty = ty_of(e)
+    new src = ty_of(node_a(e))
+    value(node_a(e))
+    if target_ty.kind is types.k_bool
+        emit("cmp x0, #0")
+        emit("cset x0, ne")
+    else if target_ty.kind is types.k_int
+        normalize(target_ty)
+    else if target_ty.kind is types.k_choice
+        emit("mov w0, w0")
+    else if target_ty.kind is types.k_span and src.kind is types.k_array
+        imm("x1", src.count)
+
+to v_binary (e ptr ast.node)
+    new t = ty_of(e)
+    if t.kind is types.k_ptr
+        value(node_a(e))
+        push(types.r_word)
+        value(node_b(e))
+        emit("mov x1, x0")
+        pop1("x0")
+        new size = t.inner.size
+        if size is not 1
+            if power_of_two(size)
+                emit(cat("lsl x1, x1, #", n(log2(size))))
+            else
+                imm("x16", size)
+                emit("mul x1, x1, x16")
+        if same(e.name, "+")
+            emit("add x0, x0, x1")
+        else
+            emit("sub x0, x0, x1")
+        give
+    value(node_a(e))
+    push(types.r_word)
+    value(node_b(e))
+    emit("mov x1, x0")
+    pop1("x0")
+    binop(e, e.name, t)
+
+-- x0 = x0 op x1 for type t (both canonical).
+to binop (node ptr ast.node, op string, t ptr types.ty)
+    new dbg = program.debug
+    new s = t.signed
+    if same(op, "&")
+        emit("and x0, x0, x1")
+        give
+    if same(op, "|")
+        emit("orr x0, x0, x1")
+        give
+    if same(op, "^")
+        emit("eor x0, x0, x1")
+        give
+    if same(op, "<<")
+        emit("lsl x0, x0, x1")
+        normalize(t)
+        give
+    if same(op, ">>")
+        if s
+            emit("asr x0, x0, x1")
+        else
+            emit("lsr x0, x0, x1")
+        give
+    if same(op, "+%") or same(op, "-%") or same(op, "*%")
+        if same(op, "+%")
+            emit("add x0, x0, x1")
+        else if same(op, "-%")
+            emit("sub x0, x0, x1")
+        else
+            emit("mul x0, x0, x1")
+        normalize(t)
+        give
+    if same(op, "+|") or same(op, "-|")
+        saturate(op, t)
+        give
+    if same(op, "/") or same(op, "%")
+        if dbg
+            emit(cat("cbz x1, ", trap(node, "division by zero")))
+        if s
+            emit("sdiv x2, x0, x1")
+        else
+            emit("udiv x2, x0, x1")
+        if same(op, "/")
+            emit("mov x0, x2")
+            if dbg and s and t.bits < 64
+                check_range(node, t)
+            normalize(t)
+        else
+            emit("msub x0, x2, x1, x0")
+        give
+    if t.bits is 64
+        if same(op, "*")
+            if dbg
+                if s
+                    emit("smulh x2, x0, x1")
+                    emit("mul x0, x0, x1")
+                    emit("cmp x2, x0, asr #63")
+                    emit(cat("b.ne ", trap(node, "integer overflow")))
+                else
+                    emit("umulh x2, x0, x1")
+                    emit("mul x0, x0, x1")
+                    emit(cat("cbnz x2, ", trap(node, "integer overflow")))
+            else
+                emit("mul x0, x0, x1")
+            give
+        new ins = "adds"
+        if same(op, "-")
+            ins = "subs"
+        if dbg
+            emit(cat(ins, " x0, x0, x1"))
+            new c = "vs"
+            if not s
+                if same(op, "+")
+                    c = "cs"
+                else
+                    c = "cc"
+            emit(cat3(cat("b.", c), " ", trap(node, "integer overflow")))
+        else
+            emit(cat(ins[0 until 3], " x0, x0, x1"))
+        give
+    if same(op, "+")
+        emit("add x0, x0, x1")
+    else if same(op, "-")
+        emit("sub x0, x0, x1")
+    else
+        emit("mul x0, x0, x1")
+    if dbg
+        check_range(node, t)
+    normalize(t)
+
+-- Trap unless the exact 64-bit result in x0 fits in narrow type t.
+to check_range (node ptr ast.node, t ptr types.ty)
+    new l = trap(node, "integer overflow")
+    if t.signed
+        if t.bits is 8
+            emit("sxtb x2, w0")
+        else if t.bits is 16
+            emit("sxth x2, w0")
+        else
+            emit("sxtw x2, w0")
+        emit("cmp x2, x0")
+        emit(cat("b.ne ", l))
+    else
+        emit(cat("lsr x2, x0, #", n(t.bits)))
+        emit(cat("cbnz x2, ", l))
+
+to saturate (op string, t ptr types.ty)
+    new adding = same(op, "+|")
+    if t.bits is 64
+        if t.signed
+            if adding
+                emit("adds x2, x0, x1")
+            else
+                emit("subs x2, x0, x1")
+            emit("asr x3, x1, #63")
+            if adding
+                emit("eor x3, x3, #0x7fffffffffffffff")
+            else
+                emit("eor x3, x3, #0x8000000000000000")
+            emit("csel x0, x3, x2, vs")
+        else if adding
+            emit("adds x0, x0, x1")
+            emit("csinv x0, x0, xzr, cc")
+        else
+            emit("subs x0, x0, x1")
+            emit("csel x0, x0, xzr, cs")
+        give
+    if adding
+        emit("add x0, x0, x1")
+    else
+        emit("sub x0, x0, x1")
+    imm("x2", types.max_of(t).lo)
+    emit("cmp x0, x2")
+    emit("csel x0, x2, x0, gt")
+    imm("x2", types.min_of(t).lo)
+    emit("cmp x0, x2")
+    emit("csel x0, x2, x0, lt")
+
+to v_compare (e ptr ast.node)
+    new left = node_a(e)
+    new right = node_b(e)
+    new lt = ty_of(left)
+    if lt.kind is types.k_maybe
+        new other = right
+        if right.kind is ast.k_nothing
+            other = left
+        value(other)
+        if lt.repr is types.r_pair
+            emit("cmp x1, #0")
+        else
+            emit("cmp x0, #0")
+        if same(e.name, "==")
+            emit("cset x0, eq")
+        else
+            emit("cset x0, ne")
+        give
+    value(left)
+    push(types.r_word)
+    value(right)
+    emit("mov x1, x0")
+    pop1("x0")
+    emit("cmp x0, x1")
+    new signed = lt.kind is types.k_int and lt.signed
+    new op = e.name
+    new c = "eq"
+    if same(op, "!=")
+        c = "ne"
+    else if same(op, "<")
+        c = "lo"
+        if signed
+            c = "lt"
+    else if same(op, ">")
+        c = "hi"
+        if signed
+            c = "gt"
+    else if same(op, "<=")
+        c = "ls"
+        if signed
+            c = "le"
+    else if same(op, ">=")
+        c = "hs"
+        if signed
+            c = "ge"
+    emit(cat("cset x0, ", c))
+
+to v_logic (e ptr ast.node)
+    new done = program.label("lg")
+    value(node_a(e))
+    if same(e.name, "and")
+        emit(cat("cbz x0, ", done))
+    else
+        emit(cat("cbnz x0, ", done))
+    value(node_b(e))
+    lab(done)
+
+to v_unwrap (e ptr ast.node)
+    new mt = ty_of(node_a(e))
+    new none_label = program.label("un")
+    new done = program.label("ud")
+    value(node_a(e))
+    if mt.repr is types.r_pair
+        emit(cat("cbz x1, ", none_label))
+    else
+        emit(cat("cbz x0, ", none_label))
+    emit(cat("b ", done))
+    lab(none_label)
+    new saved = depth
+    if same(e.name, "value")
+        value(node_b(e))
+        coerce(ty_of(node_b(e)), mt.inner)
+    else if same(e.name, "give")
+        new ret = fsym.ret
+        if e.b is not 0
+            value(node_b(e))
+            coerce(ty_of(node_b(e)), ret)
+        else if ret.kind is types.k_maybe
+            emit("mov x0, #0")
+            emit("mov x1, #0")
+        else if ret.kind is not types.k_void
+            fail(e, cat3(cat3("`else give` needs a value: `", fsym.name, "` gives a `"), tt(ret), "`"))
+        leave_function()
+    else
+        jump_loop(e, same(e.name, "skip"))
+    depth = saved
+    lab(done)

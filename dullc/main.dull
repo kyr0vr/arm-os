@@ -10,6 +10,7 @@ use vec
 use lexer
 use parser
 use ast
+use program
 use diag
 
 -- The command line, split on spaces.
@@ -94,6 +95,24 @@ to dump_ast (path string, out_path string)
     if not sys.write_file(out_path, buf.text(addr of b))
         diag.fail("", 0, "cannot write the output file")
 
+-- dullc compile <root.dull> <out.s> [include folders...] [--release]
+to compile_program (args ptr vec.vec, count u64)
+    new root = argument(args, 2)
+    new out_path = argument(args, 3)
+    new includes = vec.make()
+    new debug = true
+    for each i in 4 until count
+        new a = argument(args, i)
+        if text.same(a, "--release")
+            debug = false
+        else
+            vec.push(includes, a.ptr as u64)
+            vec.push(includes, a.len)
+    program.setup(includes, debug)
+    new output = program.compile(root)
+    if not sys.write_file(out_path, output)
+        diag.fail("", 0, "cannot write the output file")
+
 to main gives u8
     new args = arguments()
     new count = args.len / 2               -- argument 0 is the tool's own name
@@ -105,6 +124,9 @@ to main gives u8
         give 0
     if text.same(command, "ast") and count is 4
         dump_ast(argument(args, 2), argument(args, 3))
+        give 0
+    if text.same(command, "compile") and count >= 4
+        compile_program(args, count)
         give 0
     usage()
     give 2

@@ -72,7 +72,8 @@ def main():
                               toolchain.build_kernel(rt, base, out, name, backend=backend))
         else:
             problem = compare(name, lambda out, backend, src=src, rt=rt, base=base, name=name:
-                              toolchain.build(src, rt, base, out, name, backend=backend))
+                              toolchain.build(src, rt, base, out, name, backend=backend,
+                                              extra_includes=[os.path.join(ROOT, "lib")]))
         print(f"{'ok  ' if problem is None else 'FAIL'} {name}" + ("" if problem is None else f": {problem}"))
         failed += problem is not None
         passed += problem is None

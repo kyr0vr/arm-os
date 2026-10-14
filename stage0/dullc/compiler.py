@@ -1617,7 +1617,8 @@ class FuncGen:
                 (e.ref is not None and e.ref.kind == "fixed" and getattr(e.ref.sym, "data_label", None))
         if k == "field":
             if e.ref is not None:
-                return e.ref.kind in ("reg", "devfield", "global")
+                return e.ref.kind in ("reg", "devfield", "global") or \
+                    (e.ref.kind == "fixed" and bool(getattr(e.ref.sym, "data_label", None)))
             bt = e.value.ty
             if isinstance(bt, T.Ptr):
                 return True
@@ -1680,6 +1681,9 @@ class FuncGen:
                 return ("mem", e.ty)
             if ref is not None and ref.kind == "global":
                 self.addr_symbol(ref.sym.symbol)
+                return ("mem", e.ty)
+            if ref is not None and ref.kind == "fixed":        # another module's fixed array
+                self.addr_symbol(ref.sym.data_label)
                 return ("mem", e.ty)
             bt = e.value.ty
             if isinstance(bt, T.Ptr):

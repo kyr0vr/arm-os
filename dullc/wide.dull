@@ -1,0 +1,185 @@
+-- 128-bit two's-complement integers, for constant expressions. Stage 0 evaluates
+-- constants with Python's unbounded integers; 128 bits holds every constant a DULL
+-- program can write (anything from -2^63 to 2^64 - 1, and their combinations) with
+-- room to spare, so results and "does not fit" messages come out the same.
+--
+-- Values are handed around as `ptr wide`; every operation gives a fresh one.
+
+use mem
+use buf
+
+shape wide
+    lo u64
+    hi u64
+
+to make (lo u64, hi u64) gives ptr wide
+    new w = mem.alloc(size_of(wide)) as ptr wide
+    w.lo = lo
+    w.hi = hi
+    give w
+
+to of_u64 (v u64) gives ptr wide
+    give make(v, 0)
+
+to of_i64 (v i64) gives ptr wide
+    if v < 0
+        give make(v as u64, 0xFFFF_FFFF_FFFF_FFFF)
+    give make(v as u64, 0)
+
+to negative (a ptr wide) gives bool
+    give a.hi >> 63 is 1
+
+to is_zero (a ptr wide) gives bool
+    give a.lo is 0 and a.hi is 0
+
+to eq (a ptr wide, b ptr wide) gives bool
+    give a.lo is b.lo and a.hi is b.hi
+
+-- a < b, signed.
+to lt (a ptr wide, b ptr wide) gives bool
+    new ah = a.hi as i64
+    new bh = b.hi as i64
+    if ah is not bh
+        give ah < bh
+    give a.lo < b.lo
+
+to le (a ptr wide, b ptr wide) gives bool
+    give lt(a, b) or eq(a, b)
+
+to ult (a ptr wide, b ptr wide) gives bool
+    if a.hi is not b.hi
+        give a.hi < b.hi
+    give a.lo < b.lo
+
+to add (a ptr wide, b ptr wide) gives ptr wide
+    new lo = a.lo +% b.lo
+    new carry u64 = 0
+    if lo < a.lo
+        carry = 1
+    give make(lo, a.hi +% b.hi +% carry)
+
+to bit_not (a ptr wide) gives ptr wide
+    give make(~a.lo, ~a.hi)
+
+to neg (a ptr wide) gives ptr wide
+    give add(bit_not(a), of_u64(1))
+
+to sub (a ptr wide, b ptr wide) gives ptr wide
+    give add(a, neg(b))
+
+to umulh (a u64, b u64) gives u64
+    new r u64 = 0
+    asm "umulh {r}, {a}, {b}"
+    give r
+
+to mul (a ptr wide, b ptr wide) gives ptr wide
+    give make(a.lo *% b.lo, umulh(a.lo, b.lo) +% (a.lo *% b.hi) +% (a.hi *% b.lo))
+
+to bit_and (a ptr wide, b ptr wide) gives ptr wide
+    give make(a.lo & b.lo, a.hi & b.hi)
+
+to bit_or (a ptr wide, b ptr wide) gives ptr wide
+    give make(a.lo | b.lo, a.hi | b.hi)
+
+to bit_xor (a ptr wide, b ptr wide) gives ptr wide
+    give make(a.lo ^ b.lo, a.hi ^ b.hi)
+
+to shl (a ptr wide, n u64) gives ptr wide
+    if n >= 128
+        give make(0, 0)
+    if n >= 64
+        give make(0, a.lo << (n - 64))
+    if n is 0
+        give make(a.lo, a.hi)
+    give make(a.lo << n, (a.hi << n) | (a.lo >> (64 - n)))
+
+-- Arithmetic (sign-filling) shift right.
+to shr (a ptr wide, n u64) gives ptr wide
+    new fill u64 = 0
+    if negative(a)
+        fill = 0xFFFF_FFFF_FFFF_FFFF
+    if n >= 128
+        give make(fill, fill)
+    if n >= 64
+        give make(((a.hi as i64) >> (n - 64)) as u64, fill)
+    if n is 0
+        give make(a.lo, a.hi)
+    give make((a.lo >> n) | (a.hi << (64 - n)), ((a.hi as i64) >> n) as u64)
+
+to abs (a ptr wide) gives ptr wide
+    if negative(a)
+        give neg(a)
+    give a
+
+-- Unsigned division: the quotient; the remainder goes in `rem`.
+to udivmod (a ptr wide, b ptr wide, rem ptr wide) gives ptr wide
+    new q = make(0, 0)
+    new r = make(0, 0)
+    new i u64 = 128
+    while i > 0
+        i -= 1
+        r = shl(r, 1)
+        if i >= 64
+            r.lo = r.lo | ((a.hi >> (i - 64)) & 1)
+        else
+            r.lo = r.lo | ((a.lo >> i) & 1)
+        if not ult(r, b)
+            r = sub(r, b)
+            if i >= 64
+                q.hi = q.hi | ((1 as u64) << (i - 64))
+            else
+                q.lo = q.lo | ((1 as u64) << i)
+    rem.lo = r.lo
+    rem.hi = r.hi
+    give q
+
+-- Division truncating toward zero (stage 0: abs(a) // abs(b) * sign).
+to div (a ptr wide, b ptr wide) gives ptr wide
+    new r = make(0, 0)
+    new q = udivmod(abs(a), abs(b), r)
+    if negative(a) is not negative(b)
+        give neg(q)
+    give q
+
+-- a - b * div(a, b)
+to rem (a ptr wide, b ptr wide) gives ptr wide
+    give sub(a, mul(b, div(a, b)))
+
+-- Keep the low `bits` bits, as signed or unsigned (stage 0's wrap()).
+to wrap (a ptr wide, bits u64, signed bool) gives ptr wide
+    new lo = a.lo
+    if bits < 64
+        lo = lo & (((1 as u64) << bits) - 1)
+    if signed and (lo >> (bits - 1)) & 1 is 1
+        if bits < 64
+            lo = lo | ~(((1 as u64) << bits) - 1)
+        give make(lo, 0xFFFF_FFFF_FFFF_FFFF)
+    give make(lo, 0)
+
+-- min(max(a, lo), hi)
+to clamp (a ptr wide, lo ptr wide, hi ptr wide) gives ptr wide
+    if lt(a, lo)
+        give lo
+    if lt(hi, a)
+        give hi
+    give a
+
+-- Decimal text, with a minus sign when negative.
+to text (b ptr buf.buf, a ptr wide)
+    if negative(a)
+        buf.byte(b, '-')
+        a = neg(a)
+    new digits [40] u8
+    new n u64 = 0
+    new ten = of_u64(10)
+    if is_zero(a)
+        buf.byte(b, '0')
+        give
+    while not is_zero(a)
+        new r = make(0, 0)
+        a = udivmod(a, ten, r)
+        digits[n] = (r.lo as u8) + '0'
+        n += 1
+    while n > 0
+        n -= 1
+        buf.byte(b, digits[n])

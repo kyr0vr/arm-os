@@ -1,8 +1,10 @@
 """Check the DULL-written compiler (dullc/) against the stage-0 compiler (stage0/dullc).
 
-Each stage must give identical results on every .dull file in the repo:
-    tokens   the lexer's token stream
-    ast      the parser's syntax tree
+Each stage must give identical results:
+    tokens   the lexer's token stream, on every .dull file in the repo
+    ast      the parser's syntax tree, on every .dull file in the repo
+    asm      the generated assembly, for every program we build (and the same error
+             message, for the programs that are meant to fail) - including dullc itself
 (and the same error message, for files that are meant to fail).
 
 Usage: python tests/selfhost_compare.py <stage> [name-filter]
@@ -15,9 +17,11 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 sys.path.insert(0, os.path.join(ROOT, "tests"))
+sys.path.insert(0, os.path.join(ROOT, "stage0"))
 
 import host  # noqa: E402
 import selfhost_dump  # noqa: E402
+from dullc import DullError, compile_file  # noqa: E402
 
 OUT = os.path.join(ROOT, "build", "selfhost")
 STAGES = {"tokens": selfhost_dump.tokens, "ast": selfhost_dump.tree}
@@ -29,6 +33,26 @@ def sources():
                     "lib/*.dull", "loader/*.dull", "dullc/*.dull"]:
         files += sorted(glob.glob(os.path.join(ROOT, pattern)))
     return files
+
+
+def is_release(path):
+    with open(path, encoding="utf-8") as f:
+        return any(line.strip() == "-- release" for line in f)
+
+
+def programs():
+    """(name, root file, include folders) for everything we compile."""
+    jobs = []
+    for path in sorted(glob.glob(os.path.join(ROOT, "tests", "*.dull"))):
+        jobs.append((os.path.relpath(path, ROOT), ["rt/virt", "lib"]))
+    for path in sorted(glob.glob(os.path.join(ROOT, "tests", "errors", "*.dull"))):
+        jobs.append((os.path.relpath(path, ROOT), ["rt/virt", "lib"]))
+    jobs.append(("kernel/main.dull", ["rt/virt", "kernel"]))
+    jobs.append(("kernel/main.dull", ["rt/pi5", "kernel"]))
+    jobs.append(("loader/loader.dull", ["rt/virt"]))
+    jobs.append(("loader/loader.dull", ["rt/pi5"]))
+    jobs.append(("dullc/main.dull", ["rt/virt", "lib"]))
+    return [(p.replace("\\", "/"), inc) for p, inc in jobs]
 
 
 def show_difference(rel, want, got):
@@ -43,11 +67,21 @@ def show_difference(rel, want, got):
     print(f"   dullc:   ...{b[lo:j + 80]}")
 
 
+def run_dullc(elf, args, out_file):
+    if os.path.exists(out_file):
+        os.remove(out_file)
+    code, console = host.run(elf, ["dullc"] + args)
+    if code == 0 and os.path.exists(out_file):
+        with open(out_file, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    return console
+
+
 def main():
-    if len(sys.argv) < 2 or sys.argv[1] not in STAGES:
+    stage = sys.argv[1] if len(sys.argv) > 1 else ""
+    if stage not in STAGES and stage != "asm":
         print(__doc__)
         return 2
-    stage = sys.argv[1]
     flt = sys.argv[2] if len(sys.argv) > 2 else ""
     os.makedirs(OUT, exist_ok=True)
     try:
@@ -56,20 +90,36 @@ def main():
         print(f"building dullc with stage 0 failed: {e}")
         return 1
     passed = failed = 0
+    if stage == "asm":
+        for rel, includes in programs():
+            label = f"{rel} [{', '.join(includes)}]"
+            if flt not in label:
+                continue
+            path = os.path.join(ROOT, rel)
+            release = is_release(path)
+            try:
+                want = compile_file(path, [os.path.join(ROOT, d) for d in includes], debug=not release)
+            except DullError as e:
+                want = f"error: {e}\n"
+            out_file = os.path.join(OUT, (rel + "_" + "_".join(includes)).replace("/", "__") + ".s")
+            args = ["compile", rel, os.path.relpath(out_file, ROOT).replace("\\", "/")] + includes
+            if release:
+                args.append("--release")
+            got = run_dullc(elf, args, out_file)
+            if got == want:
+                passed += 1
+            else:
+                failed += 1
+                show_difference(label, want, got)
+        print(f"\nasm: {passed} identical, {failed} different")
+        return 1 if failed else 0
     for path in sources():
         rel = os.path.relpath(path, ROOT).replace("\\", "/")
         if flt not in rel:
             continue
         want = STAGES[stage](path)
         out_file = os.path.join(OUT, rel.replace("/", "__") + "." + stage)
-        if os.path.exists(out_file):
-            os.remove(out_file)
-        code, console = host.run(elf, ["dullc", stage, rel, os.path.relpath(out_file, ROOT).replace("\\", "/")])
-        if code == 0:
-            with open(out_file, encoding="utf-8", errors="replace") as f:
-                got = f.read()
-        else:
-            got = console
+        got = run_dullc(elf, [stage, rel, os.path.relpath(out_file, ROOT).replace("\\", "/")], out_file)
         if got == want:
             passed += 1
         else:

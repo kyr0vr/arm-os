@@ -1,0 +1,248 @@
+-- DULL types as the compiler sees them. A port of stage0/dullc/dtypes.py.
+
+use mem
+use buf
+use map
+use vec
+use wide
+
+fixed k_int u32 = 1
+fixed k_bool u32 = 2
+fixed k_void u32 = 3
+fixed k_intlit u32 = 4
+fixed k_nothing u32 = 5
+fixed k_ptr u32 = 6
+fixed k_span u32 = 7
+fixed k_maybe u32 = 8
+fixed k_array u32 = 9
+fixed k_shape u32 = 10
+fixed k_choice u32 = 11
+
+-- How a value lives in registers.
+fixed r_word u32 = 1      -- one register (x0)
+fixed r_pair u32 = 2      -- two registers (x0, x1)
+fixed r_mem u32 = 3       -- only in memory; an expression gives its address
+
+shape field
+    name   string
+    ty     ptr ty
+    offset u64
+
+shape ty
+    kind      u32
+    repr      u32
+    size      u64
+    align     u64
+    bits      u64
+    signed    bool
+    name      string          -- ints, shapes, choices
+    symbol    string          -- shapes, choices: module.name
+    inner     ptr ty
+    count     u64             -- arrays
+    is_string bool            -- spans
+    done      bool            -- shapes: laid out
+    fields    ptr map.map     -- shapes: name -> ptr field
+    variants  ptr map.map     -- choices: name -> index
+
+new ints [8] u64              -- u8 i8 u16 i16 u32 i32 u64 i64
+new bool_t u64
+new void_t u64
+new intlit_t u64
+new nothing_t u64
+
+to make (kind u32, repr u32, size u64, align u64) gives ptr ty
+    new t = mem.alloc(size_of(ty)) as ptr ty
+    t.kind = kind
+    t.repr = repr
+    t.size = size
+    t.align = align
+    give t
+
+fixed int_names [8] string = ["u8", "i8", "u16", "i16", "u32", "i32", "u64", "i64"]
+
+to setup
+    if bool_t is not 0
+        give
+    for each i in 0 until 8
+        new bits = (8 as u64) << (i / 2)
+        new t = make(k_int, r_word, bits / 8, bits / 8)
+        t.bits = bits
+        t.signed = i % 2 is 1
+        t.name = int_names[i]
+        ints[i] = t as u64
+    bool_t = make(k_bool, r_word, 1, 1) as u64
+    void_t = make(k_void, r_word, 0, 0) as u64
+    intlit_t = make(k_intlit, r_word, 8, 8) as u64
+    nothing_t = make(k_nothing, r_word, 8, 8) as u64
+
+to int_named (name string) gives ptr ty
+    setup()
+    for each i in 0 until 8
+        if text_same(int_names[i], name)
+            give ints[i] as ptr ty
+    give 0 as ptr ty
+
+to text_same (a string, b string) gives bool
+    if a.len is not b.len
+        give false
+    for each i in 0 until a.len
+        if a[i] is not b[i]
+            give false
+    give true
+
+to int_of (bits u64, signed bool) gives ptr ty
+    setup()
+    new i u64 = 0
+    if bits is 16
+        i = 2
+    else if bits is 32
+        i = 4
+    else if bits is 64
+        i = 6
+    if signed
+        i += 1
+    give ints[i] as ptr ty
+
+to u8 gives ptr ty
+    give int_of(8, false)
+
+to u32 gives ptr ty
+    give int_of(32, false)
+
+to u64 gives ptr ty
+    give int_of(64, false)
+
+to i64 gives ptr ty
+    give int_of(64, true)
+
+to boolean gives ptr ty
+    setup()
+    give bool_t as ptr ty
+
+to void gives ptr ty
+    setup()
+    give void_t as ptr ty
+
+to intlit gives ptr ty
+    setup()
+    give intlit_t as ptr ty
+
+to nothing_lit gives ptr ty
+    setup()
+    give nothing_t as ptr ty
+
+to unsigned_of (t ptr ty) gives ptr ty
+    give int_of(t.bits, false)
+
+to ptr_to (inner ptr ty) gives ptr ty
+    new t = make(k_ptr, r_word, 8, 8)
+    t.inner = inner
+    give t
+
+to span_of (inner ptr ty, is_string bool) gives ptr ty
+    new t = make(k_span, r_pair, 16, 8)
+    t.inner = inner
+    t.is_string = is_string
+    give t
+
+to string_type gives ptr ty
+    give span_of(u8(), true)
+
+to maybe_of (inner ptr ty) gives ptr ty
+    if inner.kind is k_ptr
+        new t = make(k_maybe, r_word, 8, 8)
+        t.inner = inner
+        give t
+    new t = make(k_maybe, r_pair, 16, 8)
+    t.inner = inner
+    give t
+
+to array_of (inner ptr ty, count u64) gives ptr ty
+    new t = make(k_array, r_mem, inner.size * count, inner.align)
+    t.inner = inner
+    t.count = count
+    give t
+
+to shape_named (name string, symbol string) gives ptr ty
+    new t = make(k_shape, r_mem, 0, 1)
+    t.name = name
+    t.symbol = symbol
+    t.fields = map.make()
+    give t
+
+to choice_named (name string, symbol string, variants ptr map.map) gives ptr ty
+    new t = make(k_choice, r_word, 4, 4)
+    t.name = name
+    t.symbol = symbol
+    t.variants = variants
+    give t
+
+-- Stage 0's ==: by structure, except shapes and choices, which are equal only to themselves.
+to same (a ptr ty, b ptr ty) gives bool
+    if a as u64 is 0 or b as u64 is 0
+        give a as u64 is b as u64
+    if a.kind is not b.kind
+        give false
+    new k = a.kind
+    if k is k_int
+        give a.bits is b.bits and a.signed is b.signed
+    if k is k_ptr or k is k_span or k is k_maybe
+        give same(a.inner, b.inner)
+    if k is k_array
+        give a.count is b.count and same(a.inner, b.inner)
+    if k is k_shape or k is k_choice
+        give a as u64 is b as u64
+    give true
+
+to is_int (t ptr ty) gives bool
+    give t as u64 is not 0 and t.kind is k_int
+
+to is_kind (t ptr ty, k u32) gives bool
+    give t as u64 is not 0 and t.kind is k
+
+to is_scalar (t ptr ty) gives bool
+    new k = t.kind
+    give k is k_int or k is k_bool or k is k_choice or k is k_ptr
+
+-- The smallest and largest value of an integer type.
+to min_of (t ptr ty) gives ptr wide.wide
+    if not t.signed
+        give wide.of_u64(0)
+    give wide.neg(wide.shl(wide.of_u64(1), t.bits - 1))
+
+to max_of (t ptr ty) gives ptr wide.wide
+    if t.signed
+        give wide.sub(wide.shl(wide.of_u64(1), t.bits - 1), wide.of_u64(1))
+    give wide.sub(wide.shl(wide.of_u64(1), t.bits), wide.of_u64(1))
+
+to fits (t ptr ty, v ptr wide.wide) gives bool
+    give wide.le(min_of(t), v) and wide.le(v, max_of(t))
+
+-- How stage 0 prints a type (its str()).
+to text (b ptr buf.buf, t ptr ty)
+    new k = t.kind
+    if k is k_int or k is k_shape or k is k_choice
+        buf.add(b, t.name)
+    else if k is k_bool
+        buf.add(b, "bool")
+    else if k is k_void or k is k_nothing
+        buf.add(b, "nothing")
+    else if k is k_intlit
+        buf.add(b, "untyped number")
+    else if k is k_ptr
+        buf.add(b, "ptr ")
+        text(b, t.inner)
+    else if k is k_span
+        if t.is_string
+            buf.add(b, "string")
+        else
+            buf.add(b, "span ")
+            text(b, t.inner)
+    else if k is k_maybe
+        buf.add(b, "maybe ")
+        text(b, t.inner)
+    else if k is k_array
+        buf.byte(b, '[')
+        buf.number(b, t.count)
+        buf.add(b, "] ")
+        text(b, t.inner)
