@@ -1,0 +1,276 @@
+-- Reading a FAT32 file system (read-only), the format SD cards come in.
+--
+-- Finds the FAT32 partition on the disk (or a disk that is one big partition),
+-- then walks cluster chains for directories and files. Long file names (VFAT) are
+-- put together from their entries; only their ASCII part is kept.
+
+use board
+use pages
+use line
+
+shape entry
+    name     line.line
+    attr     u8
+    cluster  u32
+    size     u32
+
+shape dir
+    cluster  u32               -- current cluster of the directory
+    index    u32               -- next entry within that cluster
+    done     bool
+
+fixed attr_dir u8 = 0x10
+fixed attr_volume u8 = 0x08
+fixed attr_lfn u8 = 0x0F
+fixed end_of_chain u32 = 0x0FFF_FFF8
+
+new mounted bool
+new part_lba u64               -- where the FAT32 partition starts
+new sec_per_clus u32
+new fat_lba u64
+new data_lba u64
+new root u32
+new total_clusters u32
+new label line.line
+
+new sector ptr u8              -- one-sector buffer
+new fat_cache ptr u8           -- the FAT sector read last
+new fat_cached_lba u64
+new cluster_buf ptr u8         -- one cluster
+new cluster_cached u32
+
+to u16_at (p ptr u8, off u64) gives u32
+    give (p[off] as u32) | ((p[off + 1] as u32) << 8)
+
+to u32_at (p ptr u8, off u64) gives u32
+    give u16_at(p, off) | (u16_at(p, off + 2) << 16)
+
+to read (lba u64, count u32, into ptr u8) gives bool
+    give board.disk_read(lba, count, into)
+
+-- Is this sector a FAT32 boot sector?
+to is_fat32 (p ptr u8) gives bool
+    give p[510] is 0x55 and p[511] is 0xAA and p[82] is 'F' and p[83] is 'A' and p[84] is 'T' and
+        p[85] is '3' and p[86] is '2' and u16_at(p, 11) is 512
+
+to mount gives bool
+    if mounted
+        give true
+    if sector as u64 is 0
+        sector = pages.alloc() else give false
+        fat_cache = pages.alloc() else give false
+    if not read(0, 1, sector)
+        give false
+    part_lba = 0
+    if not is_fat32(sector)
+        if sector[510] is not 0x55 or sector[511] is not 0xAA
+            give false
+        new found = false
+        for each i in 0 until 4
+            new e = 0x1BE + i * 16
+            new kind = sector[e + 4]
+            if kind is 0x0B or kind is 0x0C
+                part_lba = u32_at(sector, e + 8) as u64
+                found = true
+                stop
+        if not found
+            give false
+        if not read(part_lba, 1, sector)
+            give false
+        if not is_fat32(sector)
+            give false
+    sec_per_clus = sector[13] as u32
+    new reserved = u16_at(sector, 14) as u64
+    new fats = sector[16] as u64
+    new fat_size = u32_at(sector, 36) as u64
+    root = u32_at(sector, 44)
+    fat_lba = part_lba + reserved
+    data_lba = fat_lba + fats * fat_size
+    new total = u32_at(sector, 32) as u64
+    total_clusters = ((total - (data_lba - part_lba)) / (sec_per_clus as u64)) as u32
+    line.clear(addr of label)
+    for each i in 0 until 11
+        line.byte(addr of label, sector[71 + i])
+    cluster_buf = pages.alloc_run(((sec_per_clus as u64) * 512 + 4095) / 4096) else give false
+    cluster_cached = 0
+    fat_cached_lba = 0xFFFF_FFFF_FFFF_FFFF
+    mounted = true
+    give true
+
+to cluster_lba (c u32) gives u64
+    give data_lba + ((c - 2) as u64) * (sec_per_clus as u64)
+
+to cluster_bytes gives u64
+    give (sec_per_clus as u64) * 512
+
+-- The cluster after `c` in its chain (end_of_chain or more when there is none).
+to next_cluster (c u32) gives u32
+    new offset = (c as u64) * 4
+    new lba = fat_lba + offset / 512
+    if lba is not fat_cached_lba
+        if not read(lba, 1, fat_cache)
+            give end_of_chain
+        fat_cached_lba = lba
+    give u32_at(fat_cache, offset % 512) & 0x0FFF_FFFF
+
+to load_cluster (c u32) gives bool
+    if c is cluster_cached
+        give true
+    if not read(cluster_lba(c), sec_per_clus, cluster_buf)
+        give false
+    cluster_cached = c
+    give true
+
+-- ---------------------------------------------------------------- directories
+
+to open_dir (d ptr dir, cluster u32)
+    d.cluster = cluster
+    if cluster is 0
+        d.cluster = root
+    d.index = 0
+    d.done = false
+
+-- The 13 characters a long-name entry holds, as ASCII (others become '?').
+fixed lfn_offsets [13] u64 = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]
+
+to lfn_part (raw ptr u8, into ptr line.line)
+    for each off in lfn_offsets
+        new code = u16_at(raw, off)
+        if code is 0 or code is 0xFFFF
+            stop
+        if code < 128
+            line.byte(into, code as u8)
+        else
+            line.byte(into, '?')
+
+-- The next entry of a directory: false at the end.
+to next (d ptr dir, out ptr entry) gives bool
+    new parts [20] line.line          -- long-name pieces, last piece first
+    new piece_count u32 = 0
+    repeat
+        if d.done or d.cluster < 2 or d.cluster >= end_of_chain
+            give false
+        new per_cluster = (cluster_bytes() / 32) as u32
+        if d.index >= per_cluster
+            d.cluster = next_cluster(d.cluster)
+            d.index = 0
+            skip
+        if not load_cluster(d.cluster)
+            give false
+        new raw = cluster_buf + (d.index as u64) * 32
+        d.index += 1
+        if raw[0] is 0
+            d.done = true
+            give false
+        if raw[0] is 0xE5
+            piece_count = 0
+            skip
+        new attr = raw[11]
+        if attr is attr_lfn
+            if piece_count < 20
+                line.clear(addr of parts[piece_count])
+                lfn_part(raw, addr of parts[piece_count])
+                piece_count += 1
+            skip
+        if attr & attr_volume is not 0
+            piece_count = 0
+            skip
+        line.clear(addr of out.name)
+        if piece_count > 0
+            new i = piece_count
+            while i > 0
+                i -= 1
+                line.add(addr of out.name, line.text(addr of parts[i]))
+        else
+            short_name(raw, addr of out.name)
+        out.attr = attr
+        out.cluster = (u16_at(raw, 20) << 16) | u16_at(raw, 26)
+        out.size = u32_at(raw, 28)
+        give true
+
+-- "README  TXT" -> "README.TXT" (lower-cased where the entry says so).
+to short_name (raw ptr u8, into ptr line.line)
+    new lower_base = raw[12] & 0x08 is not 0
+    new lower_ext = raw[12] & 0x10 is not 0
+    for each i in 0 until 8
+        if raw[i] is not ' '
+            line.byte(into, case(raw[i], lower_base))
+    if raw[8] is not ' '
+        line.byte(into, '.')
+        for each i in 8 until 11
+            if raw[i] is not ' '
+                line.byte(into, case(raw[i], lower_ext))
+
+to case (c u8, lower bool) gives u8
+    if lower and c >= 'A' and c <= 'Z'
+        give c + 32
+    give c
+
+-- ---------------------------------------------------------------- paths and files
+
+to same_name (a string, b string) gives bool
+    if a.len is not b.len
+        give false
+    for each i in 0 until a.len
+        if case(a[i], true) is not case(b[i], true)
+            give false
+    give true
+
+-- Find `path` ("docs/notes.txt", "/", "" for the root). False if it is not there.
+to find (path string, out ptr entry) gives bool
+    if not mount()
+        give false
+    line.clear(addr of out.name)
+    out.attr = attr_dir
+    out.cluster = root
+    out.size = 0
+    new i u64 = 0
+    while i < path.len
+        while i < path.len and path[i] is '/'
+            i += 1
+        if i >= path.len
+            stop
+        new j = i
+        while j < path.len and path[j] is not '/'
+            j += 1
+        new part = path[i until j]
+        i = j
+        if out.attr & attr_dir is 0
+            give false
+        new d dir
+        open_dir(addr of d, out.cluster)
+        new e entry
+        new found = false
+        while next(addr of d, addr of e)
+            if same_name(line.text(addr of e.name), part)
+                found = true
+                stop
+        if not found
+            give false
+        line.clear(addr of out.name)
+        line.add(addr of out.name, line.text(addr of e.name))
+        out.attr = e.attr
+        out.cluster = e.cluster
+        out.size = e.size
+        if out.cluster is 0 and out.attr & attr_dir is not 0
+            out.cluster = root                 -- ".." of a top-level folder
+    give true
+
+-- Read up to `max` bytes of a file into `into`. Gives how many were read.
+to read_file (e ptr entry, into ptr u8, max u64) gives u64
+    new want = e.size as u64
+    if want > max
+        want = max
+    new done u64 = 0
+    new c = e.cluster
+    while done < want and c >= 2 and c < end_of_chain
+        if not load_cluster(c)
+            stop
+        new n = cluster_bytes()
+        if n > want - done
+            n = want - done
+        for each k in 0 until n
+            into[done + k] = cluster_buf[k]
+        done += n
+        c = next_cluster(c)
+    give done

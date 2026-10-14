@@ -26,4 +26,6 @@ The boot screen (the arrow through the A is the progress bar; every fact on the 
 
 Type at the console over the serial cable: `python -m serial.tools.miniterm COM4 115200`.
 
+The shell can read the SD card: `disk` shows the card and its file system, `ls [folder]` lists files and `cat file` prints one (`help` lists the rest).
+
 The console font, ArmOS Mono, is baked from Cascadia Mono and Cascadia Code (SIL Open Font License 1.1, see [fonts/](fonts/)).

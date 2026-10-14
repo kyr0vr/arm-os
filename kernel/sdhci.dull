@@ -1,0 +1,260 @@
+-- The Pi 5's microSD slot: a standard SD host controller (SDHCI), read-only,
+-- polled, with the CPU copying data through the controller's buffer port (no DMA).
+--
+-- The firmware booted from this card, so it is powered and its pins are set up;
+-- we still reset the controller and walk the card through the SD start-up again.
+-- Registers are reached 32 bits at a time, the way Broadcom's SDHCI blocks like it.
+
+use timer
+
+device sd at 0x10_00ff_f000
+    arg2       at 0x00 u32
+    blocks     at 0x04 u32     -- block size (low 16), block count (high 16)
+    argument   at 0x08 u32
+    command    at 0x0c u32     -- transfer mode (low 16), command (high 16)
+    resp0      at 0x10 u32
+    resp1      at 0x14 u32
+    resp2      at 0x18 u32
+    resp3      at 0x1c u32
+    data       at 0x20 u32
+    present    at 0x24 u32
+    host       at 0x28 u32     -- host control 1, power, block gap, wakeup
+    clocks     at 0x2c u32     -- clock control (low 16), timeout, software reset
+    irq_status at 0x30 u32     -- normal (low 16), error (high 16); write 1 to clear
+    irq_enable at 0x34 u32
+    irq_signal at 0x38 u32
+    host2      at 0x3c u32
+    caps       at 0x40 u32
+    version    at 0xfc u32     -- host controller version in bits 16-23
+
+-- Interrupt status bits.
+fixed cmd_done u32 = 0x0001
+fixed xfer_done u32 = 0x0002
+fixed read_ready u32 = 0x0020
+fixed any_error u32 = 0x8000
+
+-- Response kinds (the low byte of the command register).
+fixed r_none u32 = 0x00
+fixed r2 u32 = 0x09            -- 136 bits, CRC checked
+fixed r3 u32 = 0x02            -- 48 bits, nothing checked (the OCR)
+fixed r1 u32 = 0x1A            -- 48 bits, CRC and index checked (R1, R6, R7)
+fixed r1b u32 = 0x1B           -- R1 with busy
+fixed with_data u32 = 0x20
+
+new ready bool
+new tried bool
+new high_capacity bool         -- SDHC/SDXC: addresses are sectors, not bytes
+new rca u32                    -- the card's address on the bus
+new sectors u64
+new base_mhz u32
+new failed_at u32              -- the command that failed (diagnostics), or 0xFF
+
+-- --------------------------------------------------------------- waiting
+
+to wait_us (us u64)
+    new start = timer.now()
+    new ticks = us * timer.frequency() / 1_000_000
+    hold until timer.now() - start >= ticks
+
+-- Wait until (reg & mask) is `want`, for up to `ms` milliseconds.
+to wait_bits (which u32, mask u32, want u32, ms u64) gives bool
+    new start = timer.now()
+    new ticks = ms * timer.frequency() / 1000
+    repeat
+        new v u32 = 0
+        if which is 0
+            v = sd.present
+        else if which is 1
+            v = sd.clocks
+        else
+            v = sd.irq_status
+        if v & mask is want
+            give true
+        if timer.now() - start >= ticks
+            give false
+
+-- Wait for an interrupt status bit, failing early on any error.
+to wait_irq (mask u32, ms u64) gives bool
+    new start = timer.now()
+    new ticks = ms * timer.frequency() / 1000
+    repeat
+        new v = sd.irq_status
+        if v & any_error is not 0
+            give false
+        if v & mask is not 0
+            sd.irq_status = mask
+            give true
+        if timer.now() - start >= ticks
+            give false
+
+-- Reset part of the controller: 1 all, 2 the command line, 4 the data line.
+to reset (what u32) gives bool
+    sd.clocks = (sd.clocks & 0x00FF_FFFF) | (what << 24)
+    give wait_bits(1, what << 24, 0, 100)
+
+-- --------------------------------------------------------------- commands
+
+-- Send a command; false if it got no good answer.
+to send (index u32, arg u32, kind u32, mode u32) gives bool
+    new busy = 1 as u32
+    if kind & with_data is not 0 or kind is r1b
+        busy = 3
+    if not wait_bits(0, busy, 0, 100)
+        failed_at = index
+        give false
+    sd.irq_status = 0xFFFF_FFFF
+    sd.argument = arg
+    sd.command = (((index << 8) | kind) << 16) | mode
+    if not wait_irq(cmd_done, 500)
+        failed_at = index
+        sd.irq_status = 0xFFFF_FFFF
+        reset(2)
+        reset(4)
+        give false
+    give true
+
+-- An application command (CMD55 first).
+to send_app (index u32, arg u32, kind u32) gives bool
+    if not send(55, rca << 16, r1, 0)
+        give false
+    give send(index, arg, kind, 0)
+
+-- Set the SD clock to at most `khz`.
+to set_clock (khz u32) gives bool
+    new c = sd.clocks
+    sd.clocks = c & 0xFFFF_0000                           -- clock off
+    new n u32 = (base_mhz * 1000 + 2 * khz - 1) / (2 * khz)
+    if n > 1023
+        n = 1023
+    new divider = ((n & 0xFF) << 8) | ((n >> 8) << 6)
+    sd.clocks = (c & 0xFFFF_0000) | 0x000E_0000 | divider | 1     -- timeout, internal clock
+    if not wait_bits(1, 2, 2, 100)
+        give false
+    sd.clocks = sd.clocks | 4                             -- clock to the card
+    wait_us(1000)
+    give true
+
+-- --------------------------------------------------------------- start-up
+
+to init gives bool
+    if ready
+        give true
+    if tried
+        give false
+    tried = true
+    failed_at = 0xFF
+    base_mhz = (sd.caps >> 8) & 0xFF
+    if base_mhz is 0
+        base_mhz = 200
+    if not reset(1)
+        give false
+    sd.host = 0x0F00                                      -- 3.3 V, bus power on
+    sd.irq_enable = 0xFFFF_FEFF                           -- every status but "card interrupt"
+    sd.irq_signal = 0
+    if not set_clock(400)
+        give false
+    wait_us(2000)
+    send(0, 0, r_none, 0)                                 -- go idle
+    wait_us(2000)
+    new v2 = send(8, 0x1AA, r1, 0)                        -- version 2 card? (echoes 0x1AA)
+    if v2 and sd.resp0 & 0xFFF is not 0x1AA
+        give false
+    new ocr_arg u32 = 0x00FF_8000
+    if v2
+        ocr_arg |= 0x4000_0000                            -- we can do high capacity
+    new start = timer.now()
+    repeat
+        if not send_app(41, ocr_arg, r3)
+            give false
+        if sd.resp0 & 0x8000_0000 is not 0
+            stop
+        if timer.now() - start > timer.frequency()        -- one second
+            failed_at = 41
+            give false
+        wait_us(10_000)
+    high_capacity = sd.resp0 & 0x4000_0000 is not 0
+    if not send(2, 0, r2, 0)                              -- card identification
+        give false
+    if not send(3, 0, r1, 0)                              -- ask for an address
+        give false
+    rca = sd.resp0 >> 16
+    if send(9, rca << 16, r2, 0)                          -- the card's details (CSD)
+        sectors = csd_sectors()
+    if not send(7, rca << 16, r1b, 0)                     -- select the card
+        give false
+    wait_irq(xfer_done, 100)                              -- end of busy (ignored if none)
+    if not send(16, 512, r1, 0)                           -- 512-byte blocks
+        give false
+    if send_app(6, 2, r1)                                 -- four data lines
+        sd.host = sd.host | 2
+    if not set_clock(25_000)
+        give false
+    ready = true
+    give true
+
+-- Card size from its CSD. The controller drops the CRC byte, so CSD bit k is
+-- response bit k - 8.
+to csd_sectors gives u64
+    new structure = (sd.resp3 >> 22) & 3
+    if structure is 1
+        new c_size = ((sd.resp1 >> 8) & 0x3F_FFFF) as u64        -- bits 69:48
+        give (c_size + 1) * 1024
+    -- version 1: C_SIZE bits 73:62, C_SIZE_MULT 49:47, READ_BL_LEN 83:80
+    new c_size = (((sd.resp2 & 0x3) << 10) | (sd.resp1 >> 22)) as u64
+    new mult = ((sd.resp1 >> 7) & 7) as u64
+    new bl_len = ((sd.resp2 >> 8) & 0xF) as u64
+    give ((c_size + 1) << (mult + 2)) << bl_len >> 9
+
+to capacity gives u64
+    if not init()
+        give 0
+    give sectors
+
+-- --------------------------------------------------------------- reading
+
+-- Read `count` 512-byte sectors starting at `lba` into `into`.
+to read (lba u64, count u32, into ptr u8) gives bool
+    if not init()
+        give false
+    new done u32 = 0
+    while done < count
+        new n = count - done
+        if n > 128
+            n = 128
+        if not read_some(lba + (done as u64), n, into + (done as u64) * 512)
+            give false
+        done += n
+    give true
+
+to read_some (lba u64, count u32, into ptr u8) gives bool
+    new where = lba as u32
+    if not high_capacity
+        where = (lba * 512) as u32
+    sd.blocks = (count << 16) | 512
+    new mode u32 = 0x10 | 0x02                            -- card to host, use the block count
+    new index u32 = 17
+    if count > 1
+        mode |= 0x20 | 0x04                               -- several blocks, then CMD12 by itself
+        index = 18
+    if not send(index, where, r1 | with_data, mode)
+        give false
+    new out = into
+    for each b in 0 until count
+        if not wait_irq(read_ready, 500)
+            failed_at = 0x80 | index
+            reset(2)
+            reset(4)
+            give false
+        for each w in 0 until 128 as u32
+            new v = sd.data
+            out[0] = (v & 0xFF) as u8
+            out[1] = ((v >> 8) & 0xFF) as u8
+            out[2] = ((v >> 16) & 0xFF) as u8
+            out[3] = (v >> 24) as u8
+            out = out + 4
+    if not wait_irq(xfer_done, 500)
+        failed_at = 0x40 | index
+        reset(2)
+        reset(4)
+        give false
+    give true

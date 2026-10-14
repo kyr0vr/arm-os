@@ -22,6 +22,7 @@ fixed password u32 = 0x5A00_0000
 fixed full_reset u32 = 0x20
 
 use line
+use sdhci
 
 new revision u32               -- the firmware's board revision code
 new arm_hz u32                 -- the ARM cores' clock
@@ -30,6 +31,20 @@ new arm_hz u32                 -- the ARM cores' clock
 to probe
     revision = fb.board_revision()
     arm_hz = fb.clock_rate(3)
+
+-- The disk: the microSD card the Pi booted from.
+to disk_read (lba u64, count u32, into ptr u8) gives bool
+    give sdhci.read(lba, count, into)
+
+to disk_sectors gives u64
+    give sdhci.capacity()
+
+to disk_name (l ptr line.line)
+    line.add(l, "SD card")
+    if not sdhci.init()
+        line.add(l, " (not answering, command ")
+        line.number(l, sdhci.failed_at as u64)
+        line.byte(l, ')')
 
 -- New-style revision codes (bit 23 set): type in bits 4-11, processor 12-15, memory 20-22.
 to host_name (l ptr line.line)

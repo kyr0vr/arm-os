@@ -11,6 +11,7 @@ use fb
 use line
 use timer
 use pages
+use fat
 
 new canvas ptr text.canvas
 new screen ptr fb.screen
@@ -50,6 +51,9 @@ to help
     say("  uptime   time since the kernel started\n", fetch.putty)
     say("  cpu      the processor\n", fetch.putty)
     say("  echo ... say something back\n", fetch.putty)
+    say("  ls [dir] list files on the SD card\n", fetch.putty)
+    say("  cat file show a text file\n", fetch.putty)
+    say("  disk     the SD card and its file system\n", fetch.putty)
     say("  reboot   restart the Pi\n", fetch.putty)
 
 to show (key string, value ptr line.line)
@@ -89,6 +93,15 @@ to run_command (cmd string)
     else if starts(t, "echo ")
         say(t[5 until t.len], fetch.putty)
         say("\n", fetch.putty)
+    else if same(t, "ls") or starts(t, "ls ")
+        if t.len > 2
+            list(trim(t[3 until t.len]))
+        else
+            list("")
+    else if starts(t, "cat ")
+        show_file(trim(t[4 until t.len]))
+    else if same(t, "disk")
+        disk_info()
     else if same(t, "reboot")
         say("rebooting\n", fetch.muted)
         board.reboot()
@@ -96,6 +109,123 @@ to run_command (cmd string)
         say("not a command: ", fetch.deep)
         say(t, fetch.putty)
         say(" (try help)\n", fetch.muted)
+
+to no_disk
+    say("no file system found on the SD card\n", fetch.deep)
+
+to list (path string)
+    new e fat.entry
+    if not fat.mount()
+        no_disk()
+        give
+    if not fat.find(path, addr of e)
+        say("not found: ", fetch.deep)
+        say(path, fetch.putty)
+        say("\n", fetch.putty)
+        give
+    if e.attr & fat.attr_dir is 0
+        say("not a folder: ", fetch.deep)
+        say(path, fetch.putty)
+        say("\n", fetch.putty)
+        give
+    new d fat.dir
+    fat.open_dir(addr of d, e.cluster)
+    new item fat.entry
+    new count u32 = 0
+    while fat.next(addr of d, addr of item)
+        new name = line.text(addr of item.name)
+        if same(name, ".") or same(name, "..")
+            skip
+        count += 1
+        new l line.line
+        if item.attr & fat.attr_dir is not 0
+            line.add(addr of l, "  <dir> ")
+            say(line.text(addr of l), fetch.muted)
+            say_bold(name, fetch.amber)
+            say("/\n", fetch.amber)
+        else
+            line.add(addr of l, "  ")
+            pad_number(addr of l, item.size as u64, 6)
+            line.byte(addr of l, ' ')
+            say(line.text(addr of l), fetch.muted)
+            say(name, fetch.putty)
+            say("\n", fetch.putty)
+    if count is 0
+        say("  (empty)\n", fetch.muted)
+
+to pad_number (l ptr line.line, v u64, width u64)
+    new digits line.line
+    line.number(addr of digits, v)
+    new k = digits.len
+    while k < width
+        line.byte(l, ' ')
+        k += 1
+    line.add(l, line.text(addr of digits))
+
+fixed max_show u64 = 65536
+
+to show_file (path string)
+    new e fat.entry
+    if not fat.mount()
+        no_disk()
+        give
+    if not fat.find(path, addr of e) or e.attr & fat.attr_dir is not 0
+        say("no such file: ", fetch.deep)
+        say(path, fetch.putty)
+        say("\n", fetch.putty)
+        give
+    new pages_needed = (max_show + pages.size - 1) / pages.size
+    new buffer = pages.alloc_run(pages_needed) else no_memory()
+    new n = fat.read_file(addr of e, buffer, max_show)
+    new chunk line.line
+    for each i in 0 until n
+        new c = buffer[i]
+        if c is '\r'
+            skip
+        if c is '\t'
+            c = ' '
+        if c is not '\n' and (c < 32 or c >= 127)
+            c = '?'
+        line.byte(addr of chunk, c)
+        if c is '\n' or chunk.len >= 150
+            say(line.text(addr of chunk), fetch.putty)
+            line.clear(addr of chunk)
+    if chunk.len > 0
+        say(line.text(addr of chunk), fetch.putty)
+        say("\n", fetch.putty)
+    if (e.size as u64) > max_show
+        say("(only the first 64 KB shown)\n", fetch.muted)
+    for each p in 0 until pages_needed
+        pages.free(buffer + p * pages.size)
+
+to no_memory gives ptr u8
+    say("out of memory\n", fetch.deep)
+    board.idle()
+    give 0 as ptr u8
+
+to disk_info
+    new l line.line
+    board.disk_name(addr of l)
+    line.add(addr of l, ", ")
+    line.number(addr of l, board.disk_sectors() / 2048)
+    line.add(addr of l, " MB")
+    show("Disk", addr of l)
+    if not fat.mount()
+        no_disk()
+        give
+    line.clear(addr of l)
+    line.add(addr of l, "FAT32 \"")
+    line.add(addr of l, line.text(addr of fat.label))
+    line.add(addr of l, "\", ")
+    new cluster = (fat.sec_per_clus as u64) * 512
+    if cluster < 1024
+        line.number(addr of l, cluster)
+        line.add(addr of l, "-byte clusters, from sector ")
+    else
+        line.number(addr of l, cluster / 1024)
+        line.add(addr of l, " KB clusters, from sector ")
+    line.number(addr of l, fat.part_lba)
+    show("Files", addr of l)
 
 to same (a string, b string) gives bool
     if a.len is not b.len

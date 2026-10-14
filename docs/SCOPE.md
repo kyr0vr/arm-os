@@ -122,7 +122,7 @@ Each phase ends with something visible on the Pi or the PC.
 | 4 | **Kernel core** | ✅ EL2 -> EL1, exception vectors, MMU + caches (168x faster), page allocator + heap self-tests, GIC + 100 Hz timer, all 4 cores via PSCI - on the Pi 5 and on QEMU (`tests/kernel_test.py`) |
 | 5 | **Self-host** | ✅ `dullc/`: compiler, assembler and linker in DULL; compiles itself to a fixed point; every image byte-identical to stage 0 and clang + lld; all builds now use it, stage 0 only bootstraps |
 | 6 | **Text console** | ✅ ArmOS Mono bitmap font, the designed boot screen drawn live (progress arrow with glow, facts read from the hardware), a scrolling console and a tiny shell taking keys over serial - on the Pi and in QEMU (screenshots) |
-| 7 | **Storage** | SDHCI driver + FAT32 read; list and print a `.txt` from the card |
+| 7 | **Storage** | ✅ SD card driver (SDHCI, polled, 4-bit, 25 MHz) and read-only FAT32 with long file names: `disk`, `ls`, `cat` read the real card on the Pi; QEMU tests the same code on a generated FAT32 image over virtio |
 | 8 | **Processes** | EL0 apps, syscalls, scheduler; the console is an app |
 | 9 | **GUI + Text** | Compositor, launcher with Text/Music/Video tiles, **Text reader done** (serial keys) |
 | 10 | **USB input** | PCIe root complex → RP1 → xHCI → USB HID: a USB keyboard and mouse drive the GUI |

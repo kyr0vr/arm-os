@@ -1,0 +1,115 @@
+-- A virtio block device on QEMU's virt board (the legacy virtio-mmio interface):
+-- the PC-side stand-in for the Pi's SD card. One request at a time, polled.
+--
+-- QEMU: -drive file=disk.img,if=none,format=raw,id=d0 -device virtio-blk-device,drive=d0
+
+use pages
+
+fixed slots_base u64 = 0x0A00_0000     -- 32 virtio-mmio slots, 0x200 apart
+fixed slot_count u64 = 32
+fixed queue_size u32 = 8
+fixed magic u32 = 0x7472_6976          -- "virt"
+
+new base u64
+device mmio at base
+    magic_value     at 0x000 u32
+    version         at 0x004 u32
+    device_id       at 0x008 u32
+    host_features   at 0x010 u32
+    guest_features  at 0x020 u32
+    guest_page_size at 0x028 u32
+    queue_sel       at 0x030 u32
+    queue_num_max   at 0x034 u32
+    queue_num       at 0x038 u32
+    queue_align     at 0x03c u32
+    queue_pfn       at 0x040 u32
+    queue_notify    at 0x050 u32
+    interrupt_ack   at 0x064 u32
+    status          at 0x070 u32
+    capacity_lo     at 0x100 u32
+    capacity_hi     at 0x104 u32
+
+new ring u64                   -- descriptors at +0, available ring at +128, used ring at +4096
+new header ptr u8              -- the 16-byte request header, then the status byte at +16
+new used_seen u16
+new ready bool
+
+to desc (i u64) gives ptr u64
+    give (ring + i * 16) as ptr u64
+
+to set_desc (i u64, address u64, length u32, flags u16, next u16)
+    new d = desc(i)
+    d[0] = address
+    new w = (ring + i * 16 + 8) as ptr u32
+    w[0] = length
+    new h = (ring + i * 16 + 12) as ptr u16
+    h[0] = flags
+    h[1] = next
+
+to avail_idx gives ptr u16
+    give (ring + 128 + 2) as ptr u16
+
+to avail_slot (i u64) gives ptr u16
+    give (ring + 128 + 4 + i * 2) as ptr u16
+
+to used_idx gives ptr u16
+    give (ring + 4096 + 2) as ptr u16
+
+-- Find the block device and set up its queue.
+to init gives bool
+    if ready
+        give true
+    for each slot in 0 until slot_count
+        base = slots_base + slot * 0x200
+        if mmio.magic_value is magic and mmio.device_id is 2
+            stop
+        base = 0
+    if base is 0
+        give false
+    mmio.status = 0                        -- reset
+    mmio.status = 1                        -- acknowledge
+    mmio.status = 1 | 2                    -- driver
+    mmio.guest_features = 0
+    mmio.guest_page_size = 4096
+    mmio.queue_sel = 0
+    if mmio.queue_num_max < queue_size
+        give false
+    mmio.queue_num = queue_size
+    mmio.queue_align = 4096
+    new r = pages.alloc_run(2) else give false
+    ring = r as u64
+    new h = pages.alloc() else give false
+    header = h
+    mmio.queue_pfn = (ring >> 12) as u32
+    mmio.status = 1 | 2 | 4                -- driver ok
+    used_seen = 0
+    ready = true
+    give true
+
+-- Disk size in 512-byte sectors.
+to capacity gives u64
+    give (mmio.capacity_lo as u64) | ((mmio.capacity_hi as u64) << 32)
+
+-- Read `count` sectors starting at `lba` into `into`.
+to read (lba u64, count u32, into ptr u8) gives bool
+    if not init()
+        give false
+    new hdr = header as ptr u32
+    hdr[0] = 0                             -- read
+    hdr[1] = 0
+    new sec = (header as u64 + 8) as ptr u64
+    sec[0] = lba
+    header[16] = 0xFF
+    set_desc(0, header as u64, 16, 1, 1)                     -- next
+    set_desc(1, into as u64, count * 512, 1 | 2, 2)          -- next, device writes
+    set_desc(2, header as u64 + 16, 1, 2, 0)                 -- device writes
+    new slot = (deref avail_idx()) as u64 % (queue_size as u64)
+    deref avail_slot(slot) = 0
+    dsb()
+    deref avail_idx() = deref avail_idx() +% 1
+    dsb()
+    mmio.queue_notify = 0
+    hold until deref used_idx() is not used_seen
+    used_seen = deref used_idx()
+    mmio.interrupt_ack = 1
+    give header[16] is 0

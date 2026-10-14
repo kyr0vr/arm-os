@@ -43,6 +43,18 @@ EXPECT = [
     "hello from armos",
     "not a command: not-a-command",
     "the console scrolled",
+    "Disk: virtio disk, 65 MB",
+    'Files: FAT32 "ARMOS TEST ", 512-byte clusters, from sector 2048',
+    "55 hello.txt",
+    "26 A Longer File Name.txt",
+    "<dir> docs/",
+    "2400 notes.txt",
+    "Hello from a FAT32 disk!",
+    "This is ArmOS reading a file.",
+    "Long file names work too.",
+    "note 059: a rather mundane line of text",
+    "line 00399 of a big file that crosses many clusters",
+    "no such file: nope.txt",
 ]
 
 
@@ -53,15 +65,21 @@ def to_png(raw, png):
     Image.frombytes("RGB", (1920, 1080), data, "raw", "BGRX").save(png)
 
 
+DISK = os.path.join(ROOT, "build", "disk", "test.img")
+
+
 def run(machine, label, show):
     elf, _ = toolchain.build_kernel(os.path.join(ROOT, "rt", "virt"), 0x4008_0000, OUT)
+    subprocess.run([sys.executable, os.path.join(ROOT, "tests", "make_fat_image.py"), DISK],
+                   check=True, capture_output=True)
     for n in (0, 1):
         p = os.path.join(OUT, f"screen{n}.raw")
         if os.path.exists(p):
             os.remove(p)
     cmd = [qemu.path(), "-M", machine, "-cpu", "cortex-a76", "-smp", "4", "-m", "128M",
            "-display", "none", "-monitor", "none", "-serial", "stdio",
-           "-semihosting-config", "enable=on,target=native", "-kernel", elf]
+           "-semihosting-config", "enable=on,target=native", "-kernel", elf,
+           "-drive", f"file={DISK},if=none,format=raw,id=d0", "-device", "virtio-blk-device,drive=d0"]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=300, cwd=ROOT)
     except subprocess.TimeoutExpired:

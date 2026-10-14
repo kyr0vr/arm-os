@@ -5,6 +5,7 @@
 use pages
 use line
 use fb
+use virtio
 
 elsewhere new __stack_top u8
 
@@ -14,11 +15,23 @@ fixed cores u64 = 4
 fixed ram_end u64 = 0x4700_0000       -- RAM from 0x4000_0000; the pretend screen sits above this
 
 -- The shell reads these keys, then stops (there is no keyboard in the test).
-fixed script string = "help\nmem\nuptime\ncpu\necho hello from armos\nnot-a-command\nhelp\nhelp\necho the console scrolled\n"
+fixed script string = "help\nmem\nuptime\ncpu\necho hello from armos\nnot-a-command\nhelp\nhelp\necho the console scrolled\ndisk\nls\nls docs\ncat hello.txt\ncat a longer file name.txt\ncat docs/notes.txt\ncat big.txt\ncat nope.txt\n"
 new script_pos u64
 
 to probe
     give
+
+-- The disk: QEMU's virtio block device.
+to disk_read (lba u64, count u32, into ptr u8) gives bool
+    give virtio.read(lba, count, into)
+
+to disk_sectors gives u64
+    if not virtio.init()
+        give 0
+    give virtio.capacity()
+
+to disk_name (l ptr line.line)
+    line.add(l, "virtio disk")
 
 to host_name (l ptr line.line)
     line.add(l, "QEMU virt (emulated)")
