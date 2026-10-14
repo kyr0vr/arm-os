@@ -169,8 +169,9 @@ to draw_footer
     x = key_cap(x + 48, 980, "Enter")
     x = gfx.text(x + 16, 986, "open", gfx.small, muted)
     x = key_cap(x + 48, 980, "1-4")
-    gfx.text(x + 16, 986, "jump", gfx.small, muted)
-    new v = "ArmOS 0.9"
+    x = gfx.text(x + 16, 986, "jump", gfx.small, muted)
+    gfx.text(x + 48, 986, "or point and click", gfx.small, dim)
+    new v = "ArmOS 0.10"
     gfx.text(gfx.width - 120 - gfx.text_width(v, gfx.small), 986, v, gfx.small, dim)
 
 to draw_note
@@ -200,6 +201,15 @@ to choose (i u32)
     gfx.present(0, top, gfx.width, tile_h + 16)
     draw_note()
 
+-- The tile under (x, y), or `tiles` for none.
+to tile_at (x u32, y u32) gives u32
+    if y < tile_y or y >= tile_y + tile_h
+        give tiles
+    for each i in 0 until tiles
+        if x >= tile_x(i) and x < tile_x(i) + tile_w
+            give i
+    give tiles
+
 -- ---------------------------------------------------------------- opening
 
 to open (i u32)
@@ -224,6 +234,7 @@ to main gives u64
         -- no screen: fall back to the shell
         sys.wait(sys.spawn("shell", "", false))
         give 0
+    sys.want_pointer(true)
     draw_all()
     repeat
         new key = keys.within(1000)
@@ -231,7 +242,16 @@ to main gives u64
             draw_clock()
             gfx.present(0, 100, gfx.width, 60)
             skip
-        if key is keys.right or key is keys.down or key is keys.tab or key is 'd' as u32
+        if key is keys.pointer_moved
+            new under = tile_at(sys.pointer_x(), sys.pointer_y())
+            if under < tiles
+                choose(under)
+        else if key is keys.left_down
+            new under = tile_at(sys.pointer_x(), sys.pointer_y())
+            if under < tiles
+                choose(under)
+                open(under)
+        else if key is keys.right or key is keys.down or key is keys.tab or key is 'd' as u32
             choose((chosen + 1) % tiles)
         else if key is keys.left or key is keys.up or key is 'a' as u32
             choose((chosen + tiles - 1) % tiles)

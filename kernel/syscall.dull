@@ -35,6 +35,8 @@ fixed call_surface u64 = 19
 fixed call_text u64 = 20
 fixed call_present u64 = 21
 fixed call_font u64 = 22
+fixed call_pointer u64 = 23
+fixed call_want_pointer u64 = 24
 
 fixed bad u64 = 0xFFFF_FFFF_FFFF_FFFF      -- -1
 fixed no_folder u64 = 0xFFFF_FFFF_FFFF_FFFE  -- -2
@@ -149,6 +151,11 @@ to answer (n u64, a u64, b u64, c u64, d u64, e u64) gives u64
         give 0
     if n is call_font
         give gui.font_size(a as u8)
+    if n is call_pointer
+        give gui.pointer()
+    if n is call_want_pointer
+        proc.me().pointer = a is not 0
+        give 0
     if n is call_procs
         if a >= proc.slots
             give bad

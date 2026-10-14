@@ -4,6 +4,7 @@
 use text
 use fb
 use fetch
+use cursor
 
 fixed margin u32 = 40
 
@@ -19,6 +20,7 @@ new hidden bool                -- an app's surface is in front: draw, but do not
 to show (x u32, y u32, w u32, h u32)
     if not hidden
         text.present(canvas, screen, x, y, w, h)
+        cursor.touched(x, y, w, h)
 
 to start (c ptr text.canvas, s ptr fb.screen)
     canvas = c

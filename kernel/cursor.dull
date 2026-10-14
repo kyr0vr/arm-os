@@ -1,0 +1,106 @@
+-- The mouse pointer, drawn straight onto the screen over whatever is shown there
+-- (an app's surface or the console). What it covers is still in that picture, so
+-- moving it just copies the old spot back from the picture and draws it again.
+
+use text
+use fb
+
+fixed shape_w u32 = 15
+fixed shape_h u32 = 23
+-- 'o' outline, 'x' fill, anything else clear
+fixed arrow [23] string = [
+    "o              ",
+    "oo             ",
+    "oxo            ",
+    "oxxo           ",
+    "oxxxo          ",
+    "oxxxxo         ",
+    "oxxxxxo        ",
+    "oxxxxxxo       ",
+    "oxxxxxxxo      ",
+    "oxxxxxxxxo     ",
+    "oxxxxxxxxxo    ",
+    "oxxxxxxxxxxo   ",
+    "oxxxxxxxxxxxo  ",
+    "oxxxxxxxxxxxxo ",
+    "oxxxxxxoooooooo",
+    "oxxxxxxo       ",
+    "oxxxoxxxo      ",
+    "oxxo oxxo      ",
+    "oxo  oxxxo     ",
+    "oo    oxxo     ",
+    "o     oxxxo    ",
+    "       oxxo    ",
+    "        oo     "]
+
+fixed fill_color u32 = 0xF4_EE_DE
+fixed edge_color u32 = 0x12_12_11
+
+new screen ptr fb.screen
+new source ptr text.canvas     -- the picture on the screen
+new x i64
+new y i64
+new visible bool               -- after the first mouse movement
+new buttons u8
+
+to start (s ptr fb.screen)
+    screen = s
+    x = (s.width / 2) as i64
+    y = (s.height / 2) as i64
+
+-- What is on the screen now (after a whole new picture was shown).
+to show_over (c ptr text.canvas)
+    source = c
+    draw()
+
+to put (px i64, py i64, color u32)
+    if px < 0 or py < 0 or px >= screen.width as i64 or py >= screen.height as i64
+        give
+    new v = color
+    if screen.order is not 0
+        v = (text.blue_of(color) << 16) | (text.green_of(color) << 8) | text.red_of(color)
+    screen.base[(py as u64) * (screen.pitch as u64) / 4 + (px as u64)] = v
+
+to draw
+    if not visible or screen as u64 is 0
+        give
+    for each row in 0 until shape_h as u64
+        new line = arrow[row]
+        for each col in 0 until shape_w as u64
+            new ch = line[col]
+            if ch is 'o'
+                put(x + col as i64, y + row as i64, edge_color)
+            else if ch is 'x'
+                put(x + col as i64, y + row as i64, fill_color)
+
+to erase
+    if not visible or source as u64 is 0 or x >= screen.width as i64 or y >= screen.height as i64
+        give
+    text.present(source, screen, x as u32, y as u32, shape_w, shape_h)
+
+to moved (dx i64, dy i64)
+    if screen as u64 is 0
+        give
+    erase()
+    x += dx
+    y += dy
+    if x < 0
+        x = 0
+    if y < 0
+        y = 0
+    if x >= screen.width as i64
+        x = (screen.width - 1) as i64
+    if y >= screen.height as i64
+        y = (screen.height - 1) as i64
+    visible = true
+    draw()
+
+-- Part of the screen was just redrawn from the picture: put the pointer back on top.
+to touched (rx u32, ry u32, rw u32, rh u32)
+    if not visible
+        give
+    if x + shape_w as i64 <= rx as i64 or y + shape_h as i64 <= ry as i64
+        give
+    if x >= (rx + rw) as i64 or y >= (ry + rh) as i64
+        give
+    draw()

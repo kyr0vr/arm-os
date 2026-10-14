@@ -1,0 +1,595 @@
+-- USB through xHCI, the standard USB host controller (QEMU's qemu-xhci, and the two
+-- Synopsys DWC3 controllers on the Pi 5's RP1 chip). Polled, no interrupts.
+--
+-- Bring-up: reset the controller, give it a device context table, a command ring
+-- and an event ring, start it. Then each connected root port is reset, and the
+-- device on it is enabled, addressed, asked for its descriptors and configured.
+-- Interfaces that are boot-protocol keyboards or mice get their interrupt endpoint
+-- set up, with one transfer always waiting on it; hid.dull reads the reports.
+-- (No hubs yet: devices have to be plugged straight into the computer.)
+
+use dma
+use timer
+use io
+use hid
+
+-- ---------------------------------------------------------------- shapes
+
+shape ring
+    base   u64                 -- CPU address of the TRBs
+    index  u32
+    cycle  u32
+    size   u32
+
+shape controller
+    base     u64               -- capability registers
+    op       u64               -- operational registers
+    rt       u64               -- runtime registers
+    db       u64               -- doorbells
+    ports    u32
+    slots    u32
+    ctx      u64               -- context size: 32 or 64 bytes
+    dcbaa    u64
+    commands ring
+    events   ring
+    erst     u64
+    -- the last command completion and control transfer result
+    cmd_done bool
+    cmd_code u32
+    cmd_slot u32
+    xfer_done bool
+    xfer_code u32
+    xfer_slot u32
+    xfer_left u32
+    changed  bool              -- a port changed (plugged / unplugged)
+
+shape endpoint
+    dci      u32               -- device context index (endpoint number * 2 + 1 for IN)
+    kind     u32               -- 1 keyboard, 2 mouse
+    mps      u32
+    xring    ring
+    buffer   u64
+
+shape usbdev
+    used     bool
+    c        u32               -- which controller
+    slot     u32
+    port     u32
+    speed    u32
+    ep0      ring
+    input    u64               -- input context
+    output   u64               -- device context
+    buffer   u64               -- 512 bytes for descriptors
+    eps      [2] endpoint
+    neps     u32
+
+fixed max_controllers u64 = 2
+fixed max_devices u64 = 8
+fixed ring_trbs u32 = 64
+
+new controllers [2] controller
+new ncontrollers u64
+new devices [8] usbdev
+new keyboards u32
+new mice u32
+
+-- ---------------------------------------------------------------- registers
+
+to rd (address u64) gives u32
+    give deref (address as ptr u32)
+
+to wr (address u64, v u32)
+    deref (address as ptr u32) = v
+
+to wr64 (address u64, v u64)
+    wr(address, (v & 0xFFFF_FFFF) as u32)
+    wr(address + 4, (v >> 32) as u32)
+
+to portsc (c ptr controller, port u32) gives u64
+    give c.op + 0x400 + ((port - 1) as u64) * 0x10
+
+to wait_us (us u64)
+    new start = timer.now()
+    new ticks = us * timer.frequency() / 1_000_000
+    hold until timer.now() - start >= ticks
+
+-- Wait until (register & mask) is `want`, up to `ms`.
+to wait_reg (address u64, mask u32, want u32, ms u64) gives bool
+    new start = timer.now()
+    new ticks = ms * timer.frequency() / 1000
+    repeat
+        if rd(address) & mask is want
+            give true
+        if timer.now() - start >= ticks
+            give false
+
+-- ---------------------------------------------------------------- rings
+
+to make_ring (r ptr ring, size u32) gives bool
+    r.base = dma.alloc((size as u64) * 16, 64)
+    if r.base is 0
+        give false
+    r.index = 0
+    r.cycle = 1
+    r.size = size
+    -- the last TRB links back to the start, flipping the cycle bit
+    new link = (r.base + ((size - 1) as u64) * 16) as ptr u32
+    new bus = dma.bus(r.base)
+    link[0] = (bus & 0xFFFF_FFFF) as u32
+    link[1] = (bus >> 32) as u32
+    link[2] = 0
+    link[3] = (6 << 10) | 2                                  -- Link, toggle cycle
+    give true
+
+-- Put a TRB on a ring; gives the device address of it.
+to push (r ptr ring, p u64, status u32, control u32) gives u64
+    new pos = r.base + (r.index as u64) * 16
+    new t = pos as ptr u32
+    t[0] = (p & 0xFFFF_FFFF) as u32
+    t[1] = (p >> 32) as u32
+    t[2] = status
+    dsb()
+    t[3] = control | r.cycle
+    r.index += 1
+    if r.index is r.size - 1
+        new link = (r.base + (r.index as u64) * 16) as ptr u32
+        link[3] = (link[3] & 0xFFFF_FFFE) | r.cycle
+        r.index = 0
+        r.cycle = r.cycle ^ 1
+    give dma.bus(pos)
+
+to ring_bell (c ptr controller, slot u32, target u32)
+    dsb()
+    wr(c.db + (slot as u64) * 4, target)
+
+-- ---------------------------------------------------------------- events
+
+-- Handle everything waiting on the event ring.
+to poll (c ptr controller)
+    new handled = false
+    repeat
+        new t = (c.events.base + (c.events.index as u64) * 16) as ptr u32
+        if t[3] & 1 is not c.events.cycle
+            stop
+        handled = true
+        new kind = (t[3] >> 10) & 0x3F
+        new code = t[2] >> 24
+        new slot = t[3] >> 24
+        if kind is 33                                         -- command completion
+            c.cmd_done = true
+            c.cmd_code = code
+            c.cmd_slot = slot
+        else if kind is 32                                    -- transfer
+            new dci = (t[3] >> 16) & 0x1F
+            if dci is 1
+                c.xfer_done = true
+                c.xfer_code = code
+                c.xfer_slot = slot
+                c.xfer_left = t[2] & 0xFF_FFFF
+            else
+                report(c, slot, dci, code, t[2] & 0xFF_FFFF)
+        else if kind is 34                                    -- port status change
+            c.changed = true
+        c.events.index += 1
+        if c.events.index is c.events.size
+            c.events.index = 0
+            c.events.cycle = c.events.cycle ^ 1
+    if handled
+        new pos = c.events.base + (c.events.index as u64) * 16
+        wr64(c.rt + 0x38, dma.bus(pos) | 8)                     -- ERDP, clear "busy"
+
+to command (c ptr controller, p u64, control u32) gives bool
+    c.cmd_done = false
+    push(addr of c.commands, p, 0, control)
+    ring_bell(c, 0, 0)
+    new start = timer.now()
+    new ticks = timer.frequency() / 2
+    while not c.cmd_done
+        poll(c)
+        if timer.now() - start > ticks
+            give false
+    give c.cmd_code is 1
+
+-- ---------------------------------------------------------------- the controller
+
+to start_controller (c ptr controller, base u64) gives bool
+    c.base = base
+    new caplength = rd(base) & 0xFF
+    c.op = base + caplength as u64
+    c.rt = base + (rd(base + 0x18) & 0xFFFF_FFE0) as u64
+    c.db = base + (rd(base + 0x14) & 0xFFFF_FFFC) as u64
+    new params1 = rd(base + 0x04)
+    c.slots = params1 & 0xFF
+    if c.slots > 16
+        c.slots = 16
+    c.ports = params1 >> 24
+    c.ctx = 32
+    if rd(base + 0x10) & 4 is not 0
+        c.ctx = 64
+    -- stop and reset
+    wr(c.op, rd(c.op) & 0xFFFF_FFFE)
+    if not wait_reg(c.op + 4, 1, 1, 100)
+        io.line("usb: the controller would not stop")
+        give false
+    wr(c.op, 2)
+    if not wait_reg(c.op, 2, 0, 1000) or not wait_reg(c.op + 4, 0x800, 0, 1000)
+        io.line("usb: the controller did not come out of reset")
+        give false
+    wr(c.op + 0x38, c.slots)                                 -- slots enabled
+    -- the device context table, with scratchpad pages if the controller wants them
+    c.dcbaa = dma.alloc(((c.slots + 1) as u64) * 8, 64)
+    new params2 = rd(base + 0x08)
+    new scratch = (((params2 >> 21) & 0x1F) << 5) | (params2 >> 27)
+    if scratch > 0
+        new list = dma.alloc((scratch as u64) * 8, 64)
+        new l = list as ptr u64
+        for each i in 0 until scratch as u64
+            l[i] = dma.bus(dma.alloc(4096, 4096))
+        deref (c.dcbaa as ptr u64) = dma.bus(list)
+    wr64(c.op + 0x30, dma.bus(c.dcbaa))
+    -- command ring
+    if not make_ring(addr of c.commands, ring_trbs)
+        give false
+    wr64(c.op + 0x18, dma.bus(c.commands.base) | 1)
+    -- event ring: one segment, no link TRB
+    c.events.base = dma.alloc((ring_trbs as u64) * 16, 64)
+    c.events.index = 0
+    c.events.cycle = 1
+    c.events.size = ring_trbs
+    c.erst = dma.alloc(16, 64)
+    new e = c.erst as ptr u64
+    e[0] = dma.bus(c.events.base)
+    e[1] = ring_trbs as u64
+    wr(c.rt + 0x28, 1)                                       -- ERSTSZ
+    wr64(c.rt + 0x38, dma.bus(c.events.base))                 -- ERDP
+    wr64(c.rt + 0x30, dma.bus(c.erst))                        -- ERSTBA
+    -- run
+    wr(c.op, rd(c.op) | 1)
+    if not wait_reg(c.op + 4, 1, 0, 100)
+        io.line("usb: the controller would not start")
+        give false
+    give true
+
+-- ---------------------------------------------------------------- ports and devices
+
+fixed speed_names [5] string = ["?", "full", "low", "high", "super"]
+
+to reset_port (c ptr controller, port u32) gives bool
+    new reg = portsc(c, port)
+    new v = rd(reg)
+    if v & 1 is 0
+        give false                                           -- nothing connected
+    if v & 2 is 0
+        -- USB 2 ports need a reset to be enabled (USB 3 ones train by themselves)
+        wr(reg, (v & 0x0E00_C3E0) | 0x10)
+        if not wait_reg(reg, 0x20_0000, 0x20_0000, 500)
+            give false
+        wait_us(10_000)
+    v = rd(reg)
+    wr(reg, (v & 0x0E00_C3E0) | 0x00FE_0000)                 -- clear the change bits
+    give rd(reg) & 2 is not 0
+
+-- A control transfer on a device's endpoint 0. `buffer` is CPU memory in the DMA pool.
+to control (d ptr usbdev, request_type u32, request u32, value u32, index u32, length u32, buffer u64) gives bool
+    new c = addr of controllers[d.c]
+    new setup = (request_type as u64) | ((request as u64) << 8) | ((value as u64) << 16) | ((index as u64) << 32) | ((length as u64) << 48)
+    new data_in = request_type & 0x80 is not 0
+    new trt u32 = 0
+    if length > 0 and data_in
+        trt = 3
+    else if length > 0
+        trt = 2
+    push(addr of d.ep0, setup, 8, (2 << 10) | (1 << 6) | (trt << 16))
+    if length > 0
+        new dir u32 = 0
+        if data_in
+            dir = 1 << 16
+        push(addr of d.ep0, dma.bus(buffer), length, (3 << 10) | dir)
+    new status_dir u32 = 1 << 16
+    if length > 0 and data_in
+        status_dir = 0
+    c.xfer_done = false
+    push(addr of d.ep0, 0, 0, (4 << 10) | (1 << 5) | status_dir)
+    ring_bell(c, d.slot, 1)
+    new start = timer.now()
+    new ticks = timer.frequency() / 2
+    while not c.xfer_done or c.xfer_slot is not d.slot
+        poll(c)
+        if timer.now() - start > ticks
+            give false
+    give c.xfer_code is 1 or c.xfer_code is 13
+
+to slot_context (d ptr usbdev, entries u32) gives ptr u32
+    new c = addr of controllers[d.c]
+    new s = (d.input + c.ctx) as ptr u32
+    s[0] = (entries << 27) | (d.speed << 20)
+    s[1] = d.port << 16
+    s[2] = 0
+    s[3] = 0
+    give s
+
+to ep_context (d ptr usbdev, dci u32) gives ptr u32
+    new c = addr of controllers[d.c]
+    give (d.input + c.ctx * (1 + dci as u64)) as ptr u32
+
+to set_ring (e ptr u32, r ptr ring)
+    new p = dma.bus(r.base) | 1
+    e[2] = (p & 0xFFFF_FFFF) as u32
+    e[3] = (p >> 32) as u32
+
+to clear_input (d ptr usbdev)
+    new c = addr of controllers[d.c]
+    new q = d.input as ptr u8
+    for each i in 0 until c.ctx * 33
+        q[i] = 0
+
+-- Give the device on `port` a slot and an address, read its descriptors and set up
+-- any keyboard or mouse on it.
+to attach (ci u64, port u32) gives bool
+    new c = addr of controllers[ci]
+    new free u64 = max_devices
+    for each i in 0 until max_devices
+        if not devices[i].used
+            free = i
+            stop
+    if free is max_devices
+        give false
+    new d = addr of devices[free]
+    d.c = ci as u32
+    d.port = port
+    d.speed = (rd(portsc(c, port)) >> 10) & 0xF
+    d.neps = 0
+    if not command(c, 0, 9 << 10)                            -- Enable Slot
+        io.line("usb: no slot for a new device")
+        give false
+    d.slot = c.cmd_slot
+    if d.input is 0
+        d.input = dma.alloc(c.ctx * 33, 64)
+        d.output = dma.alloc(c.ctx * 32, 64)
+        d.buffer = dma.alloc(512, 64)
+    else
+        new q = d.output as ptr u8
+        for each i in 0 until c.ctx * 32
+            q[i] = 0
+    if not make_ring(addr of d.ep0, ring_trbs)
+        give false
+    new table = c.dcbaa as ptr u64
+    table[d.slot as u64] = dma.bus(d.output)
+    -- Address Device: slot context and endpoint 0
+    new mps0 u32 = 8
+    if d.speed is 3
+        mps0 = 64
+    else if d.speed >= 4
+        mps0 = 512
+    clear_input(d)
+    new ctl = d.input as ptr u32
+    ctl[1] = 3                                               -- add slot and endpoint 0
+    slot_context(d, 1)
+    new e = ep_context(d, 1)
+    e[1] = (3 << 1) | (4 << 3) | (mps0 << 16)               -- 3 retries, control
+    set_ring(e, addr of d.ep0)
+    e[4] = 8
+    if not command(c, dma.bus(d.input), (11 << 10) | (d.slot << 24))
+        io.print("usb: port ")
+        io.print_u64(port as u64)
+        io.line(": the device did not take an address")
+        give false
+    d.used = true
+    -- the first 8 bytes of the device descriptor tell endpoint 0's real packet size
+    if not control(d, 0x80, 6, 0x100, 0, 8, d.buffer)
+        io.line("usb: could not read a device descriptor")
+        give false
+    new b = d.buffer as ptr u8
+    new real = b[7] as u32
+    if d.speed >= 4
+        real = 1 << real
+    if real is not mps0 and real >= 8
+        clear_input(d)
+        ctl[1] = 2
+        e[1] = (3 << 1) | (4 << 3) | (real << 16)
+        command(c, dma.bus(d.input), (13 << 10) | (d.slot << 24))   -- Evaluate Context
+    if not control(d, 0x80, 6, 0x100, 0, 18, d.buffer)
+        give false
+    new vendor = (b[8] as u32) | ((b[9] as u32) << 8)
+    new product = (b[10] as u32) | ((b[11] as u32) << 8)
+    io.print("usb: port ")
+    io.print_u64(port as u64)
+    io.print(": ")
+    io.print(speed_names[d.speed % 5])
+    io.print(" speed device ")
+    hex4(vendor)
+    io.print(":")
+    hex4(product)
+    io.line("")
+    give configure(d)
+
+to hex4 (v u32)
+    for each k in 0 until 4
+        new d = (v >> ((12 - k * 4) as u32)) & 0xF
+        if d < 10
+            io.put('0' + d as u8)
+        else
+            io.put('a' + (d - 10) as u8)
+
+to read_u16 (b ptr u8, pos u64) gives u32
+    give (b[pos] as u32) | ((b[pos + 1] as u32) << 8)
+
+-- Read the configuration, find keyboards and mice, set up their endpoints.
+to configure (d ptr usbdev) gives bool
+    new c = addr of controllers[d.c]
+    new b = d.buffer as ptr u8
+    if not control(d, 0x80, 6, 0x200, 0, 9, d.buffer)
+        give false
+    new total = read_u16(b, 2)
+    if total > 512
+        total = 512
+    new config_value = b[5] as u32
+    if not control(d, 0x80, 6, 0x200, 0, total, d.buffer)
+        give false
+    -- walk the descriptors
+    new pos u64 = 0
+    new kind u32 = 0
+    new iface u32 = 0
+    new interfaces [2] u32
+    while pos + 2 <= total as u64
+        new length = b[pos] as u64
+        if length < 2
+            stop
+        new type = b[pos + 1]
+        if type is 4                                         -- interface
+            kind = 0
+            iface = b[pos + 2] as u32
+            if b[pos + 5] is 3 and b[pos + 6] is 1 and (b[pos + 7] is 1 or b[pos + 7] is 2)
+                kind = b[pos + 7] as u32
+        else if type is 5 and kind is not 0 and d.neps < 2   -- endpoint of a keyboard or mouse
+            new address = b[pos + 2]
+            if address & 0x80 is not 0 and b[pos + 3] & 3 is 3
+                new ep = addr of d.eps[d.neps as u64]
+                ep.dci = ((address & 0xF) as u32) * 2 + 1
+                ep.kind = kind
+                ep.mps = read_u16(b, pos + 4) & 0x7FF
+                new interval = b[pos + 6] as u32
+                -- xHCI wants the interval as 2^n x 125 us
+                new n u32 = 3
+                if d.speed is 1 or d.speed is 2
+                    while (1 << (n - 3)) < interval and n < 10
+                        n += 1
+                else if interval > 0
+                    n = interval - 1
+                new size = ep.mps as u64
+                if size < 64
+                    size = 64
+                ep.buffer = dma.alloc(size, 64)
+                if not make_ring(addr of ep.xring, ring_trbs)
+                    give false
+                interfaces[d.neps as u64] = iface
+                d.neps += 1
+                -- remember the interval in the context below
+                ep.mps = ep.mps | (n << 16)
+                kind = 0
+        pos += length
+    if d.neps is 0
+        io.line("usb:   (not a keyboard or mouse)")
+        give true
+    -- Configure Endpoint
+    clear_input(d)
+    new ctl = d.input as ptr u32
+    ctl[1] = 1
+    new top u32 = 1
+    for each i in 0 until d.neps as u64
+        new ep = addr of d.eps[i]
+        ctl[1] = ctl[1] | (1 << ep.dci)
+        if ep.dci > top
+            top = ep.dci
+        new e = ep_context(d, ep.dci)
+        new interval = ep.mps >> 16
+        ep.mps = ep.mps & 0xFFFF
+        e[0] = interval << 16
+        e[1] = (3 << 1) | (7 << 3) | (ep.mps << 16)            -- interrupt IN
+        set_ring(e, addr of ep.xring)
+        e[4] = ep.mps | (ep.mps << 16)
+    slot_context(d, top)
+    if not command(c, dma.bus(d.input), (12 << 10) | (d.slot << 24))
+        io.line("usb: the controller refused the endpoints")
+        give false
+    if not control(d, 0x00, 9, config_value, 0, 0, 0)           -- SET_CONFIGURATION
+        give false
+    for each i in 0 until d.neps as u64
+        new ep = addr of d.eps[i]
+        control(d, 0x21, 0x0B, 0, interfaces[i], 0, 0)           -- SET_PROTOCOL: boot
+        control(d, 0x21, 0x0A, 0, interfaces[i], 0, 0)           -- SET_IDLE: only on change
+        io.print("usb:   ")
+        if ep.kind is 1
+            io.line("keyboard ready")
+            keyboards += 1
+        else
+            io.line("mouse ready")
+            mice += 1
+        queue(d, ep)
+    give true
+
+-- Keep one transfer waiting on an interrupt endpoint.
+to queue (d ptr usbdev, ep ptr endpoint)
+    new c = addr of controllers[d.c]
+    push(addr of ep.xring, dma.bus(ep.buffer), ep.mps, (1 << 10) | (1 << 5) | (1 << 2))
+    ring_bell(c, d.slot, ep.dci)
+
+-- A report arrived (from `poll`).
+to report (c ptr controller, slot u32, dci u32, code u32, left u32)
+    for each i in 0 until max_devices
+        new d = addr of devices[i]
+        if not d.used or d.slot is not slot or addr of controllers[d.c as u64] is not c
+            skip
+        for each k in 0 until d.neps as u64
+            new ep = addr of d.eps[k]
+            if ep.dci is not dci
+                skip
+            if code is 1 or code is 13
+                new got = ep.mps - left
+                hid.report(i as u32, ep.kind, ep.buffer as ptr u8, got as u64)
+            queue(d, ep)
+            give
+
+-- Ports with something plugged in that has no device yet.
+to scan (ci u64)
+    new c = addr of controllers[ci]
+    for each p in 1 until c.ports + 1
+        new taken = false
+        for each i in 0 until max_devices
+            if devices[i].used and devices[i].c as u64 is ci and devices[i].port is p
+                taken = true
+        new v = rd(portsc(c, p))
+        if taken
+            if v & 1 is 0
+                forget(ci, p)
+            skip
+        if v & 1 is 0
+            if v & 0x00FE_0000 is not 0
+                wr(portsc(c, p), (v & 0x0E00_C3E0) | 0x00FE_0000)
+            skip
+        if reset_port(c, p)
+            attach(ci, p)
+
+to forget (ci u64, port u32)
+    for each i in 0 until max_devices
+        new d = addr of devices[i]
+        if d.used and d.c as u64 is ci and d.port is port
+            io.print("usb: port ")
+            io.print_u64(port as u64)
+            io.line(": unplugged")
+            for each k in 0 until d.neps as u64
+                if d.eps[k].kind is 1
+                    keyboards -= 1
+                else
+                    mice -= 1
+            d.used = false
+            command(addr of controllers[ci], 0, (10 << 10) | (d.slot << 24))   -- Disable Slot
+
+-- ---------------------------------------------------------------- the outside
+
+-- Start the controller pos `base` and set up what is plugged into it.
+to add (base u64) gives bool
+    if ncontrollers is max_controllers or not dma.init()
+        give false
+    new c = addr of controllers[ncontrollers]
+    if not start_controller(c, base)
+        give false
+    io.print("usb: xHCI at ")
+    io.print_hex(base)
+    io.print(", ")
+    io.print_u64(c.ports as u64)
+    io.line(" ports")
+    ncontrollers += 1
+    wait_us(50_000)                                          -- let ports see their devices
+    scan(ncontrollers - 1)
+    give true
+
+-- Called every tick: reports, and plugging in or out.
+to tick
+    for each i in 0 until ncontrollers
+        new c = addr of controllers[i]
+        poll(c)
+        if c.changed
+            c.changed = false
+            scan(i)
+    hid.tick()

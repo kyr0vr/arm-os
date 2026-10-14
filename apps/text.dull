@@ -210,12 +210,57 @@ to go_up gives bool
     load_folder()
     give true
 
+-- The row of the list under (x, y), or `count` for none.
+to row_at (x u32, y u32) gives u64
+    if y < list_y or x < margin - 20 or x > gfx.width - margin + 20
+        give count
+    new r = ((y - list_y) / row_h) as u64
+    if r >= list_rows as u64 or list_top + r >= count
+        give count
+    give list_top + r
+
+-- Open the selected entry: a folder, or a file to read.
+to open_selected
+    if selected >= count
+        give
+    new p line.line
+    child_path(selected, addr of p)
+    if is_dir[selected]
+        line.clear(addr of folder)
+        line.add(addr of folder, line.text(addr of p))
+        load_folder()
+    else
+        read(addr of p, sizes[selected] as u64)
+    draw_list()
+
 -- The list: gives false when it is time to leave the app.
 to browse gives bool
     draw_list()
     repeat
         new k = keys.next()
-        if k is keys.down or k is 'j' as u32
+        if k is keys.pointer_moved
+            new r = row_at(sys.pointer_x(), sys.pointer_y())
+            if r < count and r is not selected
+                selected = r
+                draw_list()
+        else if k is keys.left_down
+            new r = row_at(sys.pointer_x(), sys.pointer_y())
+            if r < count
+                selected = r
+                open_selected()
+        else if k is keys.right_down
+            if not go_up()
+                give false
+            draw_list()
+        else if k is keys.wheel_down
+            if selected + 1 < count
+                selected += 1
+                draw_list()
+        else if k is keys.wheel_up
+            if selected > 0
+                selected -= 1
+                draw_list()
+        else if k is keys.down or k is 'j' as u32
             if selected + 1 < count
                 selected += 1
                 draw_list()
@@ -230,16 +275,7 @@ to browse gives bool
             selected = count - 1
             draw_list()
         else if k is keys.enter or k is keys.right
-            if selected < count
-                new p line.line
-                child_path(selected, addr of p)
-                if is_dir[selected]
-                    line.clear(addr of folder)
-                    line.add(addr of folder, line.text(addr of p))
-                    load_folder()
-                else
-                    read(addr of p, sizes[selected] as u64)
-                draw_list()
+            open_selected()
         else if k is keys.backspace or k is keys.left
             if go_up()
                 draw_list()
@@ -399,7 +435,18 @@ to read (path ptr line.line, size u64)
         new end_top u64 = 0
         if line_count() > rows
             end_top = line_count() - rows
-        if k is keys.down or k is 'j' as u32 or k is keys.enter
+        if k is keys.pointer_moved or k is keys.left_down or k is keys.left_up or k is keys.right_up
+            skip
+        if k is keys.wheel_down
+            top += 3
+        else if k is keys.wheel_up
+            if top > 3
+                top -= 3
+            else
+                top = 0
+        else if k is keys.right_down
+            give
+        else if k is keys.down or k is 'j' as u32 or k is keys.enter
             top += 1
         else if k is keys.up or k is 'k' as u32
             if top > 0
@@ -428,6 +475,7 @@ to main gives u64
     if not gfx.open()
         sys.print("text: no screen\n")
         give 1
+    sys.want_pointer(true)
     load_folder()
     while browse()
         skip

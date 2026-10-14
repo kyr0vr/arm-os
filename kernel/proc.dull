@@ -19,6 +19,7 @@ use timer
 use line
 use fat
 use tty
+use xhci
 
 elsewhere to arch_resume (frame ptr u64)
 elsewhere to arch_idle_entry gives u64
@@ -65,6 +66,7 @@ shape process
     ticks      u64
     key_timeout bool                   -- waiting for a key, but only until wake_at
     surface    u64                     -- physical address of its screen surface, 0 if none
+    pointer    bool                    -- wants pointer events with its keys
     rank       u64                     -- foreground order: the highest live one is in front
     name       line.line
     args       line.line
@@ -79,8 +81,16 @@ new switches u64
 new ranks u64
 new front_changed bool                 -- kernel/gui.dull should look again at what is in front
 
--- Keys typed but not yet read.
-new keys [1024] u8
+-- Keys typed but not yet read, and pointer events (codes from 0x100 up).
+new keys [1024] u16
+
+fixed pointer_moved u16 = 0x200
+fixed left_down u16 = 0x201
+fixed left_up u16 = 0x202
+fixed right_down u16 = 0x203
+fixed right_up u16 = 0x204
+fixed wheel_up u16 = 0x205
+fixed wheel_down u16 = 0x206
 new keys_head u64
 new keys_count u64
 
@@ -285,6 +295,7 @@ to spawn (name string, args string, parent u32, foreground bool) gives u32
     p.exit_code = 0
     p.key_timeout = false
     p.surface = 0
+    p.pointer = false
     p.rank = 0
     if foreground
         ranks += 1
@@ -367,10 +378,10 @@ to tick (frame ptr u64) gives ptr u64
         table[current].ticks += 1
     repeat
         new k = board.poll_key(keys_count is 0 and someone_wants_key()) else stop
-        if keys_count < 1024
-            keys[(keys_head + keys_count) % 1024] = k
-            keys_count += 1
+        push_key(k)
         deliver_keys()
+    xhci.tick()
+    deliver_keys()
     new now = timer.now()
     for each i in 1 until slots
         if table[i].state is asleep and now >= table[i].wake_at
@@ -387,17 +398,31 @@ to tick (frame ptr u64) gives ptr u64
         give switch_to(pick())
     give frame
 
--- Hand waiting keys to a process that wants one.
+to push_key (k u8)
+    push_event(k as u16)
+
+-- Queue a key or pointer event (pointer movements in a row become one).
+to push_event (e u16)
+    if e is pointer_moved and keys_count > 0 and keys[(keys_head + keys_count - 1) % 1024] is e
+        give
+    if keys_count < 1024
+        keys[(keys_head + keys_count) % 1024] = e
+        keys_count += 1
+
+-- Hand waiting keys to the front-most process that wants one. Pointer events only
+-- go to apps that asked for them.
 to deliver_keys
     while keys_count > 0
         new who u64 = 0
         for each i in 1 until slots
-            if table[i].state is wants_key
+            if table[i].state is wants_key and (who is 0 or table[i].rank > table[who].rank)
                 who = i
-                stop
         if who is 0
             give
-        table[who].frame[0] = take_key() as u64
+        new k = take_key()
+        if k >= 0x100 and not table[who].pointer
+            skip
+        table[who].frame[0] = k as u64
         table[who].state = ready
         table[who].key_timeout = false
 
@@ -407,7 +432,7 @@ to someone_wants_key gives bool
             give true
     give false
 
-to take_key gives u8
+to take_key gives u16
     new k = keys[keys_head]
     keys_head = (keys_head + 1) % 1024
     keys_count -= 1

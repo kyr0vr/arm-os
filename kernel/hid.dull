@@ -1,0 +1,154 @@
+-- USB keyboards and mice (HID boot protocol), from the reports xhci.dull reads.
+--
+-- A keyboard report holds the modifier keys and up to six keys held down; keys
+-- that are new since the last report are presses. They become the same bytes a
+-- serial terminal sends (arrows as ESC [ A and so on), so apps cannot tell the two
+-- apart. A held key repeats after half a second. A mouse report holds the buttons
+-- and how far it moved; that moves the pointer and becomes pointer events.
+
+use proc
+use cursor
+use timer
+use board
+
+-- US layout, usages 0x04-0x38: without and with shift.
+fixed plain string = "abcdefghijklmnopqrstuvwxyz1234567890\r\x1b\x08\t -=[]\\#;'`,./"
+fixed shifted string = "ABCDEFGHIJKLMNOPQRSTUVWXYZ!@#$%^&*()\r\x1b\x08\t _+{}|~:\"~<>?"
+fixed keypad string = "/*-+\r1234567890."              -- usages 0x54-0x63
+
+fixed max_devices u64 = 8
+new held_keys [48] u8          -- 6 per unit: what each keyboard held in its last report
+new caps bool
+new repeat_usage u8
+new repeat_mods u8
+new repeat_at u64
+new last_buttons u8
+
+fixed delay_ms u64 = 500
+fixed rate_ms u64 = 33
+
+to report (unit u32, kind u32, data ptr u8, length u64)
+    if kind is 1 and length >= 8
+        keyboard(unit as u64, data)
+    else if kind is 2 and length >= 3
+        mouse(data, length)
+
+to keyboard (unit u64, data ptr u8)
+    if data[2] is 1                                     -- too many keys at once
+        give
+    new mods = data[0]
+    new before = addr of held_keys[unit * 6]
+    for each k in 2 until 8 as u64
+        new u = data[k]
+        if u < 4
+            skip
+        new was = false
+        for each j in 0 until 6 as u64
+            if before[j] is u
+                was = true
+        if not was
+            press(u, mods)
+    -- the repeating key was let go?
+    new still = false
+    for each k in 2 until 8 as u64
+        if data[k] is repeat_usage
+            still = true
+    if not still
+        repeat_usage = 0
+    repeat_mods = mods
+    for each j in 0 until 6 as u64
+        before[j] = data[2 + j]
+
+to press (u u8, mods u8)
+    if u is 0x45                                        -- F12: a screenshot (QEMU only)
+        board.snapshot_key()
+        give
+    if u is 0x39                                        -- Caps Lock
+        caps = not caps
+        give
+    emit(u, mods)
+    repeat_usage = u
+    repeat_mods = mods
+    repeat_at = timer.now() + delay_ms * timer.frequency() / 1000
+
+to send (s string)
+    for each c in s
+        proc.push_key(c)
+
+to emit (u u8, mods u8)
+    new shift = mods & 0x22 is not 0
+    new ctrl = mods & 0x11 is not 0
+    if u >= 0x04 and u <= 0x38
+        new i = (u - 0x04) as u64
+        new c = plain[i]
+        if u <= 0x1D
+            if shift is not caps
+                c = shifted[i]
+            if ctrl
+                c = plain[i] & 0x1F
+        else if shift
+            c = shifted[i]
+        proc.push_key(c)
+    else if u >= 0x54 and u <= 0x63
+        proc.push_key(keypad[(u - 0x54) as u64])
+    else if u is 0x4F
+        send("\x1b[C")
+    else if u is 0x50
+        send("\x1b[D")
+    else if u is 0x51
+        send("\x1b[B")
+    else if u is 0x52
+        send("\x1b[A")
+    else if u is 0x4A
+        send("\x1b[H")
+    else if u is 0x4D
+        send("\x1b[F")
+    else if u is 0x4B
+        send("\x1b[5~")
+    else if u is 0x4E
+        send("\x1b[6~")
+    else if u is 0x4C
+        send("\x1b[3~")
+
+-- Mouse buttons and movement. Byte 0: buttons, 1 and 2: movement, 3 (if sent): wheel.
+to mouse (data ptr u8, length u64)
+    new buttons = data[0] & 7
+    new dx = signed(data[1])
+    new dy = signed(data[2])
+    if dx is not 0 or dy is not 0
+        cursor.moved(dx, dy)
+        proc.push_event(proc.pointer_moved)
+    new changed = buttons ^ last_buttons
+    if changed & 1 is not 0
+        if buttons & 1 is not 0
+            proc.push_event(proc.left_down)
+        else
+            proc.push_event(proc.left_up)
+    if changed & 2 is not 0
+        if buttons & 2 is not 0
+            proc.push_event(proc.right_down)
+        else
+            proc.push_event(proc.right_up)
+    last_buttons = buttons
+    cursor.buttons = buttons
+    if length >= 4
+        new wheel = signed(data[3])
+        if wheel > 0
+            proc.push_event(proc.wheel_up)
+        else if wheel < 0
+            proc.push_event(proc.wheel_down)
+
+to signed (b u8) gives i64
+    new v = b as i64
+    if v >= 128
+        v -= 256
+    give v
+
+-- Key repeat (from xhci.tick).
+to tick
+    if repeat_usage is 0
+        give
+    new now = timer.now()
+    if now >= repeat_at
+        emit(repeat_usage, repeat_mods)
+        repeat_at = now + rate_ms * timer.frequency() / 1000

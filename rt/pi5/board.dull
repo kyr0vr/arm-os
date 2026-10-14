@@ -46,6 +46,92 @@ to disk_name (l ptr line.line)
         line.number(l, sdhci.failed_at as u64)
         line.byte(l, ')')
 
+-- ---------------------------------------------------------------- USB, on RP1
+--
+-- The USB ports belong to RP1, the Pi 5's I/O chip, which hangs off the SoC's third
+-- PCIe controller. With `pciex4_reset=0` in config.txt the firmware leaves that link
+-- as it set it up; we read back where it put things: the CPU's window onto the link,
+-- and RP1's register block inside it (found by its chip ID). RP1's two USB controllers
+-- (Synopsys DWC3, which are xHCI controllers) sit at +0x20_0000 and +0x30_0000 in
+-- that block; each drives one USB 3 and one USB 2 port.
+
+fixed pcie u64 = 0x10_0012_0000
+fixed rp1_id u32 = 0x2000_1927
+
+new rp1 u64                    -- CPU address of RP1's registers
+
+new rp1_checked bool
+new rp1_ok bool
+new inbound u64                -- what RAM address 0 looks like from RP1 (PCIe bus address)
+
+to reg (address u64) gives u32
+    give deref (address as ptr u32)
+
+to check_rp1
+    rp1_checked = true
+    new status = reg(pcie + 0x4068)
+    if status & 0x30 is not 0x30
+        io.line("usb: the PCIe link to RP1 is down (is pciex4_reset=0 in config.txt?)")
+        give
+    -- inbound window: where devices on the link see RAM
+    new bar_lo = reg(pcie + 0x4034)
+    new bar_hi = reg(pcie + 0x4038)
+    new remap_lo = reg(pcie + 0x40B4)
+    new remap_hi = reg(pcie + 0x40B8)
+    new bus = ((bar_hi as u64) << 32) | ((bar_lo & 0xFFFF_FFE0) as u64)
+    new cpu = ((remap_hi as u64) << 32) | ((remap_lo & 0xFFFF_F000) as u64)
+    if bar_lo & 0x1F is 0
+        bus = 0x10_0000_0000                  -- not set: what Linux uses
+        cpu = 0
+    inbound = bus - cpu
+    -- outbound window: CPU addresses [window, window_end) reach PCIe address bus_base
+    new bus_base = ((reg(pcie + 0x4010) as u64) << 32) | reg(pcie + 0x400C) as u64
+    new base_limit = reg(pcie + 0x4070)
+    new base_mb = ((reg(pcie + 0x4080) as u64) << 12) | ((base_limit >> 4) & 0xFFF) as u64
+    new limit_mb = ((reg(pcie + 0x4084) as u64) << 12) | (base_limit >> 20) as u64
+    new window = base_mb << 20
+    new window_end = (limit_mb + 1) << 20
+    -- RP1's register block starts with its chip ID; look for it in 4 MB steps
+    new step u64 = 0x40_0000
+    new k u64 = 0
+    while window + k * step < window_end
+        if reg(window + k * step) is rp1_id
+            rp1 = window + k * step
+            rp1_ok = true
+            stop
+        k += 1
+    if not rp1_ok
+        io.line("usb: RP1 not found in the PCIe window")
+        give
+    io.print("usb: RP1 at ")
+    io.print_hex(rp1)
+    io.print(" (PCIe bus ")
+    io.print_hex(bus_base + (rp1 - window))
+    io.line(")")
+
+to usb_controller (n u64) gives u64
+    if not rp1_checked
+        check_rp1()
+    if not rp1_ok or n >= 2
+        give 0
+    give rp1 + 0x20_0000 + n * 0x10_0000
+
+-- DWC3: make it a host (it can also be a USB device), and keep its PHYs awake.
+to usb_prepare (base u64)
+    new gctl = (base + 0xC110) as ptr u32
+    deref gctl = (deref gctl & 0xFFFF_CFFF) | 0x1000            -- port capability: host
+    new usb2 = (base + 0xC200) as ptr u32
+    deref usb2 = deref usb2 & 0xFFFF_FFBF                        -- no PHY suspend
+    new usb3 = (base + 0xC2C0) as ptr u32
+    deref usb3 = deref usb3 & 0xFFFD_FFFF
+
+to dma_offset gives u64
+    give inbound
+
+-- Screenshots are a QEMU thing.
+to snapshot_key
+    give
+
 -- New-style revision codes (bit 23 set): type in bits 4-11, processor 12-15, memory 20-22.
 to host_name (l ptr line.line)
     new t = (revision >> 4) & 0xFF
@@ -123,6 +209,8 @@ to memory_kind (g u64) gives u8
         give 1                        -- up to 8 GB of RAM
     if g >= 64 and g < 68
         give 2                        -- 0x10_0000_0000: the SoC's peripherals
+    if g >= 68 and g < 128
+        give 2                        -- up to 0x20_0000_0000: PCIe windows (RP1)
     give 0
 
 -- Hand the page allocator the RAM nobody else is using (before the MMU is on).

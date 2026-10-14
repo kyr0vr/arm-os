@@ -62,6 +62,21 @@ to yield
 to time gives u64
     give call(5, 0, 0, 0, 0, 0)
 
+-- ---------------------------------------------------------------- the pointer
+
+-- Ask for pointer events (movement, buttons, wheel) along with keys.
+to want_pointer (wanted bool)
+    new v u64 = 0
+    if wanted
+        v = 1
+    call(24, v, 0, 0, 0, 0)
+
+to pointer_x gives u32
+    give (call(23, 0, 0, 0, 0, 0) & 0xFFFF) as u32
+
+to pointer_y gives u32
+    give ((call(23, 0, 0, 0, 0, 0) >> 16) & 0xFFFF) as u32
+
 -- ---------------------------------------------------------------- facts
 
 fixed info_memory u64 = 0

@@ -6,6 +6,7 @@ use pages
 use line
 use fb
 use virtio
+use pci
 
 elsewhere new __stack_top u8
 
@@ -14,14 +15,58 @@ fixed gic_cpu  u64 = 0x0801_0000
 fixed cores u64 = 4
 fixed ram_end u64 = 0x4700_0000       -- RAM from 0x4000_0000; the pretend screen sits above this
 
--- The apps read these keys (the launcher, the text reader, then the shell); once
--- they have run out and nothing is left to do, the test is over (there is no
--- keyboard in the test).
-fixed script string = "\x02\x1b[C\r1\x03\x1b[B\x1b[B\x1b[B\x1b[B\r\x04  G\x05q\x1b[H\r\x1b[B\r\x07q\x08qq4help\nmem\nuptime\ncpu\necho hello from armos\nnot-a-command\nhelp\nhelp\necho the console scrolled\ndisk\nls\nls docs\ncat hello.txt\ncat a longer file name.txt\ncat docs/notes.txt\ncat big.txt\ncat nope.txt\nhello one two three\nps\nspin a 3 &\nspin b 3 &\nps\nsleep 2000\ncrash\necho the shell is still here\napps/hello.app from the SD card\n\x06exit\n"
+-- Scripted keys from build/kernel_virt/keys.txt (written by tests/kernel_test.py),
+-- read by the apps; once they have run out and nothing is left to do, the run is
+-- over. Without that file the run is interactive: keys come from a USB keyboard and
+-- it never ends by itself.
+new script [16384] u8
+new script_len u64
+new interactive bool           -- no key file: keys only ever come from USB
 new script_pos u64
 
 to probe
+    load_script()
+    pci.setup(0x3F00_0000, 0x1000_0000, 0x2EFF_0000)
+
+-- USB: xHCI controllers on the PCIe bus (QEMU: -device qemu-xhci).
+to usb_controller (n u64) gives u64
+    give pci.find(0x0C_0330, n as u32)
+
+to usb_prepare (base u64)
     give
+
+-- Devices see RAM where the CPU does.
+to dma_offset gives u64
+    give 0
+
+-- F12 on a USB keyboard saves the screen as screen<n>.raw, n = 2, 3, ...
+new shots u32 = 2
+
+to snapshot_key
+    save_raw(fb.ram_screen, 1920 * 1080 * 4, shots)
+    shots += 1
+
+to load_script
+    new path string = "build/kernel_virt/keys.txt\0"
+    new block [3] u64
+    block[0] = path.ptr as u64
+    block[1] = 1                      -- "rb"
+    block[2] = path.len - 1
+    new h = semihost(0x01, addr of block[0])
+    if h as i64 < 0
+        interactive = true
+        give
+    block[0] = h
+    new size = semihost(0x0C, addr of block[0])
+    if size > 16384
+        size = 16384
+    block[0] = h
+    block[1] = (addr of script[0]) as u64
+    block[2] = size
+    new left = semihost(0x06, addr of block[0])     -- gives the bytes it did not read
+    script_len = size - left
+    block[0] = h
+    semihost(0x02, addr of block[0])
 
 -- The disk: QEMU's virtio block device.
 to disk_read (lba u64, count u32, into ptr u8) gives bool
@@ -53,17 +98,17 @@ to cpu_mhz gives u64
 to poll_key (wanted bool) gives maybe u8
     if not wanted
         give nothing
-    while script_pos < script.len and script[script_pos] >= 2 and script[script_pos] <= 7
+    while script_pos < script_len and script[script_pos] >= 2 and script[script_pos] <= 7
         save_raw(fb.ram_screen, 1920 * 1080 * 4, script[script_pos] as u32)
         script_pos += 1
-    if script_pos >= script.len
+    if script_pos >= script_len
         give nothing
     new k = script[script_pos]
     script_pos += 1
     give k
 
 to input_ended gives bool
-    give script_pos >= script.len
+    give not interactive and script_pos >= script_len
 
 to core_mpidr (n u64) gives u64
     give n

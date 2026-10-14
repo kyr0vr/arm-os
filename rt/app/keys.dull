@@ -17,15 +17,24 @@ fixed page_up u32 = 0x107
 fixed page_down u32 = 0x108
 fixed delete u32 = 0x109
 
+-- Pointer events, for apps that asked for them (sys.want_pointer).
+fixed pointer_moved u32 = 0x200
+fixed left_down u32 = 0x201
+fixed left_up u32 = 0x202
+fixed right_down u32 = 0x203
+fixed right_up u32 = 0x204
+fixed wheel_up u32 = 0x205
+fixed wheel_down u32 = 0x206
+
 fixed timeout u32 = 0x1FF            -- `within` ran out of time
 fixed none u64 = 256                 -- what the kernel's timed wait gives then
 
 to key_within (ms u64) gives u64
     give sys.call(18, ms, 0, 0, 0, 0)
 
--- Wait for the next key.
+-- Wait for the next key (or pointer event).
 to next gives u32
-    give decode(sys.key() as u32)
+    give decode((sys.call(2, 0, 0, 0, 0, 0) & 0xFFFF) as u32)
 
 -- Wait at most `ms` for a key (`timeout` if none came).
 to within (ms u64) gives u32
@@ -35,6 +44,8 @@ to within (ms u64) gives u32
     give decode(k as u32)
 
 to decode (k u32) gives u32
+    if k >= 0x100
+        give k
     if k is '\r' as u32 or k is '\n' as u32
         give enter
     if k is 127
@@ -43,6 +54,13 @@ to decode (k u32) gives u32
         give k
     give after_escape()
 
+-- The next key byte, skipping pointer events (inside an escape sequence).
+to next_byte gives u32
+    repeat
+        new k = (sys.call(2, 0, 0, 0, 0, 0) & 0xFFFF) as u32
+        if k < 0x100
+            give k
+
 -- ESC alone, or the start of ESC [ ... / ESC O ...
 to after_escape gives u32
     new k2 = key_within(60)
@@ -50,7 +68,7 @@ to after_escape gives u32
         give escape
     if k2 is not '[' as u64 and k2 is not 'O' as u64
         give escape
-    new k3 = sys.key() as u32
+    new k3 = next_byte()
     if k3 is 'A' as u32
         give up
     if k3 is 'B' as u32
@@ -66,7 +84,7 @@ to after_escape gives u32
     if k3 >= '0' as u32 and k3 <= '9' as u32
         new code = k3 - '0' as u32
         repeat                       -- ESC [ <number> ~
-            new k4 = sys.key() as u32
+            new k4 = next_byte()
             if k4 < '0' as u32 or k4 > '9' as u32
                 stop
             code = code * 10 + (k4 - '0' as u32)

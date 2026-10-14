@@ -1,0 +1,47 @@
+-- Memory that devices read and write by themselves (DMA): one 2 MB pool, uncached
+-- on the Pi so the CPU and a PCIe device always agree on its contents, handed out
+-- in aligned pieces that never cross a 64 KB line (xHCI rings and contexts must not).
+-- Devices may see RAM at a different address than the CPU does: `bus` translates.
+
+use pages
+use mmu
+use board
+
+elsewhere to arch_clean_range (address u64, size u64)
+
+fixed pool_size u64 = 0x20_0000
+
+new base u64
+new next u64
+new limit u64
+
+to init gives bool
+    if base is not 0
+        give true
+    new run = pages.alloc_run(1024) else give false     -- 4 MB, to find 2 MB aligned inside
+    new start = ((run as u64) + pool_size - 1) & 0xFFFF_FFFF_FFE0_0000
+    arch_clean_range(start, pool_size)
+    mmu.uncached(start, pool_size)
+    arch_clean_range(start, pool_size)
+    base = start
+    next = start
+    limit = start + pool_size
+    give true
+
+-- `size` zeroed bytes aligned to `align` (a power of two); 0 if the pool is used up.
+to alloc (size u64, align u64) gives u64
+    new mask = (align - 1) ^ 0xFFFF_FFFF_FFFF_FFFF
+    new p = (next + align - 1) & mask
+    if p / 0x1_0000 is not (p + size - 1) / 0x1_0000
+        p = (p + 0xFFFF) & 0xFFFF_FFFF_FFFF_0000
+    if p + size > limit
+        give 0
+    next = p + size
+    new q = p as ptr u8
+    for each i in 0 until size
+        q[i] = 0
+    give p
+
+-- The address a device uses for CPU address `p`.
+to bus (p u64) gives u64
+    give p + board.dma_offset()

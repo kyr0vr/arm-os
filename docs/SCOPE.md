@@ -5,7 +5,7 @@ Raspberry Pi 5, built from the ground up: our own language, compiler, assembler,
 linker, kernel, drivers, file system, codecs and GUI. No borrowed toolchain in the
 final product.
 
-Status: **draft v0** (2026-10-08). Phases 0 to 9 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
+Status: **draft v0** (2026-10-08). Phases 0 to 10 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
 
 ---
 
@@ -125,7 +125,7 @@ Each phase ends with something visible on the Pi or the PC.
 | 7 | **Storage** | ✅ SD card driver (SDHCI, polled, 4-bit, 25 MHz) and read-only FAT32 with long file names: `disk`, `ls`, `cat` read the real card on the Pi; QEMU tests the same code on a generated FAT32 image over virtio |
 | 8 | **Processes** | ✅ Apps at EL0 in their own address spaces, 18 system calls, a preemptive round-robin scheduler (1 ms ticks, 10 ms turns); the shell is an app; built-in apps plus `.app` files from the SD card; a crashing app is stopped and the rest carries on - on the Pi and in QEMU |
 | 9 | **GUI + Text** | ✅ Compositor (each graphical app draws its own full-screen surface; the foreground one is shown, the one underneath comes back), anti-aliased shapes in apps and kernel-drawn ArmOS Mono text, a launcher with Text / Music / Video / Console tiles, and the **Text reader**: folders and .txt files on the SD card, word-wrapped reading, line and page scrolling (serial keys) |
-| 10 | **USB input** | PCIe root complex → RP1 → xHCI → USB HID: a USB keyboard and mouse drive the GUI |
+| 10 | **USB input** | ✅ PCIe → RP1 (left set up by the firmware with `pciex4_reset=0`, found by its chip ID) → both DWC3 xHCI controllers → HID boot protocol: USB keyboards (US layout, key repeat) and mice drive the GUI, with a pointer drawn by the compositor and click / right-click / wheel in the apps; plugging in and out works. Tested on the Pi and in QEMU (`tests/usb_test.py` types and clicks through QEMU's control socket). No USB hubs yet |
 | 11 | **Audio** | HDMI audio plays a test tone; MP3 decoder; **Music done** |
 | 12 | **Video** | MP4 demux, AAC, H.264 (I/P/B, CABAC, deblock), NEON, 4-core decode, A/V sync; **Video done** |
 

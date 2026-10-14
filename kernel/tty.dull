@@ -7,6 +7,7 @@ use fetch
 use facts
 use text
 use fb
+use cursor
 
 fixed putty u32 = 0xE6_DB_C1
 fixed amber u32 = 0xFF_9A_1F
@@ -21,6 +22,9 @@ to start (c ptr text.canvas, s ptr fb.screen, with_screen bool)
     canvas = c
     screen = s
     has_screen = with_screen
+    if with_screen
+        cursor.start(s)
+        cursor.source = c
 
 -- Write `count` bytes; `bold` picks the bold face on the screen.
 to write (bytes ptr u8, count u64, color u32, bold bool)
@@ -54,6 +58,7 @@ to show_fetch
     fetch.step(canvas, 1000, fetch.info_rows)
     if has_screen
         text.present_all(canvas, screen)
+        cursor.show_over(canvas)
         console.active = false
 
 -- The end of a QEMU test run: keep the last screen, then stop.

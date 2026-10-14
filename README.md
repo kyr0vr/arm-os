@@ -34,6 +34,6 @@ Type at the console over the serial cable: `python -m serial.tools.miniterm COM4
 
 The shell can read the SD card: `disk` shows the card and its file system, `ls [folder]` lists files and `cat file` prints one (`help` lists the rest).
 
-Arrow keys (or 1-4) and Enter over the serial cable drive the launcher until USB input arrives in phase 10; the Console tile opens the shell. The shell is an app, like everything outside the kernel: it starts other apps by name (`hello`, `spin a 5 &` in the background), and `ps` / `kill` manage them. See [apps/](apps/README.md) for writing one.
+A USB keyboard and mouse drive it (point and click, the wheel scrolls, right-click goes back), as do arrow keys over the serial cable; the Console tile opens the shell. Plug them straight into the Pi: USB hubs are not supported yet. The shell is an app, like everything outside the kernel: it starts other apps by name (`hello`, `spin a 5 &` in the background), and `ps` / `kill` manage them. See [apps/](apps/README.md) for writing one.
 
 The console font, ArmOS Mono, is baked from Cascadia Mono and Cascadia Code (SIL Open Font License 1.1, see [fonts/](fonts/)).

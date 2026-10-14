@@ -37,7 +37,10 @@ app draws rectangles, rounded rectangles, discs, triangles and quads into it its
 (anti-aliased), text is drawn by the kernel in ArmOS Mono (25 px, bold, 22 px small,
 46 px large), and `gfx.present` shows a finished area. The app started last is in
 front; when it ends, whatever was under it comes back. `rt/app/keys.dull` turns the
-escape sequences of arrow and paging keys into single codes.
+escape sequences of arrow and paging keys into single codes (USB keyboards send the
+same bytes as a serial terminal). An app that calls `sys.want_pointer(true)` also
+gets pointer events through `keys.next()`: movement, left and right buttons, the
+wheel; `sys.pointer_x()` / `sys.pointer_y()` say where the pointer is.
 
 ## The image
 
@@ -63,4 +66,5 @@ the app's memory ends (with `.bss`) and its entry point. Apps are linked at
 | 8 | wait(pid) - waits | 17 | process(index, buffer, cap) |
 | 18 | key_within(ms) | 19 | surface(size) - the app's screen surface |
 | 20 | text(x \| y << 16, text, length, color, style) | 21 | present(x \| y << 32, w \| h << 32) |
-| 22 | font(style) - advance \| height << 32 | | |
+| 22 | font(style) - advance \| height << 32 | 23 | pointer() - x \| y << 16 \| buttons << 32 |
+| 24 | want_pointer(on) | | |

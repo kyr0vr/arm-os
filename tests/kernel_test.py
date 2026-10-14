@@ -35,6 +35,9 @@ EXPECT = [
     "ok    all four cores running",
     "boot screen: 100% drawn",
     "kernel core: all checks passed",
+    "usb:   keyboard ready",
+    "usb:   mouse ready",
+    "usb: 1 keyboard(s), 1 mouse/mice",
     "root@armos:~$ help",
     "fetch      show the boot screen again",
     "Memory: ",
@@ -77,6 +80,22 @@ def to_png(raw, png):
 
 DISK = os.path.join(ROOT, "build", "disk", "test.img")
 
+# What the kernel reads as typed keys (rt/virt/board.dull): the launcher, the text
+# reader, then the shell. Bytes 2-7 save a screenshot (screen<n>.raw) instead.
+RIGHT, DOWN, HOME = "\x1b[C", "\x1b[B", "\x1b[H"
+KEYS = ("\x02" + RIGHT + "\r"           # the launcher; Music is not here yet
+        + "1" + "\x03"                   # Text: the folder list
+        + DOWN * 4 + "\r" + "\x04"       # big.txt
+        + "  G" + "\x05"                 # two pages on, then the end
+        + "q" + HOME + "\r" + DOWN + "\r" + "\x07"   # docs/essay.txt, word-wrapped
+        + "q\x08qq"                      # out to the launcher
+        + "4"                             # the Console tile: the shell
+        + "help\nmem\nuptime\ncpu\necho hello from armos\nnot-a-command\nhelp\nhelp\n"
+        "echo the console scrolled\ndisk\nls\nls docs\ncat hello.txt\n"
+        "cat a longer file name.txt\ncat docs/notes.txt\ncat big.txt\ncat nope.txt\n"
+        "hello one two three\nps\nspin a 3 &\nspin b 3 &\nps\nsleep 2000\ncrash\n"
+        "echo the shell is still here\napps/hello.app from the SD card\n\x06exit\n")
+
 
 def amber_pixels(raw):
     """How many pixels are the ArmOS amber (BGRX bytes)."""
@@ -88,6 +107,8 @@ def run(machine, label, show):
     subprocess.run([sys.executable, os.path.join(ROOT, "tests", "make_fat_image.py"), DISK,
                     "--add", "apps/hello.app", os.path.join(OUT, "apps", "hello.img")],
                    check=True, capture_output=True)
+    with open(os.path.join(OUT, "keys.txt"), "wb") as f:
+        f.write(KEYS.encode("latin-1"))
     for n in range(8):
         p = os.path.join(OUT, f"screen{n}.raw")
         if os.path.exists(p):
@@ -95,7 +116,8 @@ def run(machine, label, show):
     cmd = [qemu.path(), "-M", machine, "-cpu", "cortex-a76", "-smp", "4", "-m", "128M",
            "-display", "none", "-monitor", "none", "-serial", "stdio",
            "-semihosting-config", "enable=on,target=native", "-kernel", elf,
-           "-drive", f"file={DISK},if=none,format=raw,id=d0", "-device", "virtio-blk-device,drive=d0"]
+           "-drive", f"file={DISK},if=none,format=raw,id=d0", "-device", "virtio-blk-device,drive=d0",
+           "-device", "qemu-xhci", "-device", "usb-kbd", "-device", "usb-mouse"]
     try:
         r = subprocess.run(cmd, capture_output=True, timeout=300, cwd=ROOT)
     except subprocess.TimeoutExpired:
@@ -138,8 +160,8 @@ def run(machine, label, show):
 
 def main():
     show = "--show" in sys.argv
-    good = run("virt,gic-version=2", "kernel on QEMU virt, starting at EL1", show)
-    good &= run("virt,gic-version=2,virtualization=on", "kernel on QEMU virt, starting at EL2", show)
+    good = run("virt,gic-version=2,highmem=off", "kernel on QEMU virt, starting at EL1", show)
+    good &= run("virt,gic-version=2,highmem=off,virtualization=on", "kernel on QEMU virt, starting at EL2", show)
     return 0 if good else 1
 
 

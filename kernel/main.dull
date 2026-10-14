@@ -1,4 +1,4 @@
--- The ArmOS kernel. Phase 9: the GUI.
+-- The ArmOS kernel. Phase 10: USB keyboards and mice.
 --
 -- Brings the machine up step by step and checks each step: exception level,
 -- exceptions, memory, the MMU and caches, interrupts and the timer, all four cores.
@@ -24,6 +24,7 @@ use fetch
 use facts
 use tty
 use proc
+use xhci
 
 elsewhere to arch_drop_to_el1
 elsewhere to arch_current_el gives u64
@@ -62,7 +63,7 @@ to main
     io.line("")
     io.line("========================================")
     io.line(" ArmOS - a rather mundane operating system")
-    io.line(" phase 9: the GUI")
+    io.line(" phase 10: USB input")
     io.line("========================================")
 
     -- exception level
@@ -145,6 +146,21 @@ to main
     facts.cpu(fetch.value(4))
     facts.gpu(fetch.value(5))
     progress(660, 6)
+
+    -- USB keyboards and mice
+    new found = 0 as u64
+    repeat
+        new base = board.usb_controller(found)
+        if base is 0
+            stop
+        board.usb_prepare(base)
+        xhci.add(base)
+        found += 1
+    io.print("usb: ")
+    io.print_u64(xhci.keyboards as u64)
+    io.print(" keyboard(s), ")
+    io.print_u64(xhci.mice as u64)
+    io.line(" mouse/mice")
 
     facts.memory(fetch.value(6))
     facts.display(fetch.value(7))
