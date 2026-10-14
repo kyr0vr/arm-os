@@ -18,7 +18,8 @@ shape screen
     width  u32
     height u32
     pitch  u32        -- bytes per row
-    order  u32        -- 0 = BGR, 1 = RGB
+    order  u32        -- byte order in memory: 0 = BGR (Pi 5 default), 1 = RGB
+    depth  u32        -- bits per pixel the firmware actually gave
 
 new buf [64] u32       -- message buffer; the mailbox needs a 16-byte aligned copy
 new last_reply u32     -- the firmware's answer code from the last open(), for diagnostics
@@ -106,7 +107,15 @@ to open (want_w u32, want_h u32, s ptr screen) gives bool
     s.height = m[6]
     s.order  = m[24]
     s.pitch  = m[33]
+    s.depth  = m[20]
     give true
+
+-- A 32-bit pixel value for this screen's color order. The order describes bytes in
+-- memory: order 0 ("BGR") stores blue first, so the pixel reads as 0x00RRGGBB.
+to color (s ptr screen, r u8, g u8, b u8) gives u32
+    if s.order is 1
+        give (b as u32) << 16 | (g as u32) << 8 | (r as u32)
+    give (r as u32) << 16 | (g as u32) << 8 | (b as u32)
 
 -- Write `n` copies of `color` starting at `p` (n must be at least 1).
 to fill_row (p ptr u32, n u64, color u32)

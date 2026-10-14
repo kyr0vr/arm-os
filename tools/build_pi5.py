@@ -30,6 +30,7 @@ os_check=0
 enable_uart=1
 uart_2ndstage=1
 hdmi_force_hotplug=1
+framebuffer_depth=32
 """
 
 

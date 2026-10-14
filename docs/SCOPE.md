@@ -5,7 +5,7 @@ Raspberry Pi 5, built from the ground up: our own language, compiler, assembler,
 linker, kernel, drivers, file system, codecs and GUI. No borrowed toolchain in the
 final product.
 
-Status: **draft v0** (2026-10-08). Phase 0 is done: the stage-0 compiler and its test suite are in `stage0/` and `tests/`.
+Status: **draft v0** (2026-10-08). Phases 0 and 1 are done: the stage-0 compiler and its tests are in `stage0/` and `tests/`; the first kernel boots on a real Pi 5 (`kernel/`, `rt/pi5/`, built with `tools/build_pi5.py`).
 
 ---
 
@@ -60,6 +60,12 @@ Media goes onto the SD card from a Windows PC, so the card uses FAT32.
   decoder written by us, which makes NEON (SIMD) support in the language mandatory.
 - **HDMI audio.** The HDMI controller is on the SoC; the Linux `vc4_hdmi` driver is
   the reference for how its audio path and DMA work.
+- **Learned in phase 1 (confirmed on hardware):**
+  - The firmware starts our image at **EL2** with the MMU off, at `0x80000` (`kernel_address=0x80000`, `os_check=0`; no device tree file needed).
+  - The debug UART at `0x10_7d00_1000` is already running at 115200 baud when we start.
+  - The mailbox is at `0x10_7c01_3880`. The firmware **ignores the depth tag** and uses `framebuffer_depth` from `config.txt` (default 16); set it to 32.
+  - Pixel order 0 means blue is the first byte in memory, so a pixel reads as `0x00RRGGBB`.
+  - The firmware only offers a screen if it saw a monitor at boot; `hdmi_force_hotplug=1` drives HDMI regardless.
 - **Emulation.** QEMU has no Pi 5 machine. We develop against QEMU `virt` (AArch64,
   GICv2/v3, PL011) behind a thin board layer, and run on the real Pi regularly.
 
@@ -105,7 +111,7 @@ Each phase ends with something visible on the Pi or the PC.
 | # | Phase | Exit criterion |
 |---|---|---|
 | 0 | **Stage-0 compiler** in Python: functions, ints, pointers, shapes, spans, if/while, `device`, `asm` | ✅ Test programs compile, assemble (clang/lld via `ziglang`, a temporary crutch) and run correctly on an emulated Cortex-A76 |
-| 1 | **Alive** | Pi 5 prints "ArmOS" over serial and fills the screen with a color |
+| 1 | **Alive** | ✅ Pi 5 prints "ArmOS" over serial and paints the screen red / green / blue |
 | 2 | **Own assembler + linker** | Phase 1 image rebuilt with zero outside tools; byte-compare against GNU output |
 | 3 | **Serial chainloader** | New kernels load over the cable; no more SD swaps per build |
 | 4 | **Kernel core** | Timer interrupts tick, MMU on, page allocator and heap pass tests, all 4 cores say hello |
