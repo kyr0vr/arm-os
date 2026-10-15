@@ -1,0 +1,895 @@
+-- An H.264 video decoder: progressive 4:2:0 8-bit, CABAC (Main and High profile
+-- streams as cameras, phones and x264 make them), I, P and B slices, weighted and
+-- direct prediction, 8x8 transforms, scaling matrices, the deblocking filter.
+--
+--   new d = h264.make()
+--   h264.nal(d, bytes, size)              -- each NAL unit (SPS, PPS, slices), in order
+--   new pic = h264.frame(d, false)        -- a picture ready to show (null if none yet)
+--   new pic = h264.frame(d, true)         -- at the end: the ones still held back
+--
+-- A picture's planes: pic.y (stride pic.stride), pic.u and pic.v (pic.cstride), with
+-- the size and cropping in h264.width / height / crop_x / crop_y.
+-- Not supported: CAVLC (Baseline profile), interlaced video, I_PCM macroblocks.
+
+use mem
+use h264state
+use h264tables
+use h264cabac
+use h264mb
+use h264motion
+use h264recon
+use h264deblock
+
+to make gives ptr h264state.decoder
+    give h264state.make()
+
+-- ---------------------------------------------------------------- NAL units
+
+new rbsp_buf ptr u8
+new rbsp_cap u64
+
+-- Remove emulation prevention bytes (00 00 03 -> 00 00); gives the new size.
+to unescape (data ptr u8, size u64) gives u64
+    if size > rbsp_cap
+        rbsp_cap = size + 4096
+        rbsp_buf = mem.alloc(rbsp_cap)
+    new n u64 = 0
+    new zeros u64 = 0
+    for each i in 0 until size
+        new b = data[i]
+        if zeros >= 2 and b is 3
+            zeros = 0
+            skip
+        rbsp_buf[n] = b
+        n += 1
+        if b is 0
+            zeros += 1
+        else
+            zeros = 0
+    give n
+
+to nal (d ptr h264state.decoder, data ptr u8, size u64)
+    if size < 2
+        give
+    new kind = data[0] & 31
+    d.nal_ref = ((data[0] >> 5) & 3) as u32
+    new n = unescape(data + 1, size - 1)
+    new b h264state.bits
+    b.data = rbsp_buf
+    b.size = n
+    b.pos = 0
+    if kind is 7
+        parse_sps(d, addr of b)
+    else if kind is 8
+        parse_pps(d, addr of b)
+    else if kind is 1 or kind is 5
+        slice(d, addr of b, kind is 5)
+
+-- ---------------------------------------------------------------- parameter sets
+
+to scaling_list (b ptr h264state.bits, out ptr u8, size u64, default ptr u8)
+    new last i32 = 8
+    new next i32 = 8
+    new use_default = false
+    for each j in 0 until size
+        if next is not 0
+            new delta = h264state.se(b)
+            next = (last + delta + 256) % 256
+            use_default = j is 0 and next is 0
+        new v = next
+        if next is 0
+            v = last
+        if size is 16
+            out[h264tables.zigzag4[j] as u64] = v as u8
+        else
+            out[h264tables.zigzag8[j] as u64] = v as u8
+        last = v
+    if use_default
+        for each j in 0 until size
+            out[j] = default[j]
+
+to hrd (b ptr h264state.bits)
+    new count = h264state.ue(b) + 1
+    h264state.u(b, 8)
+    for each i in 0 until count as u64
+        h264state.ue(b)
+        h264state.ue(b)
+        h264state.u(b, 1)
+    h264state.u(b, 20)
+
+to parse_sps (d ptr h264state.decoder, b ptr h264state.bits)
+    new profile = h264state.u(b, 8)
+    h264state.u(b, 16)
+    new id = h264state.ue(b)
+    if id >= 32
+        give
+    new s = addr of d.spss[id as u64]
+    s.profile = profile
+    s.chroma = 1
+    s.has_scaling = false
+    for each i in 0 until 96
+        s.scale4[i] = 16
+    for each i in 0 until 128
+        s.scale8[i] = 16
+    if profile is 100 or profile is 110 or profile is 122 or profile is 244 or profile is 44 or profile is 83 or profile is 86 or profile is 118 or profile is 128
+        s.chroma = h264state.ue(b)
+        if s.chroma is 3
+            h264state.u(b, 1)
+        h264state.ue(b)
+        h264state.ue(b)
+        h264state.u(b, 1)
+        if h264state.u(b, 1) is 1
+            s.has_scaling = true
+            for each i in 0 until 8
+                new present = h264state.u(b, 1) is 1
+                if i < 6
+                    new def = addr of h264tables.default4[0]
+                    if i >= 3
+                        def = addr of h264tables.default4[16]
+                    new out = addr of s.scale4[i * 16]
+                    if present
+                        scaling_list(b, out, 16, def)
+                    else if i is 0 or i is 3
+                        for each k in 0 until 16
+                            out[k] = def[k]
+                    else
+                        for each k in 0 until 16
+                            out[k] = s.scale4[(i - 1) * 16 + k]
+                else
+                    new def = addr of h264tables.default8[(i - 6) * 64]
+                    new out = addr of s.scale8[(i - 6) * 64]
+                    if present
+                        scaling_list(b, out, 64, def)
+                    else
+                        for each k in 0 until 64
+                            out[k] = def[k]
+    s.log2_fn = h264state.ue(b) + 4
+    s.poc_type = h264state.ue(b)
+    if s.poc_type is 0
+        s.log2_poc = h264state.ue(b) + 4
+    else if s.poc_type is 1
+        give                                            -- not supported
+    s.max_refs = h264state.ue(b)
+    h264state.u(b, 1)
+    s.mb_w = h264state.ue(b) + 1
+    s.mb_h = h264state.ue(b) + 1
+    if h264state.u(b, 1) is 0
+        give                                            -- interlaced: not supported
+    s.direct8 = h264state.u(b, 1) is 1
+    s.crop_l = 0
+    s.crop_r = 0
+    s.crop_t = 0
+    s.crop_b = 0
+    if h264state.u(b, 1) is 1
+        s.crop_l = h264state.ue(b)
+        s.crop_r = h264state.ue(b)
+        s.crop_t = h264state.ue(b)
+        s.crop_b = h264state.ue(b)
+    s.reorder = s.max_refs                              -- unless the VUI says otherwise
+    if h264state.u(b, 1) is 1                           -- VUI
+        if h264state.u(b, 1) is 1
+            if h264state.u(b, 8) is 255
+                h264state.u(b, 32)
+        if h264state.u(b, 1) is 1
+            h264state.u(b, 1)
+        if h264state.u(b, 1) is 1
+            h264state.u(b, 4)
+            if h264state.u(b, 1) is 1
+                h264state.u(b, 24)
+        if h264state.u(b, 1) is 1
+            h264state.ue(b)
+            h264state.ue(b)
+        if h264state.u(b, 1) is 1
+            h264state.u(b, 32)
+            h264state.u(b, 32)
+            h264state.u(b, 1)
+        new nal_hrd = h264state.u(b, 1) is 1
+        if nal_hrd
+            hrd(b)
+        new vcl_hrd = h264state.u(b, 1) is 1
+        if vcl_hrd
+            hrd(b)
+        if nal_hrd or vcl_hrd
+            h264state.u(b, 1)
+        h264state.u(b, 1)
+        if h264state.u(b, 1) is 1
+            h264state.u(b, 1)
+            for each k in 0 until 4
+                h264state.ue(b)
+            s.reorder = h264state.ue(b)
+            h264state.ue(b)
+    s.valid = s.chroma is 1
+
+to more_rbsp (b ptr h264state.bits) gives bool
+    new last = b.size
+    while last > 0 and b.data[last - 1] is 0
+        last -= 1
+    if last is 0
+        give false
+    new byte = b.data[last - 1]
+    new zeros u64 = 0
+    while (byte >> zeros as u8) & 1 is 0
+        zeros += 1
+    new stop_bit = (last - 1) * 8 + 7 - zeros
+    give b.pos < stop_bit
+
+to parse_pps (d ptr h264state.decoder, b ptr h264state.bits)
+    new id = h264state.ue(b)
+    if id >= 64
+        give
+    new p = addr of d.ppss[id as u64]
+    p.sps_id = h264state.ue(b)
+    if p.sps_id >= 32
+        give
+    new s = addr of d.spss[p.sps_id as u64]
+    p.cabac = h264state.u(b, 1) is 1
+    p.bottom_poc = h264state.u(b, 1) is 1
+    if h264state.ue(b) is not 0
+        give                                            -- slice groups: not supported
+    p.nref0 = h264state.ue(b) + 1
+    p.nref1 = h264state.ue(b) + 1
+    p.weighted = h264state.u(b, 1) is 1
+    p.bipred = h264state.u(b, 2)
+    p.init_qp = 26 + h264state.se(b)
+    h264state.se(b)
+    p.cqp = h264state.se(b)
+    p.deblock_ctl = h264state.u(b, 1) is 1
+    p.constrained = h264state.u(b, 1) is 1
+    p.redundant = h264state.u(b, 1) is 1
+    p.t8 = false
+    p.cqp2 = p.cqp
+    for each i in 0 until 96
+        p.scale4[i] = s.scale4[i]
+    for each i in 0 until 128
+        p.scale8[i] = s.scale8[i]
+    if more_rbsp(b)
+        p.t8 = h264state.u(b, 1) is 1
+        if h264state.u(b, 1) is 1
+            new count u64 = 6
+            if p.t8
+                count = 8
+            for each i in 0 until count
+                new present = h264state.u(b, 1) is 1
+                if i < 6
+                    new def = addr of h264tables.default4[0]
+                    if i >= 3
+                        def = addr of h264tables.default4[16]
+                    new out = addr of p.scale4[i * 16]
+                    if present
+                        scaling_list(b, out, 16, def)
+                    else if i is 0 or i is 3
+                        for each k in 0 until 16
+                            out[k] = def[k]
+                            if s.has_scaling
+                                out[k] = s.scale4[i * 16 + k]
+                    else
+                        for each k in 0 until 16
+                            out[k] = p.scale4[(i - 1) * 16 + k]
+                else
+                    new def = addr of h264tables.default8[(i - 6) * 64]
+                    new out = addr of p.scale8[(i - 6) * 64]
+                    if present
+                        scaling_list(b, out, 64, def)
+                    else
+                        for each k in 0 until 64
+                            out[k] = def[k]
+                            if s.has_scaling
+                                out[k] = s.scale8[(i - 6) * 64 + k]
+        p.cqp2 = h264state.se(b)
+    p.valid = true
+
+-- ---------------------------------------------------------------- pictures
+
+to slot_pic (d ptr h264state.decoder, slot u64) gives ptr h264state.picture
+    give addr of d.pics[slot]
+
+-- A free picture slot with planes for the current size.
+to new_slot (d ptr h264state.decoder) gives u64
+    for each i in 0 until h264state.max_pics
+        new p = slot_pic(d, i)
+        if p.used and (p.ref is not 0 or p.waiting)
+            skip
+        if p.alloc_w is not d.s.mb_w or p.alloc_h is not d.s.mb_h
+            new w = (d.s.mb_w as u64) * 16
+            new h = (d.s.mb_h as u64) * 16
+            p.stride = w + 2 * h264state.pad
+            p.cstride = w / 2 + 2 * h264state.cpad
+            new ysize = p.stride * (h + 2 * h264state.pad)
+            new csize = p.cstride * (h / 2 + 2 * h264state.cpad)
+            p.ybase = mem.alloc(ysize + 2 * csize)
+            p.y = p.ybase + h264state.pad * p.stride + h264state.pad
+            new ub = p.ybase + ysize
+            p.u = ub + h264state.cpad * p.cstride + h264state.cpad
+            new vb = ub + csize
+            p.v = vb + h264state.cpad * p.cstride + h264state.cpad
+            p.mbs = mem.alloc((d.s.mb_w as u64) * (d.s.mb_h as u64) * size_of(h264state.mbinfo)) as ptr h264state.mbinfo
+            p.alloc_w = d.s.mb_w
+            p.alloc_h = d.s.mb_h
+        p.used = true
+        p.ref = 0
+        p.waiting = false
+        give i
+    give 0                                              -- the stream needs too many pictures
+
+-- Copy the edge samples outwards into the border.
+to pad_plane (p ptr u8, stride u64, w u64, h u64, border u64)
+    for each y in 0 until h
+        new row = p + y * stride
+        for each k in 1 until border + 1
+            ((row as i64 - k as i64) as ptr u8)[0] = row[0]
+            row[w - 1 + k] = row[w - 1]
+    for each k in 1 until border + 1
+        new top = (p as i64 - (k * stride + border) as i64) as ptr u8
+        new first = (p as i64 - border as i64) as ptr u8
+        new bottom = p + (h - 1 + k) * stride - border
+        new last = p + (h - 1) * stride - border
+        for each x in 0 until w + 2 * border
+            top[x] = first[x]
+            bottom[x] = last[x]
+
+to start_picture (d ptr h264state.decoder)
+    if d.idr
+        d.idr_seq += 1
+    d.cur_slot = new_slot(d)
+    d.cur = slot_pic(d, d.cur_slot)
+    d.cur.id = d.next_id
+    d.next_id += 1
+    d.cur.poc = d.poc
+    d.cur.frame_num = d.frame_num
+    d.cur.idr_seq = d.idr_seq
+    d.mbs = d.cur.mbs
+    d.mb_count = (d.s.mb_w as u64) * (d.s.mb_h as u64)
+    for each a in 0 until d.mb_count
+        h264state.mb(d, a).avail = false
+    d.slice_no = 0
+    d.pic_done = false
+
+to finish_picture (d ptr h264state.decoder)
+    if d.pic_done or d.cur as u64 is 0
+        give
+    d.pic_done = true
+    h264deblock.picture(d)
+    new w = (d.s.mb_w as u64) * 16
+    new h = (d.s.mb_h as u64) * 16
+    pad_plane(d.cur.y, d.cur.stride, w, h, h264state.pad)
+    pad_plane(d.cur.u, d.cur.cstride, w / 2, h / 2, h264state.cpad)
+    pad_plane(d.cur.v, d.cur.cstride, w / 2, h / 2, h264state.cpad)
+    mark(d)
+    d.cur.waiting = true
+    if d.s.poc_type is 0 and d.nal_ref is not 0
+        d.prev_msb = d.poc_msb
+        d.prev_lsb = d.poc_lsb
+    d.prev_fn_off = d.fn_off
+    d.prev_fn = d.frame_num
+
+-- The next picture to show, in display order: once more than `reorder` are waiting
+-- (or all of them at the end, with `flush`). Null if none is ready.
+to frame (d ptr h264state.decoder, flush bool) gives ptr h264state.picture
+    new waiting u64 = 0
+    new busy u64 = 0
+    new best = 0 as ptr h264state.picture
+    for each i in 0 until h264state.max_pics
+        new p = slot_pic(d, i)
+        if p.used and (p.waiting or p.ref is not 0)
+            busy += 1
+        if not p.used or not p.waiting
+            skip
+        waiting += 1
+        if best as u64 is 0 or p.idr_seq < best.idr_seq or (p.idr_seq is best.idr_seq and p.poc < best.poc)
+            best = p
+    if best as u64 is 0
+        give best
+    new limit = d.s.reorder as u64
+    -- keep a slot free for the next picture
+    if not flush and waiting <= limit and busy + 1 < h264state.max_pics
+        give 0 as ptr h264state.picture
+    best.waiting = false
+    give best
+
+to width (d ptr h264state.decoder) gives u32
+    give d.s.mb_w * 16 - 2 * (d.s.crop_l + d.s.crop_r)
+
+to height (d ptr h264state.decoder) gives u32
+    give d.s.mb_h * 16 - 2 * (d.s.crop_t + d.s.crop_b)
+
+to crop_x (d ptr h264state.decoder) gives u32
+    give 2 * d.s.crop_l
+
+to crop_y (d ptr h264state.decoder) gives u32
+    give 2 * d.s.crop_t
+
+-- ---------------------------------------------------------------- picture order count
+
+to picture_order_count (d ptr h264state.decoder) gives i32
+    if d.idr
+        d.prev_msb = 0
+        d.prev_lsb = 0
+        d.prev_fn_off = 0
+        d.prev_fn = 0
+    if d.s.poc_type is 0
+        new max = (1 as i32) << d.s.log2_poc
+        new lsb = d.poc_lsb as i32
+        new prev = d.prev_lsb as i32
+        new msb = d.prev_msb
+        if lsb < prev and prev - lsb >= max / 2
+            msb = d.prev_msb + max
+        else if lsb > prev and lsb - prev > max / 2
+            msb = d.prev_msb - max
+        d.poc_msb = msb
+        give msb + lsb
+    new max_fn = (1 as u32) << d.s.log2_fn
+    new off u32 = 0
+    if not d.idr
+        off = d.prev_fn_off
+        if d.prev_fn > d.frame_num
+            off = d.prev_fn_off + max_fn
+    d.fn_off = off
+    if d.idr
+        give 0
+    new poc = 2 * (off + d.frame_num) as i32
+    if d.nal_ref is 0
+        give poc - 1
+    give poc
+
+-- ---------------------------------------------------------------- reference lists
+
+to wrap_all (d ptr h264state.decoder, frame_num u32)
+    new max_fn = (1 as i32) << d.s.log2_fn
+    for each i in 0 until h264state.max_pics
+        new p = slot_pic(d, i)
+        if p.used and p.ref is 1
+            p.wrap = p.frame_num as i32
+            if p.frame_num > frame_num
+                p.wrap = p.frame_num as i32 - max_fn
+
+-- The reference slots sorted by `key` (ascending), from `kind` (1 short, 2 long),
+-- filtered by POC side: 0 all, 1 before the current picture, 2 after.
+to gather (d ptr h264state.decoder, kind u8, side u32, key u32, out ptr u64, count u64) gives u64
+    new chosen [18] u64
+    new n u64 = 0
+    for each i in 0 until h264state.max_pics
+        new p = slot_pic(d, i)
+        if not p.used or p.ref is not kind or i is d.cur_slot
+            skip
+        if side is 1 and p.poc >= d.poc
+            skip
+        if side is 2 and p.poc <= d.poc
+            skip
+        chosen[n] = i
+        n += 1
+    -- insertion sort by key: 0 descending wrap, 1 ascending long_idx, 2 descending POC, 3 ascending POC
+    for each a in 1 until n
+        new v = chosen[a]
+        new b = a
+        while b > 0 and before(d, v, chosen[b - 1], key)
+            chosen[b] = chosen[b - 1]
+            b -= 1
+        chosen[b] = v
+    for each k in 0 until n
+        out[count + k] = chosen[k] + 1
+    give count + n
+
+to before (d ptr h264state.decoder, x u64, y u64, key u32) gives bool
+    new a = slot_pic(d, x)
+    new b = slot_pic(d, y)
+    if key is 0
+        give a.wrap > b.wrap
+    if key is 1
+        give a.long_idx < b.long_idx
+    if key is 2
+        give a.poc > b.poc
+    give a.poc < b.poc
+
+-- Build RefPicList0/1 for the current slice, then apply the modifications read into
+-- `mods` (idc, value pairs; idc 3 ends a list).
+to build_lists (d ptr h264state.decoder, mods ptr u32)
+    wrap_all(d, d.frame_num)
+    new init [64] u64
+    new n0 u64 = 0
+    new n1 u64 = 0
+    if d.stype is 0
+        n0 = gather(d, 1, 0, 0, addr of init[0], 0)
+        n0 = gather(d, 2, 0, 1, addr of init[0], n0)
+    else if d.stype is 1
+        n0 = gather(d, 1, 1, 2, addr of init[0], 0)
+        n0 = gather(d, 1, 2, 3, addr of init[0], n0)
+        n0 = gather(d, 2, 0, 1, addr of init[0], n0)
+        n1 = gather(d, 1, 2, 3, addr of init[32], 0)
+        n1 = gather(d, 1, 1, 2, addr of init[32], n1)
+        n1 = gather(d, 2, 0, 1, addr of init[32], n1)
+        if n1 > 1 and n0 is n1
+            new same = true
+            for each k in 0 until n0
+                if init[k] is not init[32 + k]
+                    same = false
+            if same
+                new t = init[32]
+                init[32] = init[33]
+                init[33] = t
+    new counts [2] u64
+    counts[0] = n0
+    counts[1] = n1
+    new max_fn = (1 as i32) << d.s.log2_fn
+    new m u64 = 0
+    for each lst in 0 until 2
+        new n = d.nref[lst] as u64
+        new l [33] u64
+        for each k in 0 until 33
+            l[k] = 0
+            if k < counts[lst] and k < 32
+                l[k] = init[lst * 32 + k]
+        new pred = d.frame_num as i32
+        new idx u64 = 0
+        repeat
+            new idc = mods[m]
+            new val = mods[m + 1]
+            m += 2
+            if idc is 3
+                stop
+            new found u64 = 0
+            if idc is 0 or idc is 1
+                new diff = val as i32 + 1
+                if idc is 0
+                    pred = pred - diff
+                    if pred < 0
+                        pred += max_fn
+                else
+                    pred = pred + diff
+                    if pred >= max_fn
+                        pred -= max_fn
+                new num = pred
+                if pred > d.frame_num as i32
+                    num = pred - max_fn
+                for each i in 0 until h264state.max_pics
+                    new p = slot_pic(d, i)
+                    if p.used and p.ref is 1 and i is not d.cur_slot and p.wrap is num
+                        found = i + 1
+            else
+                for each i in 0 until h264state.max_pics
+                    new p = slot_pic(d, i)
+                    if p.used and p.ref is 2 and p.long_idx is val as i32
+                        found = i + 1
+            if idx < 32
+                -- shift up, insert, drop the later copy
+                new k = n
+                if k > 32
+                    k = 32
+                while k > idx
+                    l[k] = l[k - 1]
+                    k -= 1
+                l[idx] = found
+                idx += 1
+                new out = idx
+                for each c in idx until n + 1
+                    if c < 33 and l[c] is not found
+                        l[out] = l[c]
+                        out += 1
+        for each k in 0 until 32
+            d.list[lst * 32 + k] = 0
+            if k < n
+                d.list[lst * 32 + k] = l[k]
+
+-- ---------------------------------------------------------------- marking
+
+to mark (d ptr h264state.decoder)
+    new pic = d.cur
+    if d.nal_ref is 0
+        pic.ref = 0
+        give
+    if d.idr
+        for each i in 0 until h264state.max_pics
+            if i is not d.cur_slot
+                slot_pic(d, i).ref = 0
+        pic.ref = 1
+        if d.long_term
+            pic.ref = 2
+            pic.long_idx = 0
+        give
+    wrap_all(d, pic.frame_num)
+    if d.nmmco > 0
+        for each k in 0 until d.nmmco as u64
+            new op = d.mmco[k * 3]
+            new a = d.mmco[k * 3 + 1]
+            new bb = d.mmco[k * 3 + 2]
+            if op is 1 or op is 3
+                new num = pic.frame_num as i32 - (a as i32 + 1)
+                for each i in 0 until h264state.max_pics
+                    new p = slot_pic(d, i)
+                    if i is d.cur_slot or not p.used or p.ref is not 1 or p.wrap is not num
+                        skip
+                    if op is 1
+                        p.ref = 0
+                    else
+                        for each j in 0 until h264state.max_pics
+                            new q = slot_pic(d, j)
+                            if q.used and q.ref is 2 and q.long_idx is bb as i32
+                                q.ref = 0
+                        p.ref = 2
+                        p.long_idx = bb as i32
+            else if op is 2
+                for each i in 0 until h264state.max_pics
+                    new p = slot_pic(d, i)
+                    if p.used and p.ref is 2 and p.long_idx is a as i32
+                        p.ref = 0
+            else if op is 4
+                for each i in 0 until h264state.max_pics
+                    new p = slot_pic(d, i)
+                    if p.used and p.ref is 2 and p.long_idx >= a as i32
+                        p.ref = 0
+            else if op is 5
+                for each i in 0 until h264state.max_pics
+                    if i is not d.cur_slot
+                        slot_pic(d, i).ref = 0
+            else if op is 6
+                for each j in 0 until h264state.max_pics
+                    new q = slot_pic(d, j)
+                    if q.used and q.ref is 2 and q.long_idx is bb as i32
+                        q.ref = 0
+                pic.ref = 2
+                pic.long_idx = bb as i32
+                give
+        pic.ref = 1
+        give
+    -- sliding window
+    new count u64 = 0
+    new oldest u64 = 0xFFFF
+    for each i in 0 until h264state.max_pics
+        new p = slot_pic(d, i)
+        if i is d.cur_slot or not p.used or p.ref is 0
+            skip
+        count += 1
+        if p.ref is 1 and (oldest is 0xFFFF or p.wrap < slot_pic(d, oldest).wrap)
+            oldest = i
+    new most = d.s.max_refs as u64
+    if most < 1
+        most = 1
+    if count >= most and oldest is not 0xFFFF
+        slot_pic(d, oldest).ref = 0
+    pic.ref = 1
+
+-- ---------------------------------------------------------------- slices
+
+to read_weights (d ptr h264state.decoder, b ptr h264state.bits)
+    d.lw_denom = h264state.ue(b)
+    d.cw_denom = h264state.ue(b)
+    new lists u64 = 1
+    if d.stype is 1
+        lists = 2
+    for each lst in 0 until lists
+        for each i in 0 until d.nref[lst] as u64
+            new w = addr of d.w[lst]
+            w.luma[i * 2] = (1 as i32) << d.lw_denom
+            w.luma[i * 2 + 1] = 0
+            if h264state.u(b, 1) is 1
+                w.luma[i * 2] = h264state.se(b)
+                w.luma[i * 2 + 1] = h264state.se(b)
+            w.cb[i * 2] = (1 as i32) << d.cw_denom
+            w.cb[i * 2 + 1] = 0
+            w.cr[i * 2] = (1 as i32) << d.cw_denom
+            w.cr[i * 2 + 1] = 0
+            if h264state.u(b, 1) is 1
+                w.cb[i * 2] = h264state.se(b)
+                w.cb[i * 2 + 1] = h264state.se(b)
+                w.cr[i * 2] = h264state.se(b)
+                w.cr[i * 2 + 1] = h264state.se(b)
+
+to read_mods (b ptr h264state.bits, out ptr u32, pos u64, present bool) gives u64
+    new k = pos
+    if present and h264state.u(b, 1) is 1
+        repeat
+            new idc = h264state.ue(b)
+            if idc is 3 or k + 2 >= 128
+                stop
+            out[k] = idc
+            out[k + 1] = h264state.ue(b)
+            k += 2
+    out[k] = 3
+    out[k + 1] = 0
+    give k + 2
+
+to slice (d ptr h264state.decoder, b ptr h264state.bits, idr bool)
+    new first_mb = h264state.ue(b) as u64
+    new st = h264state.ue(b) % 5
+    if st is 0 or st is 3
+        d.stype = 0
+    else if st is 1
+        d.stype = 1
+    else
+        d.stype = 2
+    new pps_id = h264state.ue(b)
+    if pps_id >= 64 or not d.ppss[pps_id as u64].valid
+        give
+    d.p = addr of d.ppss[pps_id as u64]
+    d.s = addr of d.spss[d.p.sps_id as u64]
+    if not d.s.valid or not d.p.cabac
+        give                                            -- CAVLC or unsupported stream
+    if first_mb is 0 and d.cur as u64 is not 0 and not d.pic_done
+        finish_picture(d)
+    new frame_num = h264state.u(b, d.s.log2_fn)
+    d.idr = idr
+    if idr
+        h264state.ue(b)
+    if d.s.poc_type is 0
+        d.poc_lsb = h264state.u(b, d.s.log2_poc)
+        if d.p.bottom_poc
+            h264state.se(b)
+    if d.p.redundant
+        h264state.ue(b)
+    if first_mb is 0
+        d.frame_num = frame_num
+        d.poc = picture_order_count(d)
+    d.spatial = true
+    if d.stype is 1
+        d.spatial = h264state.u(b, 1) is 1
+    d.nref[0] = d.p.nref0
+    d.nref[1] = d.p.nref1
+    if d.stype is not 2
+        if h264state.u(b, 1) is 1
+            d.nref[0] = h264state.ue(b) + 1
+            if d.stype is 1
+                d.nref[1] = h264state.ue(b) + 1
+    if d.stype is not 1
+        d.nref[1] = 0
+    if d.stype is 2
+        d.nref[0] = 0
+    if d.nref[0] > 32
+        d.nref[0] = 32
+    if d.nref[1] > 32
+        d.nref[1] = 32
+    new mods [128] u32
+    new pos = read_mods(b, addr of mods[0], 0, d.stype is not 2)
+    read_mods(b, addr of mods[0], pos, d.stype is 1)
+    if (d.p.weighted and d.stype is 0) or (d.p.bipred is 1 and d.stype is 1)
+        read_weights(d, b)
+    d.nmmco = 0
+    d.long_term = false
+    if d.nal_ref is not 0
+        if idr
+            h264state.u(b, 1)
+            d.long_term = h264state.u(b, 1) is 1
+        else if h264state.u(b, 1) is 1
+            repeat
+                new op = h264state.ue(b)
+                if op is 0 or d.nmmco >= 32
+                    stop
+                new a u32 = 0
+                new bb u32 = 0
+                if op is 1 or op is 3 or op is 2 or op is 4
+                    a = h264state.ue(b)
+                if op is 3 or op is 6
+                    bb = h264state.ue(b)
+                d.mmco[(d.nmmco * 3) as u64] = op
+                d.mmco[(d.nmmco * 3 + 1) as u64] = a
+                d.mmco[(d.nmmco * 3 + 2) as u64] = bb
+                d.nmmco += 1
+    new init_type u64 = 0
+    if d.stype is not 2
+        init_type = h264state.ue(b) as u64 + 1
+    new qp = d.p.init_qp + h264state.se(b)
+    d.deblock_idc = 0
+    d.alpha_off = 0
+    d.beta_off = 0
+    if d.p.deblock_ctl
+        d.deblock_idc = h264state.ue(b)
+        if d.deblock_idc is not 1
+            d.alpha_off = h264state.se(b) * 2
+            d.beta_off = h264state.se(b) * 2
+    if first_mb is 0
+        start_picture(d)
+    else if d.cur as u64 is 0 or d.pic_done
+        give                                            -- a slice without its picture's start
+    d.slice_no += 1
+    build_lists(d, addr of mods[0])
+    h264cabac.start(d, b.data, b.size, b.pos, init_type, qp)
+    d.qp = qp
+    d.prev_qpd = 0
+    new a = first_mb
+    while a < d.mb_count
+        start_mb(d, a)
+        if d.stype is not 2 and h264mb.skip_flag(d)
+            skip_mb(d)
+        else
+            macroblock(d)
+        if h264cabac.terminate(d) is 1
+            stop
+        a += 1
+    if a + 1 >= d.mb_count
+        finish_picture(d)
+
+-- ---------------------------------------------------------------- macroblocks
+
+to start_mb (d ptr h264state.decoder, a u64)
+    d.mba = a
+    d.mbx = (a % (d.s.mb_w as u64)) * 16
+    d.mby = (a / (d.s.mb_w as u64)) * 16
+    d.done[0] = 0
+    d.done[1] = 0
+    d.spatial_done = false
+    new m = h264state.mb(d, a)
+    m.avail = true
+    m.slice = d.slice_no
+    m.kind = h264state.k_none
+    m.intra = false
+    m.t8 = false
+    m.cbp = 0
+    m.cmode = 0
+    m.i16mode = 0
+    m.btype = -1
+    m.qpdelta = 0
+    m.nz = 0
+    m.nzdc = 0
+    m.nzc[0] = 0
+    m.nzc[1] = 0
+    m.direct = 0
+    for each k in 0 until 16
+        m.modes[k] = 2
+    for each k in 0 until 8
+        m.ref[k] = -1
+        m.refpic[k] = 0
+    for each k in 0 until 64
+        m.mv[k] = 0
+        m.mvd[k] = 0
+
+to set_qp (d ptr h264state.decoder, m ptr h264state.mbinfo)
+    m.qp = d.qp
+    m.qpc[0] = h264tables.chroma_qp[h264state.clip(d.qp + d.p.cqp, 0, 51) as u64] as i32
+    m.qpc[1] = h264tables.chroma_qp[h264state.clip(d.qp + d.p.cqp2, 0, 51) as u64] as i32
+
+to skip_mb (d ptr h264state.decoder)
+    new m = h264state.mb(d, d.mba)
+    if d.stype is 0
+        h264motion.p_skip(d, m)
+    else
+        h264motion.b_skip(d, m)
+    set_qp(d, m)
+    d.prev_qpd = 0
+    h264recon.inter(d, m)
+
+to macroblock (d ptr h264state.decoder)
+    new m = h264state.mb(d, d.mba)
+    new mtype i32 = -1
+    if d.stype is 0
+        mtype = h264mb.p_type(d)
+    else if d.stype is 1
+        mtype = h264mb.b_type(d)
+    if d.stype is not 2 and mtype >= 0
+        new ok8 = h264motion.inter(d, m, mtype)
+        m.intra = false
+        m.cbp = h264mb.cbp(d)
+        if m.cbp & 15 is not 0 and d.p.t8 and ok8
+            m.t8 = h264mb.transform8(d)
+        if m.cbp is not 0
+            h264mb.qp_delta(d, m)
+        else
+            d.prev_qpd = 0
+        set_qp(d, m)
+        h264mb.residual(d, m)
+        h264recon.inter(d, m)
+        give
+    if d.stype is 2
+        h264mb.i_type(d, m)
+    else if d.stype is 0
+        h264mb.intra_type(d, m, 17)
+    else
+        h264mb.intra_type(d, m, 32)
+    m.intra = true
+    if m.kind is h264state.k_pcm
+        give                                            -- not supported
+    if m.kind is h264state.k_nxn
+        if d.p.t8
+            m.t8 = h264mb.transform8(d)
+        if m.t8
+            h264mb.pred_flags(d, 4)
+        else
+            h264mb.pred_flags(d, 16)
+    m.cmode = h264mb.chroma_mode(d)
+    if m.kind is h264state.k_nxn
+        h264mb.intra_modes(d, m)
+        m.cbp = h264mb.cbp(d)
+    if m.kind is h264state.k_i16 or m.cbp is not 0
+        h264mb.qp_delta(d, m)
+    else
+        d.prev_qpd = 0
+    set_qp(d, m)
+    h264mb.residual(d, m)
+    h264recon.intra(d, m)

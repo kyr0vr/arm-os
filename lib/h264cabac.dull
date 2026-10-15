@@ -1,0 +1,74 @@
+-- The CABAC arithmetic decoder of H.264 (9.3.1.2 and 9.3.3.2 of the standard).
+
+use h264state
+use h264tables
+
+to bit (d ptr h264state.decoder) gives u32
+    new pos = d.bit >> 3
+    new v u32 = 0
+    if pos < d.size
+        new shift = (7 - (d.bit & 7)) as u32
+        v = ((d.data[pos] as u32) >> shift) & 1
+    d.bit += 1
+    give v
+
+-- Start decoding the slice data at bit `pos` (rounded up to a byte) of `data`.
+to start (d ptr h264state.decoder, data ptr u8, size u64, pos u64, init_type u64, slice_qp i32)
+    d.data = data
+    d.size = size
+    d.bit = (pos + 7) & 0xFFFF_FFFF_FFFF_FFF8
+    new q = h264state.clip(slice_qp, 0, 51) as i64
+    for each i in 0 until 460
+        new m = h264tables.ctx_init[(i * 4 + init_type) * 2] as i64
+        new n = h264tables.ctx_init[(i * 4 + init_type) * 2 + 1] as i64
+        new pre = ((m * q) >> 4) + n
+        if pre < 1
+            pre = 1
+        if pre > 126
+            pre = 126
+        if pre <= 63
+            d.state[i] = (63 - pre) as u8
+            d.mps[i] = 0
+        else
+            d.state[i] = (pre - 64) as u8
+            d.mps[i] = 1
+    d.range = 510
+    d.offset = 0
+    for each k in 0 until 9
+        d.offset = (d.offset << 1) | bit(d)
+
+to decision (d ptr h264state.decoder, ctx u64) gives u32
+    new s = d.state[ctx] as u64
+    new lps = h264tables.range_lps[s * 4 + ((d.range >> 6) & 3) as u64] as u32
+    d.range -= lps
+    new b u32 = 0
+    if d.offset >= d.range
+        b = 1 - d.mps[ctx] as u32
+        d.offset -= d.range
+        d.range = lps
+        if s is 0
+            d.mps[ctx] = 1 - d.mps[ctx]
+        d.state[ctx] = h264tables.next_state[s * 2]
+    else
+        b = d.mps[ctx] as u32
+        d.state[ctx] = h264tables.next_state[s * 2 + 1]
+    while d.range < 256
+        d.range = d.range << 1
+        d.offset = (d.offset << 1) | bit(d)
+    give b
+
+to bypass (d ptr h264state.decoder) gives u32
+    d.offset = (d.offset << 1) | bit(d)
+    if d.offset >= d.range
+        d.offset -= d.range
+        give 1
+    give 0
+
+to terminate (d ptr h264state.decoder) gives u32
+    d.range -= 2
+    if d.offset >= d.range
+        give 1
+    while d.range < 256
+        d.range = d.range << 1
+        d.offset = (d.offset << 1) | bit(d)
+    give 0

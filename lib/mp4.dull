@@ -1,0 +1,273 @@
+-- Reading MP4 files (ISO base media file format): the tracks of the `moov` box and
+-- where each sample (a video frame, a chunk of audio) is in the file, with its time.
+--
+--   new m = mp4.make()
+--   mp4.parse(m, moov_bytes, moov_size)   -- the contents of the moov box
+--   m.tracks[i]: kind (1 video H.264, 2 audio AAC), samples, offsets, sizes, times
+--
+-- H.264 tracks keep their avcC (SPS, PPS, NAL length size); AAC tracks their
+-- AudioSpecificConfig.
+
+use mem
+
+fixed video u32 = 1
+fixed audio u32 = 2
+fixed max_tracks u64 = 8
+
+shape track
+    kind       u32
+    timescale  u32
+    duration   u64
+    width      u32
+    height     u32
+    channels   u32
+    rate       u32
+    count      u64                     -- samples
+    sizes      ptr u32
+    offsets    ptr u64
+    times      ptr u64                 -- decode time of each sample (timescale units)
+    shift      ptr i32                 -- composition offset (presentation = time + shift)
+    sync       ptr u8                  -- 1 for key frames (all, if there is no stss)
+    config     ptr u8                  -- avcC, or the AudioSpecificConfig
+    config_size u64
+
+shape movie
+    tracks     [8] track
+    ntracks    u64
+    timescale  u32
+    duration   u64
+
+to make gives ptr movie
+    give mem.alloc(size_of(movie)) as ptr movie
+
+to be32 (p ptr u8) gives u32
+    give ((p[0] as u32) << 24) | ((p[1] as u32) << 16) | ((p[2] as u32) << 8) | (p[3] as u32)
+
+to be16 (p ptr u8) gives u32
+    give ((p[0] as u32) << 8) | (p[1] as u32)
+
+to be64 (p ptr u8) gives u64
+    give ((be32(p) as u64) << 32) | be32(p + 4) as u64
+
+to named (p ptr u8, name string) gives bool
+    give p[0] is name[0] and p[1] is name[1] and p[2] is name[2] and p[3] is name[3]
+
+-- The box named `name` among the boxes in [start, finish): gives its contents
+-- (after the header) and their size in `size`, or null.
+to find (start ptr u8, finish ptr u8, name string, size ptr u64) gives ptr u8
+    new p = start
+    while (p as u64) + 8 <= finish as u64
+        new box = be32(p) as u64
+        new head u64 = 8
+        if box is 1
+            box = be64(p + 8)
+            head = 16
+        else if box is 0
+            box = finish as u64 - p as u64
+        if box < head or (p as u64) + box > finish as u64
+            give 0 as ptr u8
+        if named(p + 4, name)
+            deref size = box - head
+            give p + head
+        p = p + box
+    give 0 as ptr u8
+
+-- The box `name` inside the box at `start` (contents of size `size`).
+to inside (start ptr u8, size u64, name string, out ptr u64) gives ptr u8
+    if start as u64 is 0
+        give start
+    give find(start, start + size, name, out)
+
+to parse (m ptr movie, moov ptr u8, size u64) gives bool
+    m.ntracks = 0
+    new mvhd_size u64 = 0
+    new mvhd = find(moov, moov + size, "mvhd", addr of mvhd_size)
+    if mvhd as u64 is not 0
+        if mvhd[0] is 1
+            m.timescale = be32(mvhd + 20)
+            m.duration = be64(mvhd + 24)
+        else
+            m.timescale = be32(mvhd + 12)
+            m.duration = be32(mvhd + 16) as u64
+    new p = moov
+    new finish = moov + size
+    while (p as u64) + 8 <= finish as u64
+        new box = be32(p) as u64
+        if box < 8 or (p as u64) + box > finish as u64
+            stop
+        if named(p + 4, "trak") and m.ntracks < max_tracks
+            if track_of(addr of m.tracks[m.ntracks], p + 8, box - 8)
+                m.ntracks += 1
+        p = p + box
+    give m.ntracks > 0
+
+to track_of (t ptr track, trak ptr u8, size u64) gives bool
+    new s u64 = 0
+    new mdia_size u64 = 0
+    new mdia = inside(trak, size, "mdia", addr of mdia_size)
+    new hdlr = inside(mdia, mdia_size, "hdlr", addr of s)
+    if hdlr as u64 is 0
+        give false
+    new mdhd = inside(mdia, mdia_size, "mdhd", addr of s)
+    if mdhd as u64 is 0
+        give false
+    if mdhd[0] is 1
+        t.timescale = be32(mdhd + 20)
+        t.duration = be64(mdhd + 24)
+    else
+        t.timescale = be32(mdhd + 12)
+        t.duration = be32(mdhd + 16) as u64
+    new stbl_size u64 = 0
+    new minf_size u64 = 0
+    new minf = inside(mdia, mdia_size, "minf", addr of minf_size)
+    new stbl = inside(minf, minf_size, "stbl", addr of stbl_size)
+    if stbl as u64 is 0
+        give false
+    new stsd_size u64 = 0
+    new stsd = find(stbl, stbl + stbl_size, "stsd", addr of stsd_size)
+    if stsd as u64 is 0 or stsd_size < 16
+        give false
+    new entry = stsd + 8
+    new entry_size = be32(entry) as u64
+    t.kind = 0
+    if named(entry + 4, "avc1")
+        t.kind = video
+        t.width = be16(entry + 8 + 24)
+        t.height = be16(entry + 8 + 26)
+        new cs u64 = 0
+        new avcc = find(entry + 8 + 78, entry + entry_size, "avcC", addr of cs)
+        if avcc as u64 is 0
+            give false
+        t.config = avcc
+        t.config_size = cs
+    else if named(entry + 4, "mp4a")
+        t.kind = audio
+        t.channels = be16(entry + 8 + 16)
+        t.rate = be32(entry + 8 + 24) >> 16
+        new es_size u64 = 0
+        new esds = find(entry + 8 + 28, entry + entry_size, "esds", addr of es_size)
+        if esds as u64 is not 0
+            audio_config(t, esds + 4, es_size - 4)
+    else
+        give false
+    give samples(t, stbl, stbl_size)
+
+-- The MPEG-4 descriptors in esds: find the DecoderSpecificInfo (tag 5).
+to audio_config (t ptr track, p ptr u8, size u64)
+    new i u64 = 0
+    while i + 2 <= size
+        new tag = p[i]
+        i += 1
+        new len u64 = 0
+        for each k in 0 until 4
+            new b = p[i]
+            i += 1
+            len = (len << 7) | (b & 127) as u64
+            if b & 128 is 0
+                stop
+        if tag is 3
+            i += 3                                      -- ES_ID, flags (dependent streams are rare)
+        else if tag is 4
+            i += 13                                     -- object type, stream type, buffer, bitrates
+        else if tag is 5
+            t.config = p + i
+            t.config_size = len
+            give
+        else
+            i += len
+
+to samples (t ptr track, stbl ptr u8, size u64) gives bool
+    new s u64 = 0
+    new stsz = find(stbl, stbl + size, "stsz", addr of s)
+    if stsz as u64 is 0
+        give false
+    new fixed_size = be32(stsz + 4)
+    t.count = be32(stsz + 8) as u64
+    t.sizes = mem.alloc(t.count * 4 + 4) as ptr u32
+    for each i in 0 until t.count
+        t.sizes[i] = fixed_size
+        if fixed_size is 0
+            t.sizes[i] = be32(stsz + 12 + i * 4)
+    -- chunk offsets
+    new chunks u64 = 0
+    new co = find(stbl, stbl + size, "stco", addr of s)
+    new wide = false
+    if co as u64 is 0
+        co = find(stbl, stbl + size, "co64", addr of s)
+        wide = true
+    if co as u64 is 0
+        give false
+    chunks = be32(co + 4) as u64
+    new stsc = find(stbl, stbl + size, "stsc", addr of s)
+    if stsc as u64 is 0
+        give false
+    new runs = be32(stsc + 4) as u64
+    t.offsets = mem.alloc(t.count * 8 + 8) as ptr u64
+    new sample u64 = 0
+    new run u64 = 0
+    for each c in 0 until chunks
+        while run + 1 < runs and be32(stsc + 8 + (run + 1) * 12) as u64 <= c + 1
+            run += 1
+        new per = be32(stsc + 8 + run * 12 + 4) as u64
+        new off u64 = 0
+        if wide
+            off = be64(co + 8 + c * 8)
+        else
+            off = be32(co + 8 + c * 4) as u64
+        for each k in 0 until per
+            if sample >= t.count
+                stop
+            t.offsets[sample] = off
+            off += t.sizes[sample] as u64
+            sample += 1
+    -- decode times
+    t.times = mem.alloc(t.count * 8 + 8) as ptr u64
+    new stts = find(stbl, stbl + size, "stts", addr of s)
+    new time u64 = 0
+    new pos u64 = 0
+    if stts as u64 is not 0
+        new n = be32(stts + 4) as u64
+        for each e in 0 until n
+            new cnt = be32(stts + 8 + e * 8) as u64
+            new delta = be32(stts + 12 + e * 8) as u64
+            for each k in 0 until cnt
+                if pos < t.count
+                    t.times[pos] = time
+                    pos += 1
+                time += delta
+    -- composition offsets
+    t.shift = mem.alloc(t.count * 4 + 4) as ptr i32
+    new ctts = find(stbl, stbl + size, "ctts", addr of s)
+    if ctts as u64 is not 0
+        new n = be32(ctts + 4) as u64
+        pos = 0
+        for each e in 0 until n
+            new cnt = be32(ctts + 8 + e * 8) as u64
+            new off = be32(ctts + 12 + e * 8) as i32
+            for each k in 0 until cnt
+                if pos < t.count
+                    t.shift[pos] = off
+                    pos += 1
+    -- key frames
+    t.sync = mem.alloc(t.count + 1)
+    new stss = find(stbl, stbl + size, "stss", addr of s)
+    if stss as u64 is 0
+        for each i in 0 until t.count
+            t.sync[i] = 1
+    else
+        new n = be32(stss + 4) as u64
+        for each e in 0 until n
+            new k = be32(stss + 8 + e * 4) as u64
+            if k >= 1 and k <= t.count
+                t.sync[k - 1] = 1
+    give true
+
+-- Where the moov box is in a whole file in memory (null if it is not there).
+to moov_of (file ptr u8, size u64, out ptr u64) gives ptr u8
+    give find(file, file + size, "moov", out)
+
+-- The NAL units of an H.264 sample: their length prefix size (1, 2 or 4).
+to nal_length_size (t ptr track) gives u64
+    if t.config_size < 5
+        give 4
+    give ((t.config[4] & 3) as u64) + 1

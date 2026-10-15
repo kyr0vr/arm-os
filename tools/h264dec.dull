@@ -1,0 +1,130 @@
+-- Decode the video of an MP4 file to raw YUV 4:2:0 frames with lib/h264.dull, on the
+-- PC (QEMU, semihosting). tests/h264_test.py compares the result with ffmpeg's.
+--
+--   h264dec <in.mp4> <out.yuv>
+
+use sys
+use mem
+use mp4
+use h264
+use h264state
+
+to word_from_end (line string, n u64) gives string
+    new words [8] u64
+    new ends [8] u64
+    new count u64 = 0
+    new i u64 = 0
+    while i < line.len and count < 8
+        while i < line.len and line[i] is ' '
+            i += 1
+        if i >= line.len
+            stop
+        words[count] = i
+        while i < line.len and line[i] is not ' '
+            i += 1
+        ends[count] = i
+        count += 1
+    new empty string
+    if n >= count
+        give empty
+    new k = count - 1 - n
+    give line[words[k] until ends[k]]
+
+new out ptr u8
+new used u64
+new cap u64
+
+-- Append the cropped planes of `pic` to the output.
+to save (d ptr h264state.decoder, pic ptr h264state.picture)
+    new w = h264.width(d) as u64
+    new h = h264.height(d) as u64
+    new cx = h264.crop_x(d) as u64
+    new cy = h264.crop_y(d) as u64
+    new need = w * h * 3 / 2
+    if used + need > cap
+        cap = (used + need) * 2
+        new bigger = mem.alloc(cap)
+        for each i in 0 until used
+            bigger[i] = out[i]
+        out = bigger
+    for each y in 0 until h
+        new row = pic.y + (cy + y) * pic.stride + cx
+        for each x in 0 until w
+            out[used] = row[x]
+            used += 1
+    for each plane in 0 until 2
+        new base = pic.u
+        if plane is 1
+            base = pic.v
+        for each y in 0 until h / 2
+            new row = base + (cy / 2 + y) * pic.cstride + cx / 2
+            for each x in 0 until w / 2
+                out[used] = row[x]
+                used += 1
+
+to main gives u8
+    new line = sys.command_line()
+    new input = word_from_end(line, 1)
+    new output = word_from_end(line, 0)
+    new file string
+    if not sys.read_file(input, addr of file)
+        sys.print("h264dec: cannot read the input\n")
+        give 1
+    new moov_size u64 = 0
+    new moov = mp4.moov_of(file.ptr, file.len, addr of moov_size)
+    new m = mp4.make()
+    if moov as u64 is 0 or not mp4.parse(m, moov, moov_size)
+        sys.print("h264dec: not an MP4 file\n")
+        give 2
+    new t = 0 as ptr mp4.track
+    for each i in 0 until m.ntracks
+        if m.tracks[i].kind is mp4.video
+            t = addr of m.tracks[i]
+    if t as u64 is 0
+        sys.print("h264dec: no H.264 track\n")
+        give 3
+    new d = h264.make()
+    -- SPS and PPS from the avcC box
+    new c = t.config
+    new p u64 = 6
+    new nsps = (c[5] & 31) as u64
+    for each k in 0 until nsps
+        new len = mp4.be16(c + p) as u64
+        h264.nal(d, c + p + 2, len)
+        p += 2 + len
+    new npps = c[p] as u64
+    p += 1
+    for each k in 0 until npps
+        new len = mp4.be16(c + p) as u64
+        h264.nal(d, c + p + 2, len)
+        p += 2 + len
+    new ls = mp4.nal_length_size(t)
+    for each s in 0 until t.count
+        new data = file.ptr + t.offsets[s]
+        new size = t.sizes[s] as u64
+        new q u64 = 0
+        while q + ls <= size
+            new len u64 = 0
+            for each k in 0 until ls
+                len = (len << 8) | data[q + k] as u64
+            q += ls
+            if q + len > size
+                stop
+            h264.nal(d, data + q, len)
+            q += len
+        repeat
+            new pic = h264.frame(d, false)
+            if pic as u64 is 0
+                stop
+            save(d, pic)
+    repeat
+        new pic = h264.frame(d, true)
+        if pic as u64 is 0
+            stop
+        save(d, pic)
+    new result string
+    result.ptr = out
+    result.len = used
+    if not sys.write_file(output, result)
+        give 4
+    give 0

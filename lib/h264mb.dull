@@ -1,0 +1,585 @@
+-- Macroblock syntax of H.264 with CABAC (7.3.5 and 9.3.3.1 of the standard): the
+-- syntax elements and how their contexts depend on the neighbouring macroblocks.
+
+use h264state
+use h264cabac
+use h264tables
+
+fixed none u64 = 0xFFFF_FFFF_FFFF_FFFF
+
+to dec (d ptr h264state.decoder, ctx u64) gives u32
+    give h264cabac.decision(d, ctx)
+
+to present (m ptr h264state.mbinfo) gives bool
+    give m as u64 is not 0
+
+-- ---------------------------------------------------------------- macroblock types
+
+-- mb_type in an I slice: kind in m.kind, plus the 16x16 mode and cbp.
+to i_type (d ptr h264state.decoder, m ptr h264state.mbinfo)
+    new a = h264state.left_of(d, d.mba)
+    new b = h264state.top_of(d, d.mba)
+    new inc u64 = 0
+    if present(a) and a.kind is not h264state.k_nxn
+        inc += 1
+    if present(b) and b.kind is not h264state.k_nxn
+        inc += 1
+    if dec(d, 3 + inc) is 0
+        m.kind = h264state.k_nxn
+        give
+    if h264cabac.terminate(d) is 1
+        m.kind = h264state.k_pcm
+        give
+    m.kind = h264state.k_i16
+    new luma = dec(d, 3 + 3)
+    new chroma = dec(d, 3 + 4)
+    if chroma is 1
+        chroma = 1 + dec(d, 3 + 5)
+    new mode = dec(d, 3 + 6) * 2
+    mode += dec(d, 3 + 7)
+    m.i16mode = mode as u8
+    m.cbp = ((luma * 15) | (chroma << 4)) as u8
+
+-- An intra macroblock's type in a P or B slice (ctx 17 or 32 onwards).
+to intra_type (d ptr h264state.decoder, m ptr h264state.mbinfo, base u64)
+    if dec(d, base) is 0
+        m.kind = h264state.k_nxn
+        give
+    if h264cabac.terminate(d) is 1
+        m.kind = h264state.k_pcm
+        give
+    m.kind = h264state.k_i16
+    new luma = dec(d, base + 1)
+    new chroma = dec(d, base + 2)
+    if chroma is 1
+        chroma = 1 + dec(d, base + 2)
+    new mode = dec(d, base + 3) * 2
+    mode += dec(d, base + 3)
+    m.i16mode = mode as u8
+    m.cbp = ((luma * 15) | (chroma << 4)) as u8
+
+-- P mb_type: 0 16x16, 1 16x8, 2 8x16, 3 8x8; -1 for intra.
+to p_type (d ptr h264state.decoder) gives i32
+    if dec(d, 14) is 0
+        if dec(d, 15) is 0
+            give 3 * dec(d, 16) as i32
+        give 2 - dec(d, 17) as i32
+    give -1
+
+-- B mb_type 0 (direct) .. 22 (8x8); -1 for intra.
+to b_type (d ptr h264state.decoder) gives i32
+    new a = h264state.left_of(d, d.mba)
+    new b = h264state.top_of(d, d.mba)
+    new inc u64 = 0
+    if present(a) and not (a.kind is h264state.k_skip or (a.kind is h264state.k_b and a.btype is 0))
+        inc += 1
+    if present(b) and not (b.kind is h264state.k_skip or (b.kind is h264state.k_b and b.btype is 0))
+        inc += 1
+    if dec(d, 27 + inc) is 0
+        give 0
+    if dec(d, 27 + 3) is 0
+        give 1 + dec(d, 27 + 5) as i32
+    new bits = dec(d, 27 + 4) << 3
+    bits = bits | (dec(d, 27 + 5) << 2)
+    bits = bits | (dec(d, 27 + 5) << 1)
+    bits = bits | dec(d, 27 + 5)
+    if bits < 8
+        give bits as i32 + 3
+    if bits is 13
+        give -1
+    if bits is 14
+        give 11
+    if bits is 15
+        give 22
+    bits = (bits << 1) | dec(d, 27 + 5)
+    give bits as i32 - 4
+
+to p_sub (d ptr h264state.decoder) gives u32
+    if dec(d, 21) is 1
+        give 0
+    if dec(d, 22) is 0
+        give 1
+    if dec(d, 23) is 1
+        give 2
+    give 3
+
+to b_sub (d ptr h264state.decoder) gives u32
+    if dec(d, 36) is 0
+        give 0
+    if dec(d, 37) is 0
+        give 1 + dec(d, 39)
+    new t u32 = 3
+    if dec(d, 38) is 1
+        if dec(d, 39) is 1
+            give 11 + dec(d, 39)
+        t += 4
+    t += 2 * dec(d, 39)
+    t += dec(d, 39)
+    give t
+
+to skip_flag (d ptr h264state.decoder) gives bool
+    new a = h264state.left_of(d, d.mba)
+    new b = h264state.top_of(d, d.mba)
+    new inc u64 = 0
+    if present(a) and a.kind is not h264state.k_skip
+        inc += 1
+    if present(b) and b.kind is not h264state.k_skip
+        inc += 1
+    new base u64 = 24
+    if d.stype is 0
+        base = 11
+    give dec(d, base + inc) is 1
+
+to transform8 (d ptr h264state.decoder) gives bool
+    new a = h264state.left_of(d, d.mba)
+    new b = h264state.top_of(d, d.mba)
+    new inc u64 = 0
+    if present(a) and a.t8
+        inc += 1
+    if present(b) and b.t8
+        inc += 1
+    give dec(d, 399 + inc) is 1
+
+-- ---------------------------------------------------------------- intra modes
+
+-- prev_intra_pred_mode_flag / rem_intra_pred_mode for `n` blocks into d.rem
+-- (-1 when the predicted mode is used).
+to pred_flags (d ptr h264state.decoder, n u64)
+    for each i in 0 until n
+        if dec(d, 68) is 1
+            d.rem[i] = -1
+        else
+            new r = dec(d, 69)
+            r = r | (dec(d, 69) << 1)
+            r = r | (dec(d, 69) << 2)
+            d.rem[i] = r as i32
+
+-- The mode of the block covering (x, y) for prediction purposes: -1 if not
+-- available, 2 (DC) if that macroblock is not I_NxN.
+to mode_at (d ptr h264state.decoder, x i32, y i32) gives i32
+    new blk u64 = 0
+    new m = h264state.neighbor(d, x, y, addr of blk)
+    if not present(m)
+        give -1
+    if d.p.constrained and not m.intra
+        give -1
+    if m.kind is not h264state.k_nxn
+        give 2
+    give m.modes[blk] as i32
+
+to intra_modes (d ptr h264state.decoder, m ptr h264state.mbinfo)
+    if m.t8
+        for each b8 in 0 until 4
+            new bx = ((b8 % 2) * 8) as i32
+            new by = ((b8 / 2) * 8) as i32
+            new a = mode_at(d, bx - 1, by)
+            new b = mode_at(d, bx, by - 1)
+            new pred i32 = 2
+            if a >= 0 and b >= 0
+                pred = a
+                if b < a
+                    pred = b
+            new r = d.rem[b8]
+            new mode = pred
+            if r >= 0
+                mode = r
+                if r >= pred
+                    mode = r + 1
+            for each k in 0 until 4
+                m.modes[b8 * 4 + k] = mode as u8
+        give
+    for each blk in 0 until 16
+        new bx = (h264state.blk_x[blk] * 4) as i32
+        new by = (h264state.blk_y[blk] * 4) as i32
+        new a = mode_at(d, bx - 1, by)
+        new b = mode_at(d, bx, by - 1)
+        new pred i32 = 2
+        if a >= 0 and b >= 0
+            pred = a
+            if b < a
+                pred = b
+        new r = d.rem[blk]
+        new mode = pred
+        if r >= 0
+            mode = r
+            if r >= pred
+                mode = r + 1
+        m.modes[blk] = mode as u8
+
+to chroma_mode (d ptr h264state.decoder) gives u8
+    new a = h264state.left_of(d, d.mba)
+    new b = h264state.top_of(d, d.mba)
+    new inc u64 = 0
+    if present(a) and a.intra and a.kind is not h264state.k_pcm and a.cmode is not 0
+        inc += 1
+    if present(b) and b.intra and b.kind is not h264state.k_pcm and b.cmode is not 0
+        inc += 1
+    if dec(d, 64 + inc) is 0
+        give 0
+    if dec(d, 64 + 3) is 0
+        give 1
+    if dec(d, 64 + 3) is 0
+        give 2
+    give 3
+
+-- ---------------------------------------------------------------- coded_block_pattern, qp
+
+to cbp_luma_term (n ptr h264state.mbinfo, b8 u64) gives u64
+    if not present(n) or n.kind is h264state.k_pcm
+        give 0
+    if n.kind is h264state.k_skip
+        give 1
+    if ((n.cbp as u64) >> b8) & 1 is 1
+        give 0
+    give 1
+
+to cbp_chroma_term (n ptr h264state.mbinfo, second bool) gives u64
+    if not present(n) or n.kind is h264state.k_skip
+        give 0
+    if n.kind is h264state.k_pcm
+        give 1
+    new c = n.cbp >> 4
+    if second
+        if c is 2
+            give 1
+        give 0
+    if c is not 0
+        give 1
+    give 0
+
+to cbp (d ptr h264state.decoder) gives u8
+    new a = h264state.left_of(d, d.mba)
+    new b = h264state.top_of(d, d.mba)
+    new luma u64 = 0
+    for each b8 in 0 until 4
+        new ca u64 = 0
+        if b8 % 2 is 1
+            if (luma >> (b8 - 1)) & 1 is 0
+                ca = 1
+        else
+            ca = cbp_luma_term(a, b8 + 1)
+        new cb u64 = 0
+        if b8 / 2 is 1
+            if (luma >> (b8 - 2)) & 1 is 0
+                cb = 1
+        else
+            cb = cbp_luma_term(b, b8 + 2)
+        if dec(d, 73 + ca + 2 * cb) is 1
+            luma = luma | ((1 as u64) << b8)
+    new chroma u64 = 0
+    new inc = cbp_chroma_term(a, false) + 2 * cbp_chroma_term(b, false)
+    if dec(d, 77 + inc) is 1
+        inc = cbp_chroma_term(a, true) + 2 * cbp_chroma_term(b, true)
+        chroma = 1 + dec(d, 77 + 4 + inc) as u64
+    give (luma | (chroma << 4)) as u8
+
+to qp_delta (d ptr h264state.decoder, m ptr h264state.mbinfo)
+    new inc u64 = 0
+    if d.prev_qpd is not 0
+        inc = 1
+    new k i32 = 0
+    if dec(d, 60 + inc) is 1
+        k = 1
+        new ctx u64 = 62
+        while dec(d, ctx) is 1
+            k += 1
+            ctx = 63
+    new delta = (k + 1) / 2
+    if k & 1 is 0
+        delta = 0 - k / 2
+    d.qp = (d.qp + delta + 52) % 52
+    m.qpdelta = delta
+    d.prev_qpd = delta
+
+-- ---------------------------------------------------------------- residual blocks
+
+fixed cbf_offset [5] u64 = [0, 4, 8, 12, 16]
+fixed map_offset [5] u64 = [0, 15, 29, 44, 47]
+fixed abs_offset [5] u64 = [0, 10, 20, 30, 39]
+
+-- condTermFlagN of coded_block_flag when the neighbour macroblock is n; `flag` is
+-- the neighbour block's own flag (used when that block exists).
+to cbf_term (cur ptr h264state.mbinfo, n ptr h264state.mbinfo, block_exists bool, flag u32) gives u64
+    if not present(n)
+        if cur.intra
+            give 1
+        give 0
+    if n.kind is h264state.k_pcm
+        give 1
+    if n.kind is h264state.k_skip
+        give 0
+    if not block_exists
+        give 0
+    give flag as u64
+
+-- Significance map and levels of one block (after its coded_block_flag), into
+-- `out` in scan order (n coefficients).
+to block (d ptr h264state.decoder, cat u64, n u64, out ptr i32)
+    for each i in 0 until n
+        out[i] = 0
+    new sig_base u64 = 402
+    new last_base u64 = 417
+    new abs_base u64 = 426
+    if cat is not 5
+        sig_base = 105 + map_offset[cat]
+        last_base = 166 + map_offset[cat]
+        abs_base = 227 + abs_offset[cat]
+    new sig [64] u8
+    new count u64 = 0
+    new i u64 = 0
+    new ended = false
+    while i + 1 < n
+        new inc = i
+        new linc = i
+        if cat is 5
+            inc = h264tables.sig8[i] as u64
+            linc = h264tables.last8[i] as u64
+        else if cat is 3
+            if inc > 2
+                inc = 2
+            linc = inc
+        if dec(d, sig_base + inc) is 1
+            sig[count] = i as u8
+            count += 1
+            if dec(d, last_base + linc) is 1
+                ended = true
+                stop
+        i += 1
+    if not ended
+        sig[count] = (n - 1) as u8
+        count += 1
+    new gt1 u64 = 0
+    new eq1 u64 = 0
+    new top u64 = 4
+    if cat is 3
+        top = 3
+    new k = count
+    while k > 0
+        k -= 1
+        new inc u64 = 0
+        if gt1 is 0
+            inc = 1 + eq1
+            if inc > 4
+                inc = 4
+        new prefix u32 = 0
+        if dec(d, abs_base + inc) is 1
+            prefix = 1
+            new g = gt1
+            if g > top
+                g = top
+            new ctx = abs_base + 5 + g
+            while prefix < 14 and dec(d, ctx) is 1
+                prefix += 1
+        new level = prefix
+        if prefix is 14
+            new e u32 = 0
+            while h264cabac.bypass(d) is 1
+                level += (1 as u32) << e
+                e += 1
+            while e > 0
+                e -= 1
+                level += h264cabac.bypass(d) << e
+        level += 1
+        if level is 1
+            eq1 += 1
+        else
+            gt1 += 1
+        new v = level as i32
+        if h264cabac.bypass(d) is 1
+            v = 0 - v
+        out[sig[k] as u64] = v
+
+to flag (d ptr h264state.decoder, cat u64, a u64, b u64) gives bool
+    give dec(d, 85 + cbf_offset[cat] + a + 2 * b) is 1
+
+-- The coded_block_flag terms of luma 4x4 block `blk` of the current macroblock.
+to luma_terms (d ptr h264state.decoder, m ptr h264state.mbinfo, blk u64, ta ptr u64, tb ptr u64)
+    new bx = (h264state.blk_x[blk] * 4) as i32
+    new by = (h264state.blk_y[blk] * 4) as i32
+    for each side in 0 until 2
+        new x = bx - 1
+        new y = by
+        if side is 1
+            x = bx
+            y = by - 1
+        new nb u64 = 0
+        new n = h264state.neighbor(d, x, y, addr of nb)
+        new t u64 = 0
+        if n as u64 is m as u64
+            t = ((m.nz >> nb as u32) & 1) as u64
+        else
+            new exists = false
+            new f u32 = 0
+            if present(n)
+                exists = ((n.cbp as u64) >> (nb / 4)) & 1 is 1
+                if n.t8
+                    f = 1
+                else
+                    f = (n.nz >> nb as u32) & 1
+            t = cbf_term(m, n, exists, f)
+        if side is 0
+            deref ta = t
+        else
+            deref tb = t
+
+-- All residual blocks of the current macroblock, into the decoder's coefficient arrays.
+to residual (d ptr h264state.decoder, m ptr h264state.mbinfo)
+    new a = h264state.left_of(d, d.mba)
+    new b = h264state.top_of(d, d.mba)
+    for each i in 0 until 256
+        d.luma[i] = 0
+        d.luma8[i] = 0
+    for each i in 0 until 16
+        d.dc[i] = 0
+    for each i in 0 until 8
+        d.cdc[i] = 0
+    for each i in 0 until 128
+        d.cac[i] = 0
+    new scan [64] i32
+    if m.kind is h264state.k_i16
+        new fa u32 = 0
+        new ea = false
+        if present(a) and a.kind is h264state.k_i16
+            ea = true
+            fa = a.nzdc & 1
+        new fb u32 = 0
+        new eb = false
+        if present(b) and b.kind is h264state.k_i16
+            eb = true
+            fb = b.nzdc & 1
+        if flag(d, 0, cbf_term(m, a, ea, fa), cbf_term(m, b, eb, fb))
+            m.nzdc = m.nzdc | 1
+            block(d, 0, 16, addr of scan[0])
+            for each k in 0 until 16
+                d.dc[h264tables.zigzag4[k] as u64] = scan[k]
+    for each b8 in 0 until 4
+        if ((m.cbp as u64) >> b8) & 1 is 0
+            skip
+        if m.t8
+            block(d, 5, 64, addr of scan[0])
+            for each k in 0 until 64
+                d.luma8[b8 * 64 + h264tables.zigzag8[k] as u64] = scan[k]
+            m.nz = m.nz | ((15 as u32) << (b8 * 4) as u32)
+            skip
+        for each k in 0 until 4
+            new blk = b8 * 4 + k
+            new ta u64 = 0
+            new tb u64 = 0
+            luma_terms(d, m, blk, addr of ta, addr of tb)
+            new cat u64 = 2
+            if m.kind is h264state.k_i16
+                cat = 1
+            if flag(d, cat, ta, tb)
+                m.nz = m.nz | ((1 as u32) << blk as u32)
+                if cat is 1
+                    block(d, 1, 15, addr of scan[1])
+                    scan[0] = 0
+                else
+                    block(d, 2, 16, addr of scan[0])
+                for each kk in 0 until 16
+                    d.luma[blk * 16 + h264tables.zigzag4[kk] as u64] = scan[kk]
+    if m.cbp >> 4 is 0
+        give
+    for each c in 0 until 2
+        new fa u32 = 0
+        new ea = false
+        if present(a) and a.cbp >> 4 is not 0
+            ea = true
+            fa = (a.nzdc >> (1 + c) as u32) & 1
+        new fb u32 = 0
+        new eb = false
+        if present(b) and b.cbp >> 4 is not 0
+            eb = true
+            fb = (b.nzdc >> (1 + c) as u32) & 1
+        if flag(d, 3, cbf_term(m, a, ea, fa), cbf_term(m, b, eb, fb))
+            m.nzdc = m.nzdc | ((2 as u32) << c as u32)
+            block(d, 3, 4, addr of d.cdc[c * 4])
+    if m.cbp >> 4 is not 2
+        give
+    for each c in 0 until 2
+        for each blk in 0 until 4
+            new bx = blk % 2
+            new by = blk / 2
+            new terms [2] u64
+            for each side in 0 until 2
+                if (side is 0 and bx is 1) or (side is 1 and by is 1)
+                    new inner = blk - 1
+                    if side is 1
+                        inner = blk - 2
+                    terms[side] = ((m.nzc[c] >> inner as u32) & 1) as u64
+                    skip
+                new n = a
+                new nb = by * 2 + 1
+                if side is 1
+                    n = b
+                    nb = 2 + bx
+                new exists = false
+                new f u32 = 0
+                if present(n) and n.cbp >> 4 is 2
+                    exists = true
+                    f = (n.nzc[c] >> nb as u32) & 1
+                terms[side] = cbf_term(m, n, exists, f)
+            if flag(d, 4, terms[0], terms[1])
+                m.nzc[c] = m.nzc[c] | ((1 as u32) << blk as u32)
+                block(d, 4, 15, addr of scan[1])
+                scan[0] = 0
+                for each kk in 0 until 16
+                    d.cac[(c * 4 + blk) * 16 + h264tables.zigzag4[kk] as u64] = scan[kk]
+
+-- ---------------------------------------------------------------- motion syntax
+
+to ref_idx (d ptr h264state.decoder, m ptr h264state.mbinfo, lst u64, x i32, y i32) gives i32
+    if d.nref[lst] <= 1
+        give 0
+    new inc u64 = 0
+    for each side in 0 until 2
+        new nb u64 = 0
+        new n = h264state.neighbor(d, x - 1 + side as i32, y - side as i32, addr of nb)
+        if not present(n) or n.kind is h264state.k_skip or n.intra
+            skip
+        if (n.direct >> nb as u32) & 1 is 1
+            skip
+        if n.ref[lst * 4 + nb / 4] > 0
+            inc += 1 + side
+    new v i32 = 0
+    if dec(d, 54 + inc) is 1
+        v = 1
+        new ctx u64 = 58
+        while dec(d, ctx) is 1
+            v += 1
+            ctx = 59
+    give v
+
+fixed mvd_ctx [8] u64 = [3, 4, 5, 6, 6, 6, 6, 6]
+
+to mvd (d ptr h264state.decoder, lst u64, comp u64, x i32, y i32) gives i32
+    new total u64 = 0
+    for each side in 0 until 2
+        new nb u64 = 0
+        new n = h264state.neighbor(d, x - 1 + side as i32, y - side as i32, addr of nb)
+        if present(n)
+            total += n.mvd[(lst * 16 + nb) * 2 + comp] as u64
+    new inc u64 = 0
+    if total > 32
+        inc = 2
+    else if total >= 3
+        inc = 1
+    new base u64 = 40
+    if comp is 1
+        base = 47
+    if dec(d, base + inc) is 0
+        give 0
+    new v i32 = 1
+    while v < 9 and dec(d, base + mvd_ctx[(v - 1) as u64]) is 1
+        v += 1
+    if v >= 9
+        new e u32 = 3
+        while h264cabac.bypass(d) is 1
+            v += (1 as i32) << e
+            e += 1
+        while e > 0
+            e -= 1
+            v += (h264cabac.bypass(d) << e) as i32
+    if h264cabac.bypass(d) is 1
+        give 0 - v
+    give v

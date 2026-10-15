@@ -1,0 +1,303 @@
+-- The H.264 decoder's state, shared by its parts (lib/h264*.dull): parameter sets,
+-- pictures, per-macroblock records, the CABAC engine and the current macroblock.
+--
+-- Pictures keep a 32-sample border (16 for chroma) filled with copies of their
+-- edges, so motion compensation never has to clamp coordinates.
+
+use mem
+
+fixed pad u64 = 32
+fixed cpad u64 = 16
+fixed max_pics u64 = 18
+
+-- macroblock kinds
+fixed k_none u8 = 0
+fixed k_nxn u8 = 1                     -- I_NxN (4x4 or 8x8 prediction)
+fixed k_i16 u8 = 2                     -- I_16x16
+fixed k_pcm u8 = 3
+fixed k_p u8 = 4
+fixed k_b u8 = 5
+fixed k_skip u8 = 6                    -- P_Skip or B_Skip
+
+shape sps
+    valid      bool
+    profile    u32
+    chroma     u32
+    log2_fn    u32                     -- log2 of MaxFrameNum
+    poc_type   u32
+    log2_poc   u32
+    max_refs   u32
+    mb_w       u32
+    mb_h       u32
+    direct8    bool
+    crop_l     u32
+    crop_r     u32
+    crop_t     u32
+    crop_b     u32
+    reorder    u32                     -- max_num_reorder_frames (16 if not given)
+    has_scaling bool
+    scale4     [96] u8                 -- 6 lists of 16, raster order
+    scale8     [128] u8                -- 2 lists of 64
+
+shape pps
+    valid      bool
+    sps_id     u32
+    cabac      bool
+    bottom_poc bool
+    nref0      u32
+    nref1      u32
+    weighted   bool
+    bipred     u32
+    init_qp    i32
+    cqp        i32
+    cqp2       i32
+    deblock_ctl bool
+    constrained bool
+    redundant  bool
+    t8         bool
+    scale4     [96] u8
+    scale8     [128] u8
+
+-- What later macroblocks (and later pictures) need to know about a macroblock.
+shape mbinfo
+    avail      bool
+    slice      u32
+    kind       u8
+    intra      bool
+    t8         bool
+    cbp        u8                      -- luma bits 0-3, chroma << 4
+    cmode      u8                      -- intra chroma prediction mode
+    i16mode    u8
+    btype      i32                     -- B macroblock type (0 = direct), -1 otherwise
+    qp         i32
+    qpc        [2] i32
+    qpdelta    i32
+    nz         u32                     -- coded_block_flag of each luma 4x4 block
+    nzdc       u32                     -- bit 0 luma DC, 1 Cb DC, 2 Cr DC
+    nzc        [2] u32                 -- chroma AC blocks, bits 0-3
+    direct     u32                     -- 4x4 blocks predicted in direct mode
+    modes      [16] u8                 -- intra 4x4 / 8x8 modes, per 4x4 block
+    ref        [8] i8                  -- [list * 4 + 8x8 block]
+    refpic     [8] u32                 -- picture id behind each reference (0 = none)
+    mv         [64] i16                -- [(list * 16 + block) * 2 + x/y]
+    mvd        [64] u8                 -- |mvd|, capped at 255
+
+shape picture
+    used       bool                    -- this slot holds a picture
+    id         u32
+    y          ptr u8                  -- top-left sample (inside the border)
+    u          ptr u8
+    v          ptr u8
+    ybase      ptr u8                  -- the allocation
+    stride     u64
+    cstride    u64
+    alloc_w    u32                     -- size the planes were made for (in macroblocks)
+    alloc_h    u32
+    poc        i32
+    frame_num  u32
+    wrap       i32                     -- FrameNumWrap
+    ref        u8                      -- 0 none, 1 short-term, 2 long-term
+    long_idx   i32
+    waiting    bool                    -- decoded, not output yet
+    idr_seq    u32
+    mbs        ptr mbinfo
+
+shape weights
+    luma       [64] i32                -- weight, offset pairs per reference
+    cb         [64] i32
+    cr         [64] i32
+
+shape decoder
+    spss       [32] sps
+    ppss       [64] pps
+    pics       [18] picture
+    next_id    u32
+    -- the current slice
+    s          ptr sps
+    p          ptr pps
+    stype      u32                     -- 0 P, 1 B, 2 I
+    nal_ref    u32
+    idr        bool
+    frame_num  u32
+    poc        i32
+    poc_lsb    u32
+    poc_msb    i32
+    prev_msb   i32
+    prev_lsb   u32
+    prev_fn    u32
+    prev_fn_off u32
+    fn_off     u32
+    idr_seq    u32
+    slice_no   u32
+    qp         i32
+    prev_qpd   i32
+    deblock_idc u32
+    alpha_off  i32
+    beta_off   i32
+    spatial    bool
+    nref       [2] u32
+    list       [64] u64                -- picture slot index + 1 per entry, [list * 32 + i] (0 = none)
+    lw_denom   u32
+    cw_denom   u32
+    w          [2] weights
+    long_term  bool                    -- an IDR marked long-term
+    mmco       [96] u32                -- (op, a, b) triples
+    nmmco      u32
+    -- the current picture
+    cur        ptr picture
+    cur_slot   u64
+    mbs        ptr mbinfo
+    mb_count   u64
+    pic_done   bool
+    -- CABAC
+    state      [460] u8
+    mps        [460] u8
+    range      u32
+    offset     u32
+    data       ptr u8
+    size       u64
+    bit        u64
+    -- the current macroblock
+    mba       u64
+    mbx        u64                     -- in samples
+    mby        u64
+    done       [2] u32                 -- blocks whose motion is decoded, per list
+    rem        [16] i32
+    luma       [256] i32               -- 16 blocks x 16 coefficients (raster)
+    luma8      [256] i32               -- 4 blocks x 64
+    dc         [16] i32
+    cdc        [8] i32
+    cac        [128] i32               -- 2 x 4 blocks x 16
+    pred_y     [256] i32
+    pred_c     [128] i32
+    tmp        [1024] i32
+    spatial_done bool
+    spatial_ref [2] i32
+    spatial_mv [4] i32
+    -- output
+    out_count  u64
+
+to make gives ptr decoder
+    new d = mem.alloc(size_of(decoder)) as ptr decoder
+    d.next_id = 1
+    give d
+
+-- ---------------------------------------------------------------- small helpers
+
+to clip (v i32, lo i32, hi i32) gives i32
+    if v < lo
+        give lo
+    if v > hi
+        give hi
+    give v
+
+to clip1 (v i32) gives i32
+    if v < 0
+        give 0
+    if v > 255
+        give 255
+    give v
+
+to abs (v i32) gives i32
+    if v < 0
+        give 0 - v
+    give v
+
+-- luma4x4BlkIdx <-> position (in 4-sample units)
+fixed blk_x [16] u8 = [0, 1, 0, 1, 2, 3, 2, 3, 0, 1, 0, 1, 2, 3, 2, 3]
+fixed blk_y [16] u8 = [0, 0, 1, 1, 0, 0, 1, 1, 2, 2, 3, 3, 2, 2, 3, 3]
+fixed blk_at [16] u8 = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15]   -- [y * 4 + x]
+
+to block_at (x u64, y u64) gives u64
+    give blk_at[y * 4 + x] as u64
+
+-- ---------------------------------------------------------------- neighbours
+
+to mb (d ptr decoder, mbn u64) gives ptr mbinfo
+    give d.mbs + mbn
+
+-- The macroblock at `addr` if it is decoded and in the current slice, else null.
+to usable (d ptr decoder, mbn i64) gives ptr mbinfo
+    if mbn < 0 or mbn as u64 >= d.mb_count
+        give 0 as ptr mbinfo
+    new m = mb(d, mbn as u64)
+    if not m.avail or m.slice is not d.slice_no
+        give 0 as ptr mbinfo
+    give m
+
+to left_of (d ptr decoder, mbn u64) gives ptr mbinfo
+    if mbn % (d.s.mb_w as u64) is 0
+        give 0 as ptr mbinfo
+    give usable(d, mbn as i64 - 1)
+
+to top_of (d ptr decoder, mbn u64) gives ptr mbinfo
+    give usable(d, mbn as i64 - d.s.mb_w as i64)
+
+to topright_of (d ptr decoder, mbn u64) gives ptr mbinfo
+    if mbn % (d.s.mb_w as u64) + 1 >= d.s.mb_w as u64
+        give 0 as ptr mbinfo
+    give usable(d, mbn as i64 - d.s.mb_w as i64 + 1)
+
+to topleft_of (d ptr decoder, mbn u64) gives ptr mbinfo
+    if mbn % (d.s.mb_w as u64) is 0
+        give 0 as ptr mbinfo
+    give usable(d, mbn as i64 - d.s.mb_w as i64 - 1)
+
+-- The macroblock covering luma sample (x, y) relative to the current one (x, y may
+-- be -1 or 16) and, in `blk`, the 4x4 block there. Null if there is none.
+to neighbor (d ptr decoder, x i32, y i32, blk ptr u64) gives ptr mbinfo
+    new m = 0 as ptr mbinfo
+    new xx = x
+    new yy = y
+    if x < 0 and y < 0
+        m = topleft_of(d, d.mba)
+        xx = x + 16
+        yy = y + 16
+    else if x < 0 and y < 16
+        m = left_of(d, d.mba)
+        xx = x + 16
+    else if y < 0 and x < 16
+        m = top_of(d, d.mba)
+        yy = y + 16
+    else if y < 0
+        m = topright_of(d, d.mba)
+        xx = x - 16
+        yy = y + 16
+    else if x < 16 and y < 16
+        m = mb(d, d.mba)
+    if m as u64 is not 0
+        deref blk = block_at((xx / 4) as u64, (yy / 4) as u64)
+    give m
+
+-- ---------------------------------------------------------------- bits (headers)
+
+shape bits
+    data       ptr u8
+    size       u64
+    pos        u64
+
+to u (b ptr bits, n u32) gives u32
+    new v u32 = 0
+    for each i in 0 until n as u64
+        new pos = b.pos >> 3
+        new byte u32 = 0
+        if pos < b.size
+            byte = b.data[pos] as u32
+        new shift = (7 - (b.pos & 7)) as u32
+        v = (v << 1) | ((byte >> shift) & 1)
+        b.pos += 1
+    give v
+
+to ue (b ptr bits) gives u32
+    new zeros u32 = 0
+    while u(b, 1) is 0 and zeros < 32
+        zeros += 1
+    if zeros is 0
+        give 0
+    give ((1 as u32) << zeros) - 1 + u(b, zeros)
+
+to se (b ptr bits) gives i32
+    new k = ue(b)
+    if k & 1 is 1
+        give ((k + 1) / 2) as i32
+    give 0 - (k / 2) as i32
