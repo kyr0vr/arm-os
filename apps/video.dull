@@ -1,8 +1,10 @@
 -- Video: the ArmOS video player. Choose an .mp4 file (H.264 video, AAC sound) on the
 -- SD card and it plays full screen, the sound keeping time.
 --
--- `video bench <file> [frames]` decodes a file (or its first frames) as fast as it
--- can, without sound or waiting, and prints how fast that was (to the serial console).
+-- `video play <file>` plays one file and ends. `video bench <file> [frames]` decodes
+-- a file (or its first frames) as fast as it can, without sound or waiting, and
+-- prints how fast that was and a checksum of the pictures (to the serial console);
+-- `video bench1` does the same on this core alone.
 
 use sys
 use gfx
@@ -241,20 +243,21 @@ to place
     dst_x = (gfx.width - dst_w) / 2
     dst_y = (gfx.height - dst_h) / 2
     bt709 = h > 576
+    tables()
 
-to clamp8 (v i32) gives u32
-    if v < 0
-        give 0
-    if v > 255
-        give 255
-    give v as u32
+-- Colour conversion tables (set up by `place`): each Y, U and V value's share of R,
+-- G and B, pre-scaled by 256 (Y's with 320 added), and `level` turning a sum >> 8 into
+-- 0..255. With them a pixel is a few lookups and adds.
+new ty [256] i32
+new tr [256] i32
+new tgu [256] i32
+new tgv [256] i32
+new tb [256] i32
+new level [1024] u32
+new xmap ptr u32                        -- source column of each screen column
+new xmap_len u64
 
--- YUV 4:2:0 -> RGB into the surface, scaled to the video rectangle.
-to convert (pic ptr h264state.picture)
-    new w = h264.width(vd) as u64
-    new h = h264.height(vd) as u64
-    new cx = h264.crop_x(vd) as u64
-    new cy = h264.crop_y(vd) as u64
+to tables
     new kr i32 = 409
     new kgu i32 = 100
     new kgv i32 = 208
@@ -264,21 +267,59 @@ to convert (pic ptr h264state.picture)
         kgu = 55
         kgv = 136
         kb = 541
+    for each i in 0 until 256
+        new v = i as i32 - 128
+        ty[i] = 298 * (i as i32 - 16) + 128 + 320 * 256        -- offset: every sum >> 8 is 30 or more
+        tr[i] = kr * v
+        tgu[i] = 0 - kgu * v
+        tgv[i] = 0 - kgv * v
+        tb[i] = kb * v
+    for each i in 0 until 1024
+        new v = i as i32 - 320
+        if v < 0
+            v = 0
+        else if v > 255
+            v = 255
+        level[i] = v as u32
+    new w = h264.width(vd) as u64
+    if dst_w as u64 > xmap_len
+        xmap = mem.alloc((dst_w as u64) * 4) as ptr u32
+        xmap_len = dst_w as u64
+    for each ox in 0 until dst_w as u64
+        xmap[ox] = (ox * w / (dst_w as u64)) as u32
+
+-- YUV 4:2:0 -> RGB into the surface, scaled to the video rectangle.
+to convert (pic ptr h264state.picture)
+    new h = h264.height(vd) as u64
+    new w = h264.width(vd) as u64
+    new cx = h264.crop_x(vd) as u64
+    new cy = h264.crop_y(vd) as u64
+    new lv = addr of level[0]
     for each oy in 0 until dst_h as u64
         new sy = oy * h / (dst_h as u64)
         new yrow = pic.y + (cy + sy) * pic.stride + cx
         new urow = pic.u + ((cy + sy) / 2) * pic.cstride + cx / 2
         new vrow = pic.v + ((cy + sy) / 2) * pic.cstride + cx / 2
         new out = gfx.pixels + ((dst_y as u64) + oy) * (gfx.width as u64) + dst_x as u64
-        for each ox in 0 until dst_w as u64
-            new sx = ox * w / (dst_w as u64)
-            new c = 298 * (yrow[sx] as i32 - 16)
-            new du = urow[sx / 2] as i32 - 128
-            new dv = vrow[sx / 2] as i32 - 128
-            new r = clamp8((c + kr * dv + 128) >> 8)
-            new g = clamp8((c - kgu * du - kgv * dv + 128) >> 8)
-            new b = clamp8((c + kb * du + 128) >> 8)
-            out[ox] = (r << 16) | (g << 8) | b
+        if dst_w as u64 is w and cx % 2 is 0
+            -- one to one: two pixels share their chroma
+            for each p in 0 until w / 2
+                new u = urow[p] as u64
+                new v = vrow[p] as u64
+                new rv = tr[v]
+                new guv = tgu[u] + tgv[v]
+                new bu = tb[u]
+                new c0 = ty[yrow[p * 2] as u64]
+                new c1 = ty[yrow[p * 2 + 1] as u64]
+                out[p * 2] = (lv[((c0 + rv) >> 8) as u64] << 16) | (lv[((c0 + guv) >> 8) as u64] << 8) | lv[((c0 + bu) >> 8) as u64]
+                out[p * 2 + 1] = (lv[((c1 + rv) >> 8) as u64] << 16) | (lv[((c1 + guv) >> 8) as u64] << 8) | lv[((c1 + bu) >> 8) as u64]
+        else
+            for each ox in 0 until dst_w as u64
+                new sx = xmap[ox] as u64
+                new u = urow[sx / 2] as u64
+                new v = vrow[sx / 2] as u64
+                new c = ty[yrow[sx] as u64]
+                out[ox] = (lv[((c + tr[v]) >> 8) as u64] << 16) | (lv[((c + tgu[u] + tgv[v]) >> 8) as u64] << 8) | lv[((c + tb[u]) >> 8) as u64]
 
 -- Is the slice NAL in this sample a non-reference one (safe to skip)?
 to droppable (data ptr u8, size u64) gives bool
@@ -603,6 +644,12 @@ to main gives u64
         sys.print("video: no screen\n")
         give 1
     sys.want_pointer(true)
+    if args.len > 5 and files.same(args[0 until 5], "play ")
+        -- one file, straight away (the report goes to the serial console)
+        new one line.line
+        line.add(addr of one, args[5 until args.len])
+        play(addr of one)
+        give 0
     files.setup("Video", ".mp4")
     new path line.line
     new size u64 = 0

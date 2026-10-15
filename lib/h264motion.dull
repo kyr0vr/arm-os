@@ -61,6 +61,18 @@ to set_motion (d ptr h264state.decoder, m ptr h264state.mbinfo, r u64, lst u64, 
             done = done | ((1 as u32) << blk as u32)
     d.done[lst] = done
 
+-- The motion of 4x4 block `blk` (decoding order) with no mvd, as set_motion would
+-- store it; `pid` is the id of reference `ref`'s picture.
+to put (d ptr h264state.decoder, m ptr h264state.mbinfo, blk u64, lst u64, mvx i32, mvy i32, ref i32, pid u32)
+    new k = (lst * 16 + blk) * 2
+    m.mv[k] = mvx as i16
+    m.mv[k + 1] = mvy as i16
+    m.mvd[k] = 0
+    m.mvd[k + 1] = 0
+    m.ref[lst * 4 + blk / 4] = ref as i8
+    m.refpic[lst * 4 + blk / 4] = pid
+    d.done[lst] = d.done[lst] | ((1 as u32) << blk as u32)
+
 to set_none (d ptr h264state.decoder, m ptr h264state.mbinfo, r u64, lst u64)
     new v [5] i32
     v[4] = -1
@@ -263,6 +275,12 @@ to direct_motion (d ptr h264state.decoder, m ptr h264state.mbinfo, b8 u64)
     if d.spatial
         spatial_setup(d, m)
         new col = h264mc.picture_of(d, 1, 0)
+        new pids [2] u32
+        for each lst in 0 until 2
+            if d.spatial_ref[lst] >= 0
+                new pic = h264mc.picture_of(d, lst, d.spatial_ref[lst])
+                if pic as u64 is not 0
+                    pids[lst] = pic.id
         for each k in 0 until 4
             new blk = b8 * 4 + k
             new cblk = blk
@@ -279,11 +297,7 @@ to direct_motion (d ptr h264state.decoder, m ptr h264state.mbinfo, b8 u64)
                 if ref > 0 or (ref is 0 and not zero)
                     mvx = d.spatial_mv[lst * 2]
                     mvy = d.spatial_mv[lst * 2 + 1]
-                new v [5] i32
-                v[0] = mvx
-                v[1] = mvy
-                v[4] = ref
-                set_motion(d, m, rect((h264state.blk_x[blk] * 4) as u64, (h264state.blk_y[blk] * 4) as u64, 4, 4), lst, addr of v[0])
+                put(d, m, blk, lst, mvx, mvy, ref, pids[lst])
         give
     -- temporal
     new ref1 = h264mc.picture_of(d, 1, 0)
@@ -328,7 +342,6 @@ to direct_motion (d ptr h264state.decoder, m ptr h264state.mbinfo, b8 u64)
         v[4] = 0
         set_motion(d, m, rect(x, y, 4, 4), 1, addr of v[0])
 
--- Motion compensation for 8x8 block b8 after direct prediction.
 to b_skip (d ptr h264state.decoder, m ptr h264state.mbinfo)
     m.kind = h264state.k_skip
     m.btype = 0
