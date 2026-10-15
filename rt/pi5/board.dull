@@ -27,12 +27,27 @@ use hdmi_audio
 
 new revision u32               -- the firmware's board revision code
 new arm_hz u32                 -- the ARM cores' clock
+new arm_start_hz u32           -- what it was when the kernel started
 new pixel_hz u32               -- the HDMI pixel clock (for audio timing)
 
 -- Ask the firmware what this board is (call before the MMU is on).
 to probe
     revision = fb.board_revision()
-    arm_hz = fb.clock_rate(3)
+    -- the firmware starts the cores below their top speed; ask for the top
+    arm_start_hz = fb.measured_clock_rate(3)
+    new top = fb.max_clock_rate(3)
+    if top > 0
+        fb.set_clock_rate(3, top)
+    arm_hz = fb.measured_clock_rate(3)
+    if arm_hz is 0
+        arm_hz = fb.clock_rate(3)
+    io.print("cpu: ")
+    io.print_u64((arm_hz / 1_000_000) as u64)
+    io.print(" MHz (started at ")
+    io.print_u64((arm_start_hz / 1_000_000) as u64)
+    io.print(", top ")
+    io.print_u64((top / 1_000_000) as u64)
+    io.line(")")
     pixel_hz = fb.clock_rate(9)
 
 -- The disk: the microSD card the Pi booted from.

@@ -65,6 +65,30 @@ to board_revision gives u32
 to clock_rate (clock u32) gives u32
     give ask(0x30002, clock, 1)
 
+-- The highest rate the firmware allows a clock.
+to max_clock_rate (clock u32) gives u32
+    give ask(0x30004, clock, 1)
+
+-- A clock's rate as measured by the firmware (what it really runs at).
+to measured_clock_rate (clock u32) gives u32
+    give ask(0x30047, clock, 1)
+
+-- Ask the firmware to run a clock at `hz`; gives the rate it chose.
+to set_clock_rate (clock u32, hz u32) gives u32
+    new m = message()
+    m[0] = 9 * 4
+    m[1] = 0
+    m[2] = 0x38002     -- set clock rate
+    m[3] = 12
+    m[4] = 0
+    m[5] = clock
+    m[6] = hz
+    m[7] = 0           -- turbo settings apply
+    m[8] = 0
+    if not call(m)
+        give 0
+    give m[6]
+
 -- The end of the RAM the firmware leaves to the ARM cores (0 if it will not say).
 -- Call it before the MMU is on, like everything that talks to the firmware here.
 to arm_memory gives u64
