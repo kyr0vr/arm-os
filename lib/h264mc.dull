@@ -144,8 +144,16 @@ to chroma (pic ptr h264state.picture, x0 i64, y0 i64, wh u64, mvx i32, mvy i32, 
     new width = (pic.alloc_w as i64) * 8
     new height = (pic.alloc_h as i64) * 8
     new pad = h264state.cpad as i64
-    new xi = clampi(x0 + (mvx >> 3) as i64, 0 - pad, width + pad - w as i64 - 1)
-    new yi = clampi(y0 + (mvy >> 3) as i64, 0 - pad, height + pad - h as i64 - 1)
+    new xi = x0 + (mvx >> 3) as i64
+    if xi < 0 - pad
+        xi = 0 - pad
+    else if xi > width + pad - w as i64 - 1
+        xi = width + pad - w as i64 - 1
+    new yi = y0 + (mvy >> 3) as i64
+    if yi < 0 - pad
+        yi = 0 - pad
+    else if yi > height + pad - h as i64 - 1
+        yi = height + pad - h as i64 - 1
     new fx = mvx & 7
     new fy = mvy & 7
     new p = pic.u

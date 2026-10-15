@@ -5,6 +5,8 @@ two-register values). The locals used most (weighted by loop depth) live in the
 callee-saved registers x19-x28, the rest in the stack frame. Operands that are such a
 local or a constant are used where they are; other intermediate values wait in x9-x15
 while the rest of the expression has no call in it, and on the stack otherwise.
+Functions that call nothing also keep locals in x6-x8 and x17. Comparisons in
+conditions branch directly, and p[i] with p and i in registers is one load or store.
 """
 
 import os
@@ -19,9 +21,14 @@ BUILTIN_VOID = {"dsb": "dsb sy", "dmb": "dmb sy", "isb": "isb",
 ENTRY_SYMBOL = "dull_main"
 TRAP_SYMBOL = "dull_trap"
 LOOP_KINDS = ("while", "repeat", "hold", "for_range", "for_each", "stream")
-HOT_LOCALS = 7          # named locals that may get a register; the rest are for loop counters
+SPARE_REGS = 3          # registers left for loop counters; the rest may go to named locals
 FIRST_REG = 19
 LAST_REG = 28
+LEAF_REGS = [6, 7, 8, 17]   # free in a function that calls nothing (and has no asm)
+CONDS = {"==": ("eq", "eq"), "!=": ("ne", "ne"), "<": ("lo", "lt"), ">": ("hi", "gt"),
+         "<=": ("ls", "le"), ">=": ("hs", "ge")}
+INVERSE = {"eq": "ne", "ne": "eq", "lo": "hs", "hs": "lo", "hi": "ls", "ls": "hi",
+           "lt": "ge", "ge": "lt", "gt": "le", "le": "gt"}
 
 
 # --------------------------------------------------------------------------
@@ -634,6 +641,30 @@ def imm_ops(reg, value):
 # Per-function code generation
 # --------------------------------------------------------------------------
 
+def load_op(ty):
+    """The instruction (and target register) loading a word value of `ty` into x0."""
+    if isinstance(ty, T.Int):
+        return {(8, False): "ldrb w0", (8, True): "ldrsb x0", (16, False): "ldrh w0",
+                (16, True): "ldrsh x0", (32, False): "ldr w0", (32, True): "ldrsw x0",
+                (64, False): "ldr x0", (64, True): "ldr x0"}[(ty.bits, ty.signed)]
+    if isinstance(ty, T.Bool):
+        return "ldrb w0"
+    if isinstance(ty, T.Choice):
+        return "ldr w0"
+    return "ldr x0"
+
+
+def has_asm(node):
+    """Does `node` hold an asm statement?"""
+    if isinstance(node, (list, tuple)):
+        return any(has_asm(x) for x in node)
+    if not isinstance(node, Node):
+        return False
+    if node.kind == "asm":
+        return True
+    return any(has_asm(v) for k, v in vars(node).items() if k not in ("kind", "line", "ty"))
+
+
 def has_call(node):
     """Does expression `node` call anything (which could change x9-x15)?"""
     if isinstance(node, (list, tuple)):
@@ -804,6 +835,8 @@ class FuncGen:
         """Store x0 into local `loc`."""
         if loc.reg is not None:
             self.e(f"mov x{loc.reg}, x0")
+        elif loc.offset <= 256 and loc.ty.repr == "word":
+            self.store_lv(("at", loc.ty, f"[x29, #-{loc.offset}]"))
         else:
             self.addr_local(loc.offset, "x2")
             self.store_x0_to_x2(loc.ty)
@@ -812,8 +845,11 @@ class FuncGen:
         """The register holding local `loc`: its own, or `want` after loading it."""
         if loc.reg is not None:
             return f"x{loc.reg}"
-        self.addr_local(loc.offset)
-        self.load_from_x0(loc.ty)
+        if loc.offset <= 256 and loc.ty.repr == "word":
+            self.load_lv(("at", loc.ty, f"[x29, #-{loc.offset}]"))
+        else:
+            self.addr_local(loc.offset)
+            self.load_from_x0(loc.ty)
         if want != "x0":
             self.e(f"mov {want}, x0")
         return want
@@ -918,18 +954,7 @@ class FuncGen:
             self.e("mov x2, x0")
             self.e("ldp x0, x1, [x2]")
             return
-        if isinstance(ty, T.Int):
-            s, b = ty.signed, ty.bits
-            op = {(8, False): "ldrb w0", (8, True): "ldrsb x0", (16, False): "ldrh w0",
-                  (16, True): "ldrsh x0", (32, False): "ldr w0", (32, True): "ldrsw x0",
-                  (64, False): "ldr x0", (64, True): "ldr x0"}[(b, s)]
-            self.e(f"{op}, [x0]")
-        elif isinstance(ty, T.Bool):
-            self.e("ldrb w0, [x0]")
-        elif isinstance(ty, T.Choice):
-            self.e("ldr w0, [x0]")
-        else:
-            self.e("ldr x0, [x0]")
+        self.e(f"{load_op(ty)}, [x0]")
 
     def store_x0_to_x2(self, ty):
         """Store the value in x0 (/x1) to the address in x2."""
@@ -966,10 +991,11 @@ class FuncGen:
             return
         top = self.prog.label("z")
         done = self.prog.label("zd")
-        self.imm("x3", size)
+        wide = size % 8 == 0
+        self.imm("x3", size // 8 if wide else size)
         self.lab(top)
         self.e(f"cbz x3, {done}")
-        self.e("strb wzr, [x0], #1")
+        self.e("str xzr, [x0], #8" if wide else "strb wzr, [x0], #1")
         self.e("sub x3, x3, #1")
         self.e(f"b {top}")
         self.lab(done)
@@ -993,35 +1019,42 @@ class FuncGen:
         scan_uses(sym.node.body, 0, weights, declared, self.escaped)
         for pname, _ in sym.params:
             declared.add(pname)
+        if not has_call(sym.node.body) and not has_asm(sym.node.body):
+            self.free_regs = LEAF_REGS + self.free_regs
         cands = sorted((n for n in declared if weights.get(n, 0) and n not in self.escaped),
                        key=lambda n: (-weights[n], n))
-        self.hot = set(cands[:HOT_LOCALS])
+        self.hot = set(cands[:len(self.free_regs) - SPARE_REGS])
         param_locals = []
         for (pname, pty), (_, _, pline) in zip(sym.params, sym.node.params):
             node = Node("param", pline)
             param_locals.append(self.declare_local(pname, pty, node))
         body_start = len(self.lines)
+        slots = []
         reg = 0
         for loc in param_locals:
+            slots.append(reg)
+            reg += 2 if loc.ty.repr == "pair" else 1
+        # the ones in memory first, then the register moves backwards, so no argument
+        # register is overwritten (x6, x7) before it is read
+        for loc, reg in zip(param_locals, slots):
             if loc.reg is not None:
-                self.e(f"mov x{loc.reg}, x{reg}")
-                reg += 1
                 continue
             self.addr_local(loc.offset, "x16")
             if loc.ty.repr == "pair":
                 self.e(f"stp x{reg}, x{reg + 1}, [x16]")
-                reg += 2
             else:
                 op = {1: "strb w", 2: "strh w", 4: "str w", 8: "str x"}[loc.ty.size]
                 self.e(f"{op}{reg}, [x16]")
-                reg += 1
+        for loc, reg in reversed(list(zip(param_locals, slots))):
+            if loc.reg is not None:
+                self.e(f"mov x{loc.reg}, x{reg}")
         self.block(sym.node.body, new_scope=False)
         self.run_afters(0)
         if sym.ret is not T.VOID:
             self.e(f"b {self.trap(sym.node, f'`{sym.name}` ended without `give`')}")
         self.pop_scope()
         frame = (self.frame + 15) // 16 * 16
-        saved = list(range(FIRST_REG, self.top_reg + 1, 2)) if self.top_reg else []
+        saved = list(range(FIRST_REG, self.top_reg + 1, 2))
         head = [f".balign 4", f".global {sym.symbol}", f".type {sym.symbol}, %function", f"{sym.symbol}:"]
         head += [f"    stp x{r}, x{r + 1}, [sp, #-16]!" for r in saved]
         head += ["    stp x29, x30, [sp, #-16]!", "    mov x29, sp"]
@@ -1157,6 +1190,11 @@ class FuncGen:
                 return
             r = self.reg_local(s.target)
             if r is not None:
+                vt = self.infer(s.value, lv_ty)
+                if self.is_simple(s.value):
+                    self.check_assign(s.value, vt, lv_ty)
+                    self.simple_into(s.value, f"x{r}")
+                    return
                 self.value_as(s.value, lv_ty)
                 self.e(f"mov x{r}, x0")
                 return
@@ -1164,12 +1202,16 @@ class FuncGen:
                 vt = self.infer(s.value, lv_ty)
                 if self.is_simple(s.value):
                     self.check_assign(s.value, vt, lv_ty)
-                    lv = self.addr(s.target)
-                    self.e("mov x2, x0")
+                    lv = self.access(s.target)
+                    if lv[0] != "at":
+                        self.e("mov x2, x0")
                     self.simple_into(s.value, "x0")
                     self.store_lv(lv)
                     return
             self.value_as(s.value, lv_ty)
+            if lv_ty.repr == "word" and self.accessible(s.target):
+                self.store_lv(self.access(s.target))
+                return
             if lv_ty.repr == "word" and self.can_hold(s.target):
                 t = self.hold()
                 lv = self.addr(s.target)
@@ -1260,12 +1302,64 @@ class FuncGen:
         t = self.infer(e, T.BOOL)
         if not isinstance(t, T.Bool):
             self.err(e, f"a condition must be a bool, found `{t}`")
-        self.value(e)
-        self.e(f"cbz w0, {false_label}")
+        self.jump_unless(e, false_label)
+
+    def jump_unless(self, e, target):
+        """Branch to `target` when bool `e` is false."""
+        if e.kind == "logic" and e.op == "and":
+            self.jump_unless(e.left, target)
+            self.jump_unless(e.right, target)
+        elif e.kind == "logic":
+            past = self.prog.label("or")
+            self.jump_if(e.left, past)
+            self.jump_unless(e.right, target)
+            self.lab(past)
+        elif e.kind == "unary" and e.op == "not":
+            self.jump_if(e.operand, target)
+        elif e.kind == "compare" and not isinstance(e.left.ty, T.Maybe):
+            self.compare_jump(e, target, False)
+        else:
+            self.value(e)
+            self.e(f"cbz w0, {target}")
+
+    def jump_if(self, e, target):
+        """Branch to `target` when bool `e` is true."""
+        if e.kind == "logic" and e.op == "and":
+            past = self.prog.label("and")
+            self.jump_unless(e.left, past)
+            self.jump_if(e.right, target)
+            self.lab(past)
+        elif e.kind == "logic":
+            self.jump_if(e.left, target)
+            self.jump_if(e.right, target)
+        elif e.kind == "unary" and e.op == "not":
+            self.jump_unless(e.operand, target)
+        elif e.kind == "compare" and not isinstance(e.left.ty, T.Maybe):
+            self.compare_jump(e, target, True)
+        else:
+            self.value(e)
+            self.e(f"cbnz w0, {target}")
+
+    def compare_jump(self, e, target, when):
+        a, b = self.operands(e.left, e.right, "cmp")
+        self.e(f"cmp {a}, {b}")
+        lt = e.left.ty
+        c = CONDS[e.op][1 if isinstance(lt, T.Int) and lt.signed else 0]
+        if not when:
+            c = INVERSE[c]
+        self.e(f"b.{c} {target}")
 
     def s_if(self, s):
         end = self.prog.label("fi")
         for cond, body in s.arms:
+            if len(body) == 1 and body[0].kind in ("stop", "skip") and self.loops and not self.depth \
+                    and not self.any_afters(self.loops[-1].scope_index):
+                t = self.infer(cond, T.BOOL)
+                if not isinstance(t, T.Bool):
+                    self.err(cond, f"a condition must be a bool, found `{t}`")
+                loop = self.loops[-1]
+                self.jump_if(cond, loop.brk if body[0].kind == "stop" else loop.cont)
+                continue
             nxt = self.prog.label("el")
             self.cond(cond, nxt)
             self.block(body)
@@ -1304,8 +1398,7 @@ class FuncGen:
         t = self.infer(s.cond, T.BOOL)
         if not isinstance(t, T.Bool):
             self.err(s, "`hold until` needs a bool")
-        self.value(s.cond)
-        self.e(f"cbnz w0, {end}")
+        self.jump_if(s.cond, end)
         self.e("yield")
         self.e(f"b {top}")
         self.lab(end)
@@ -2049,6 +2142,56 @@ class FuncGen:
             return self.sub_bits(inner, e.value.ty, e.hi_c, e.lo_c, e)
         self.err(e, "cannot take the address of this")
 
+    def frame_local(self, e):
+        """The local in the frame (near x29) that name `e` is, or None."""
+        if e.kind == "name" and getattr(e, "ref", None) is not None and e.ref.kind == "local":
+            loc = e.ref.loc
+            if loc.reg is None and loc.offset <= 256 and loc.ty.repr == "word":
+                return loc
+        return None
+
+    def plus_const(self, e):
+        """For i + c (i simple, c a constant 0-4095): c, else None."""
+        if e.kind == "binary" and e.op == "+" and isinstance(e.ty, T.Int) and self.is_simple(e.left):
+            c = self.const_of(e.right)
+            if c is not None and 0 <= c <= 4095:
+                return c
+        return None
+
+    def accessible(self, e):
+        """Can `e` be loaded or stored with one instruction (leaving x0 alone): a local in
+        the frame, or p[i] / p[i + c] with p and i simple and a word-sized element?"""
+        if self.frame_local(e) is not None:
+            return True
+        return e.kind == "index" and isinstance(e.value.ty, T.Ptr) and e.ty.repr == "word" \
+            and e.ty.size in (1, 2, 4, 8) and self.is_simple(e.value) \
+            and (self.is_simple(e.index) or self.plus_const(e.index) is not None)
+
+    def access(self, e):
+        """The lvalue of `e`, as an address operand if `accessible` (leaving x0 alone)."""
+        if not self.accessible(e):
+            return self.addr(e)
+        loc = self.frame_local(e)
+        if loc is not None:
+            return ("at", e.ty, f"[x29, #-{loc.offset}]")
+        size = e.ty.size
+        base = self.simple_operand(e.value, "x2", None)
+        c = self.const_of(e.index)
+        if c is not None and 0 <= c <= 4095:
+            return ("at", e.ty, f"[{base}, #{c * size}]")
+        c = self.plus_const(e.index)
+        if c is not None:
+            index = self.simple_operand(e.index.left, "x1", None)
+            if size == 1:
+                self.e(f"add x16, {base}, {index}")
+            else:
+                self.e(f"add x16, {base}, {index}, lsl #{size.bit_length() - 1}")
+            return ("at", e.ty, f"[x16, #{c * size}]")
+        index = self.simple_operand(e.index, "x1", None)
+        if size == 1:
+            return ("at", e.ty, f"[{base}, {index}]")
+        return ("at", e.ty, f"[{base}, {index}, lsl #{size.bit_length() - 1}]")
+
     def sub_bits(self, inner, base_ty, hi, lo, node):
         if inner[0] in ("bits", "rbits"):
             bty, ihi, ilo = inner[1], inner[2], inner[3]
@@ -2076,6 +2219,9 @@ class FuncGen:
         if lv[0] == "reg":
             self.e(f"mov x0, x{lv[2]}")
             return
+        if lv[0] == "at":
+            self.e(f"{load_op(lv[1])}, {lv[2]}")
+            return
         if lv[0] == "rbits":
             self.e(f"ubfx x0, x{lv[4]}, #{lv[3]}, #{lv[2] - lv[3] + 1}")
             return
@@ -2090,6 +2236,9 @@ class FuncGen:
             return
         if lv[0] == "reg":
             self.e(f"mov x{lv[2]}, x0")
+            return
+        if lv[0] == "at":
+            self.e({1: "strb w0", 2: "strh w0", 4: "str w0", 8: "str x0"}[lv[1].size] + f", {lv[2]}")
             return
         if lv[0] == "rbits":
             self.e(f"bfi x{lv[4]}, x0, #{lv[3]}, #{lv[2] - lv[3] + 1}")
@@ -2148,7 +2297,7 @@ class FuncGen:
             if sym.data_label:
                 self.addr_symbol(sym.data_label)
                 return
-        lv = self.addr(e)
+        lv = self.access(e)
         self.load_lv(lv)
 
     def v_field(self, e):
@@ -2179,7 +2328,7 @@ class FuncGen:
             self.e("lsr x0, x0, x1")
             self.e("and x0, x0, #1")
             return
-        lv = self.addr(e)
+        lv = self.access(e)
         self.load_lv(lv)
 
     def v_bits(self, e):
@@ -2242,14 +2391,26 @@ class FuncGen:
         pushed = []
         later = []
         r = 0
-        for arg, (pname, pty) in zip(e.args, sym.params):
+        args = list(zip(e.args, sym.params))
+        # the last argument that has to be worked out goes straight to its register(s)
+        last = None
+        for i, (arg, (pname, pty)) in enumerate(args):
+            if not (pty.repr == "word" and self.is_simple(arg)):
+                last = i
+        for i, (arg, (pname, pty)) in enumerate(args):
             if pty.repr == "word" and self.is_simple(arg):
                 later.append((arg, r))
             else:
                 self.value(arg)
                 self.coerce(arg.ty, pty)
-                self.push(pty.repr)
-                pushed.append((pty.repr, r))
+                if i == last:
+                    if r != 0 and pty.repr == "pair":
+                        self.e(f"mov x{r + 1}, x1")
+                    if r != 0:
+                        self.e(f"mov x{r}, x0")
+                else:
+                    self.push(pty.repr)
+                    pushed.append((pty.repr, r))
             r += 2 if pty.repr == "pair" else 1
         for rep, reg in reversed(pushed):
             if rep == "pair":
@@ -2304,6 +2465,20 @@ class FuncGen:
                 b = "x16"
             self.e(f"add x0, {a}, {b}" if e.op == "+" else f"sub x0, {a}, {b}")
             return
+        if e.op in ("/", "%") and isinstance(t, T.Int) and not t.signed:
+            c = self.const_of(e.right)
+            if c is not None and c >= 2 and c & (c - 1) == 0:
+                # unsigned division by a power of two: a shift or a mask
+                r = self.reg_local(e.left)
+                a = f"x{r}"
+                if r is None:
+                    self.value(e.left)
+                    a = "x0"
+                if e.op == "/":
+                    self.e(f"lsr x0, {a}, #{c.bit_length() - 1}")
+                else:
+                    self.e(f"and x0, {a}, #{c - 1}")
+                return
         a, b = self.operands(e.left, e.right, e.op)
         self.binop(e, e.op, t, e.right.ty, a, b)
 
@@ -2337,10 +2512,11 @@ class FuncGen:
                 self.e(f"cbz {b}, {self.trap(node, 'division by zero')}")
             self.e(("sdiv" if s else "udiv") + f" x2, {a}, {b}")
             if op == "/":
+                # canonical operands give a canonical quotient (but for MIN / -1,
+                # an overflow)
                 self.e("mov x0, x2")
                 if dbg and s and t.bits < 64:
                     self.check_range(node, t)
-                self.normalize(t)
             else:
                 self.e(f"msub x0, x2, {b}, {a}")
             return
@@ -2368,10 +2544,11 @@ class FuncGen:
                 else:
                     self.e(f"{ins[:-1]} x0, {a}, {b}")
                 return
+            # a result that fits (checked in debug builds; overflow is an error, not a
+            # wrap, so release builds may assume it) is already canonical
             self.e({"+": "add", "-": "sub", "*": "mul"}[op] + f" x0, {a}, {b}")
             if dbg:
                 self.check_range(node, t)
-            self.normalize(t)
             return
         raise AssertionError(op)
 

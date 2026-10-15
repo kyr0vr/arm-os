@@ -12,6 +12,18 @@ to bit (d ptr h264state.decoder) gives u32
     d.bit += 1
     give v
 
+-- The next n (0-8) bits, zeros past the end of the data.
+to bits (d ptr h264state.decoder, n u32) gives u32
+    new pos = d.bit >> 3
+    new w u32 = 0
+    if pos + 1 < d.size
+        w = ((d.data[pos] as u32) << 8) | d.data[pos + 1] as u32
+    else if pos < d.size
+        w = (d.data[pos] as u32) << 8
+    w = (w << (d.bit & 7) as u32) & 0xFFFF
+    d.bit += n as u64
+    give w >> ((16 as u32) - n)
+
 -- Start decoding the slice data at bit `pos` (rounded up to a byte) of `data`.
 to start (d ptr h264state.decoder, data ptr u8, size u64, pos u64, init_type u64, slice_qp i32)
     d.data = data
@@ -52,9 +64,14 @@ to decision (d ptr h264state.decoder, ctx u64) gives u32
     else
         b = d.mps[ctx] as u32
         d.state[ctx] = h264tables.next_state[s * 2 + 1]
-    while d.range < 256
-        d.range = d.range << 1
-        d.offset = (d.offset << 1) | bit(d)
+    if d.range < 256
+        new r = d.range
+        new sh u32 = 0
+        while r < 256
+            r = r << 1
+            sh += 1
+        d.range = r
+        d.offset = (d.offset << sh) | bits(d, sh)
     give b
 
 to bypass (d ptr h264state.decoder) gives u32

@@ -500,6 +500,12 @@ to luma_dc (d ptr h264state.decoder, qp i32)
 -- Chroma of a macroblock: DC (2x2 transform) and AC; `pred` holds the prediction of
 -- both planes (8x8 each); `inter` picks the inter scaling lists.
 to chroma (d ptr h264state.decoder, m ptr h264state.mbinfo, pred ptr i32, inter bool)
+    if m.cbp >> 4 is 0
+        -- no residual: the prediction is the picture
+        for each c in 0 until 2
+            new dst = chroma_ptr(d, c, (d.mbx / 2) as i64, (d.mby / 2) as i64)
+            add_block(dst, d.cur.cstride, pred + c * 64, 8, 0 as ptr i32, 8)
+        give
     for each c in 0 until 2
         new qpc = m.qpc[c]
         new list = 1 + c

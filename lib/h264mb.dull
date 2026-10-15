@@ -423,18 +423,24 @@ to luma_terms (d ptr h264state.decoder, m ptr h264state.mbinfo, blk u64, ta ptr 
             deref tb = t
 
 -- All residual blocks of the current macroblock, into the decoder's coefficient arrays.
+-- Zero n (even) i32s.
+to clear (p ptr i32, n u64)
+    new q = p as ptr u64
+    for each i in 0 until n / 2
+        q[i] = 0
+
 to residual (d ptr h264state.decoder, m ptr h264state.mbinfo)
     new a = h264state.left_of(d, d.mba)
     new b = h264state.top_of(d, d.mba)
-    for each i in 0 until 256
-        d.luma[i] = 0
-        d.luma8[i] = 0
-    for each i in 0 until 16
-        d.dc[i] = 0
-    for each i in 0 until 8
-        d.cdc[i] = 0
-    for each i in 0 until 128
-        d.cac[i] = 0
+    -- Coded blocks are written whole; what else gets read must start at zero: all of
+    -- an Intra16x16 macroblock's luma (AC may be missing) and its DC, and the chroma
+    -- when there is any (h264recon.chroma skips it otherwise).
+    if m.kind is h264state.k_i16
+        clear(addr of d.luma[0], 256)
+        clear(addr of d.dc[0], 16)
+    if m.cbp >> 4 is not 0
+        clear(addr of d.cdc[0], 8)
+        clear(addr of d.cac[0], 128)
     new scan [64] i32
     if m.kind is h264state.k_i16
         new fa u32 = 0

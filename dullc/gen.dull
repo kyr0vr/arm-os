@@ -1,8 +1,10 @@
 -- Type checking and code generation for function bodies. A port of the FuncGen class
 -- in stage0/dullc/compiler.py: every value through x0/x1; the locals used most
 -- (weighted by loop depth) in x19-x28, the rest in the frame; simple operands used
--- where they are, other intermediate values in x9-x15 or on the stack. The text it
--- writes must match stage 0's exactly.
+-- where they are, other intermediate values in x9-x15 or on the stack; functions that
+-- call nothing also use x6-x8 and x17; comparisons in conditions branch directly; p[i]
+-- with p and i in registers is one load or store. The text it writes must match
+-- stage 0's exactly.
 
 use mem
 use text
@@ -28,13 +30,15 @@ shape loop
     scope_index u64
 
 -- An lvalue: memory of type `ty`, or bits hi..lo of a `ty` in memory; `reg` instead
--- of memory when it is a local in a register.
+-- of memory when it is a local in a register; `place` an address operand ("[x19, x6]")
+-- when no address needs working out.
 shape lv
     bits bool
     ty   ptr types.ty
     hi   u64
     lo   u64
     reg  u64
+    place string
 
 new mod ptr program.module
 new fsym ptr program.sym
@@ -54,7 +58,8 @@ new tdepth u64                  -- x9.. holding intermediate values
 new oa string                   -- what `operands` found: the two operands
 new ob string
 
-fixed hot_locals u64 = 7        -- named locals that may get a register; the rest are for loop counters
+fixed spare_regs u64 = 3        -- registers left for loop counters; the rest may go to named locals
+fixed leaf_regs u64 = 0x2_01C0  -- x6-x8 and x17: free in a function that calls nothing (and has no asm)
 fixed first_reg u64 = 19
 fixed last_reg u64 = 28
 
@@ -220,7 +225,7 @@ to declare_local (name string, t ptr types.ty, node ptr ast.node, readonly bool)
     loc.reg = 0
     map.put(s.names, name, loc as u64)
     if t.repr is types.r_word and not map.has(escaped, name) and (map.has(hot, name) or (name.len > 0 and name[0] is ' ')) and free_regs is not 0
-        new r = first_reg
+        new r u64 = 0
         while (free_regs >> r) & 1 is 0
             r += 1
         free_regs = free_regs & ((1 << r) ^ 0xFFFFFFFFFFFFFFFF)
@@ -238,16 +243,27 @@ to pop_scope
 to store_local (loc ptr program.local)
     if loc.reg is not 0
         emit(cat3("mov ", xr(loc.reg), ", x0"))
+    else if loc.offset <= 256 and loc.ty.repr is types.r_word
+        store_lv(frame_lv(loc))
     else
         addr_local(loc.offset, "x2")
         store_x0_to_x2(loc.ty)
+
+-- A local in the frame as an address operand.
+to frame_lv (loc ptr program.local) gives ptr lv
+    new l = mem_lv(loc.ty)
+    l.place = cat3("[x29, #-", n(loc.offset), "]")
+    give l
 
 -- The register holding local `loc`: its own, or `want` after loading it.
 to local_operand (loc ptr program.local, want string) gives string
     if loc.reg is not 0
         give xr(loc.reg)
-    addr_local(loc.offset, "x0")
-    load_from_x0(loc.ty)
+    if loc.offset <= 256 and loc.ty.repr is types.r_word
+        load_lv(frame_lv(loc))
+    else
+        addr_local(loc.offset, "x0")
+        load_from_x0(loc.ty)
     if not same(want, "x0")
         emit(cat3("mov ", want, ", x0"))
     give want
@@ -288,6 +304,24 @@ to scan_list (l ptr vec.vec, depth u64, weights ptr map.map, declared ptr map.ma
         give
     for each i in 0 until l.len
         scan_uses(ast.item(l, i), depth, weights, declared)
+
+-- Does `e` hold an asm statement?
+to has_asm (e ptr ast.node) gives bool
+    if e as u64 is 0
+        give false
+    if e.kind is ast.k_asm
+        give true
+    if has_asm(node_a(e)) or has_asm(node_b(e)) or has_asm(node_c(e))
+        give true
+    give list_has_asm(e.list) or list_has_asm(e.list2)
+
+to list_has_asm (l ptr vec.vec) gives bool
+    if l as u64 is 0
+        give false
+    for each i in 0 until l.len
+        if has_asm(ast.item(l, i))
+            give true
+    give false
 
 -- Does expression `e` call anything (which could change x9-x15)?
 to has_call (e ptr ast.node) gives bool
@@ -431,27 +465,29 @@ to load_from_x0 (t ptr types.ty)
         emit("mov x2, x0")
         emit("ldp x0, x1, [x2]")
         give
+    emit(cat(load_op(t), ", [x0]"))
+
+-- The instruction (and target register) loading a word value of `t` into x0.
+to load_op (t ptr types.ty) gives string
     if t.kind is types.k_int
-        new op = "ldr x0"
         if t.bits is 8 and not t.signed
-            op = "ldrb w0"
-        else if t.bits is 8
-            op = "ldrsb x0"
-        else if t.bits is 16 and not t.signed
-            op = "ldrh w0"
-        else if t.bits is 16
-            op = "ldrsh x0"
-        else if t.bits is 32 and not t.signed
-            op = "ldr w0"
-        else if t.bits is 32
-            op = "ldrsw x0"
-        emit(cat(op, ", [x0]"))
-    else if t.kind is types.k_bool
-        emit("ldrb w0, [x0]")
-    else if t.kind is types.k_choice
-        emit("ldr w0, [x0]")
-    else
-        emit("ldr x0, [x0]")
+            give "ldrb w0"
+        if t.bits is 8
+            give "ldrsb x0"
+        if t.bits is 16 and not t.signed
+            give "ldrh w0"
+        if t.bits is 16
+            give "ldrsh x0"
+        if t.bits is 32 and not t.signed
+            give "ldr w0"
+        if t.bits is 32
+            give "ldrsw x0"
+        give "ldr x0"
+    if t.kind is types.k_bool
+        give "ldrb w0"
+    if t.kind is types.k_choice
+        give "ldr w0"
+    give "ldr x0"
 
 to store_op (size u64) gives string
     if size is 1
@@ -498,10 +534,17 @@ to zero_mem (size u64)
         give
     new top = program.label("z")
     new done = program.label("zd")
-    imm("x3", size)
+    new by8 = size % 8 is 0
+    if by8
+        imm("x3", size / 8)
+    else
+        imm("x3", size)
     lab(top)
     emit(cat("cbz x3, ", done))
-    emit("strb wzr, [x0], #1")
+    if by8
+        emit("str xzr, [x0], #8")
+    else
+        emit("strb wzr, [x0], #1")
     emit("sub x3, x3, #1")
     emit(cat("b ", top))
     lab(done)
@@ -558,7 +601,12 @@ to generate (m ptr program.module, s ptr program.sym)
     scan_list(s.node.list2, 0, weights, declared)
     for each i in 0 until s.params.len
         map.put(declared, program.param_at(s, i).name, 1)
-    for each k in 0 until hot_locals
+    if not list_has_call(s.node.list2) and not list_has_asm(s.node.list2)
+        free_regs = free_regs | leaf_regs
+    new nregs u64 = 0
+    for each r in 0 until 64
+        nregs += (free_regs >> r) & 1
+    for each k in 0 until nregs - spare_regs
         new best = ""
         new best_w u64 = 0
         for each i in 0 until map.count(declared)
@@ -577,20 +625,32 @@ to generate (m ptr program.module, s ptr program.sym)
         new p = program.param_at(s, i)
         new pnode = ast.make(ast.k_param, ast.item(s.node.list, i).line)
         vec.push(param_locals, declare_local(p.name, p.ty, pnode, false) as u64)
+    new slots = vec.make()
     new reg u64 = 0
     for each i in 0 until param_locals.len
-        new loc = vec.get(param_locals, i) as ptr program.local
-        if loc.reg is not 0
-            emit(cat3(cat3("mov ", xr(loc.reg), ", "), xr(reg), ""))
+        vec.push(slots, reg)
+        if (vec.get(param_locals, i) as ptr program.local).ty.repr is types.r_pair
+            reg += 2
+        else
             reg += 1
+    -- the ones in memory first, then the register moves backwards, so no argument
+    -- register is overwritten (x6, x7) before it is read
+    for each i in 0 until param_locals.len
+        new loc = vec.get(param_locals, i) as ptr program.local
+        reg = vec.get(slots, i)
+        if loc.reg is not 0
             skip
         addr_local(loc.offset, "x16")
         if loc.ty.repr is types.r_pair
             emit(cat3(cat3(cat3("stp ", xr(reg), ", "), xr(reg + 1), ", [x16]"), "", ""))
-            reg += 2
         else
             emit(cat3(store_op(loc.ty.size), n(reg), ", [x16]"))
-            reg += 1
+    new pi = param_locals.len
+    while pi > 0
+        pi -= 1
+        new loc = vec.get(param_locals, pi) as ptr program.local
+        if loc.reg is not 0
+            emit(cat3(cat3("mov ", xr(loc.reg), ", "), xr(vec.get(slots, pi)), ""))
     block(s.node.list2, false)
     run_afters(0, false)
     if not types.is_kind(s.ret, types.k_void)
@@ -603,7 +663,7 @@ to generate (m ptr program.module, s ptr program.sym)
     program.line(o, cat3(".type ", s.symbol, ", %function"))
     program.line(o, cat(s.symbol, ":"))
     new saved u64 = 0                   -- register pairs saved: x19/x20, x21/x22, ...
-    if top_reg is not 0
+    if top_reg >= first_reg
         saved = (top_reg - first_reg) / 2 + 1
     for each i in 0 until saved
         program.line(o, cat3(cat3("    stp ", xr(first_reg + 2 * i), ", "), xr(first_reg + 2 * i + 1), ", [sp, #-16]!"))
@@ -792,6 +852,11 @@ to s_assign (s ptr ast.node)
             give
         new r = reg_local(target)
         if r is not 0
+            new vt = infer(v, lt)
+            if is_simple(v)
+                check_assign(v, vt, lt)
+                simple_into(v, xr(r))
+                give
             value_as(v, lt)
             emit(cat3("mov ", xr(r), ", x0"))
             give
@@ -799,12 +864,16 @@ to s_assign (s ptr ast.node)
             new vt = infer(v, lt)
             if is_simple(v)
                 check_assign(v, vt, lt)
-                new l = address(target)
-                emit("mov x2, x0")
+                new l = access(target)
+                if l.place.len is 0
+                    emit("mov x2, x0")
                 simple_into(v, "x0")
                 store_lv(l)
                 give
         value_as(v, lt)
+        if lt.repr is types.r_word and accessible(target)
+            store_lv(access(target))
+            give
         if lt.repr is types.r_word and can_hold(target)
             new t = hold_x0()
             new l = address(target)
@@ -899,13 +968,98 @@ to cond (e ptr ast.node, false_label string)
     new t = infer(e, types.boolean())
     if t.kind is not types.k_bool
         fail(e, cat3("a condition must be a bool, found `", tt(t), "`"))
-    value(e)
-    emit(cat("cbz w0, ", false_label))
+    jump_unless(e, false_label)
+
+-- Branch to `target` when bool `e` is false.
+to jump_unless (e ptr ast.node, target string)
+    if e.kind is ast.k_logic and same(e.name, "and")
+        jump_unless(node_a(e), target)
+        jump_unless(node_b(e), target)
+    else if e.kind is ast.k_logic
+        new past = program.label("or")
+        jump_if(node_a(e), past)
+        jump_unless(node_b(e), target)
+        lab(past)
+    else if e.kind is ast.k_unary and same(e.name, "not")
+        jump_if(node_a(e), target)
+    else if e.kind is ast.k_compare and ty_of(node_a(e)).kind is not types.k_maybe
+        compare_jump(e, target, false)
+    else
+        value(e)
+        emit(cat("cbz w0, ", target))
+
+-- Branch to `target` when bool `e` is true.
+to jump_if (e ptr ast.node, target string)
+    if e.kind is ast.k_logic and same(e.name, "and")
+        new past = program.label("and")
+        jump_unless(node_a(e), past)
+        jump_if(node_b(e), target)
+        lab(past)
+    else if e.kind is ast.k_logic
+        jump_if(node_a(e), target)
+        jump_if(node_b(e), target)
+    else if e.kind is ast.k_unary and same(e.name, "not")
+        jump_unless(node_a(e), target)
+    else if e.kind is ast.k_compare and ty_of(node_a(e)).kind is not types.k_maybe
+        compare_jump(e, target, true)
+    else
+        value(e)
+        emit(cat("cbnz w0, ", target))
+
+to compare_jump (e ptr ast.node, target string, when bool)
+    operands(node_a(e), node_b(e), "cmp")
+    emit(cat3(cat3("cmp ", oa, ", "), ob, ""))
+    new lt = ty_of(node_a(e))
+    new c = cond_code(e.name, lt.kind is types.k_int and lt.signed)
+    if not when
+        c = inverse_code(c)
+    emit(cat3(cat3("b.", c, " "), target, ""))
+
+to cond_code (op string, signed bool) gives string
+    if same(op, "!=")
+        give "ne"
+    if same(op, "<")
+        if signed
+            give "lt"
+        give "lo"
+    if same(op, ">")
+        if signed
+            give "gt"
+        give "hi"
+    if same(op, "<=")
+        if signed
+            give "le"
+        give "ls"
+    if same(op, ">=")
+        if signed
+            give "ge"
+        give "hs"
+    give "eq"
+
+fixed inverse_pairs [10] string = ["eq", "ne", "lo", "hs", "hi", "ls", "lt", "ge", "gt", "le"]
+
+to inverse_code (c string) gives string
+    for each i in 0 until 10
+        if same(inverse_pairs[i], c)
+            give inverse_pairs[i ^ 1]
+    give c
 
 to s_if (s ptr ast.node)
     new done = program.label("fi")
     for each i in 0 until s.list.len
         new arm = ast.item(s.list, i)
+        if arm.list2.len is 1 and loops.len > 0 and depth is 0
+            new only = ast.item(arm.list2, 0)
+            new l = vec.last(loops) as ptr loop
+            if (only.kind is ast.k_stop or only.kind is ast.k_skip) and not any_afters(l.scope_index)
+                new t = infer(node_a(arm), types.boolean())
+                if t.kind is not types.k_bool
+                    fail(node_a(arm), cat3("a condition must be a bool, found `", tt(t), "`"))
+                if only.kind is ast.k_stop
+                    jump_if(node_a(arm), l.brk)
+                else
+                    jump_if(node_a(arm), l.cont)
+                skip
         new next = program.label("el")
         cond(node_a(arm), next)
         block(arm.list2, true)
@@ -948,8 +1102,7 @@ to s_hold (s ptr ast.node)
     new t = infer(node_a(s), types.boolean())
     if t.kind is not types.k_bool
         fail(s, "`hold until` needs a bool")
-    value(node_a(s))
-    emit(cat("cbnz w0, ", done))
+    jump_if(node_a(s), done)
     emit("yield")
     emit(cat("b ", top))
     lab(done)
@@ -1907,6 +2060,65 @@ to address (e ptr ast.node) gives ptr lv
     fail(e, "cannot take the address of this")
     give mem_lv(ty_of(e))
 
+-- Is `e` p[i] with p and i simple and a word-sized element (one load or store)?
+-- The local in the frame (near x29) that name `e` is, or 0.
+to frame_local (e ptr ast.node) gives ptr program.local
+    if e.kind is ast.k_name and e.ref is not 0 and ref_of(e).kind is program.r_local
+        new loc = ref_of(e).loc
+        if loc.reg is 0 and loc.offset <= 256 and loc.ty.repr is types.r_word
+            give loc
+    give 0 as ptr program.local
+
+-- For i + c (i simple, c a constant 0-4095): c, else 0.
+to plus_const (e ptr ast.node) gives ptr wide.wide
+    if e.kind is ast.k_binary and same(e.name, "+") and ty_of(e).kind is types.k_int and is_simple(node_a(e))
+        new c = const_of(node_b(e))
+        if c as u64 is not 0 and not wide.negative(c) and c.hi is 0 and c.lo <= 4095
+            give c
+    give 0 as ptr wide.wide
+
+-- Can `e` be loaded or stored with one instruction (leaving x0 alone): a local in the
+-- frame, or p[i] / p[i + c] with p and i simple and a word-sized element?
+to accessible (e ptr ast.node) gives bool
+    if frame_local(e) as u64 is not 0
+        give true
+    if e.kind is not ast.k_index or ty_of(node_a(e)).kind is not types.k_ptr
+        give false
+    new t = ty_of(e)
+    if t.repr is not types.r_word or (t.size is not 1 and t.size is not 2 and t.size is not 4 and t.size is not 8)
+        give false
+    give is_simple(node_a(e)) and (is_simple(node_b(e)) or plus_const(node_b(e)) as u64 is not 0)
+
+-- The lvalue of `e`, as an address operand if `accessible` (leaving x0 alone).
+to access (e ptr ast.node) gives ptr lv
+    if not accessible(e)
+        give address(e)
+    new loc = frame_local(e)
+    if loc as u64 is not 0
+        give frame_lv(loc)
+    new t = ty_of(e)
+    new l = mem_lv(t)
+    new base = simple_operand(node_a(e), "x2", "")
+    new c = const_of(node_b(e))
+    if c as u64 is not 0 and not wide.negative(c) and c.hi is 0 and c.lo <= 4095
+        l.place = cat3(cat3("[", base, ", #"), n(c.lo * t.size), "]")
+        give l
+    new pc = plus_const(node_b(e))
+    if pc as u64 is not 0
+        new i = simple_operand(node_a(node_b(e)), "x1", "")
+        if t.size is 1
+            emit(cat3(cat3("add x16, ", base, ", "), i, ""))
+        else
+            emit(cat3(cat3(cat3("add x16, ", base, ", "), i, ", lsl #"), n(log2(t.size)), ""))
+        l.place = cat3("[x16, #", n(pc.lo * t.size), "]")
+        give l
+    new index = simple_operand(node_b(e), "x1", "")
+    if t.size is 1
+        l.place = cat3(cat3("[", base, ", "), index, "]")
+    else
+        l.place = cat3(cat3(cat3("[", base, ", "), index, ", lsl #"), n(log2(t.size)), "]")
+    give l
+
 to sub_bits (inner ptr lv, base_ty ptr types.ty, hi u64, lo u64, node ptr ast.node) gives ptr lv
     if inner.bits
         if hi > inner.hi - inner.lo
@@ -1926,6 +2138,9 @@ to load_lv (l ptr lv)
         else
             emit(cat("mov x0, ", xr(l.reg)))
         give
+    if l.place.len > 0
+        emit(cat3(load_op(l.ty), ", ", l.place))
+        give
     if not l.bits
         load_from_x0(l.ty)
         give
@@ -1940,6 +2155,9 @@ to store_lv (l ptr lv)
             normalize_at(l.ty, n(l.reg))
         else
             emit(cat3("mov ", xr(l.reg), ", x0"))
+        give
+    if l.place.len > 0
+        emit(cat3(store_op(l.ty.size), "0, ", l.place))
         give
     if not l.bits
         store_x0_to_x2(l.ty)
@@ -2029,7 +2247,7 @@ to v_name (e ptr ast.node)
         if s.has_data
             addr_symbol(s.data_label, "x0")
             give
-    load_lv(address(e))
+    load_lv(access(e))
 
 to v_field (e ptr ast.node)
     if has_const_len(e)
@@ -2062,7 +2280,7 @@ to v_index (e ptr ast.node)
         emit("lsr x0, x0, x1")
         emit("and x0, x0, #1")
         give
-    load_lv(address(e))
+    load_lv(access(e))
 
 to v_bits (e ptr ast.node)
     if is_lvalue(e)
@@ -2111,6 +2329,11 @@ to v_call (e ptr ast.node)
     new s = e.sym as ptr program.sym
     new pushed = vec.make()             -- (repr, register) of the arguments on the stack
     new later = vec.make()              -- (argument, register) of the simple ones
+    -- the last argument that has to be worked out goes straight to its register(s)
+    new last = e.list.len
+    for each i in 0 until e.list.len
+        if not (program.param_at(s, i).ty.repr is types.r_word and is_simple(ast.item(e.list, i)))
+            last = i
     new r u64 = 0
     for each i in 0 until e.list.len
         new arg = ast.item(e.list, i)
@@ -2121,9 +2344,15 @@ to v_call (e ptr ast.node)
         else
             value(arg)
             coerce(ty_of(arg), pty)
-            push(pty.repr)
-            vec.push(pushed, pty.repr as u64)
-            vec.push(pushed, r)
+            if i is last
+                if r is not 0 and pty.repr is types.r_pair
+                    emit(cat3("mov ", xr(r + 1), ", x1"))
+                if r is not 0
+                    emit(cat3("mov ", xr(r), ", x0"))
+            else
+                push(pty.repr)
+                vec.push(pushed, pty.repr as u64)
+                vec.push(pushed, r)
         if pty.repr is types.r_pair
             r += 2
         else
@@ -2191,6 +2420,20 @@ to v_binary (e ptr ast.node)
         else
             emit(three("sub", a, b))
         give
+    if (same(e.name, "/") or same(e.name, "%")) and t.kind is types.k_int and not t.signed
+        new c = const_of(node_b(e))
+        if c as u64 is not 0 and c.hi is 0 and c.lo >= 2 and c.lo & (c.lo - 1) is 0
+            -- unsigned division by a power of two: a shift or a mask
+            new r = reg_local(node_a(e))
+            new a = xr(r)
+            if r is 0
+                value(node_a(e))
+                a = "x0"
+            if same(e.name, "/")
+                emit(cat3(cat3("lsr x0, ", a, ", #"), n(log2(c.lo)), ""))
+            else
+                emit(cat3(cat3("and x0, ", a, ", #"), n(c.lo - 1), ""))
+            give
     operands(node_a(e), node_b(e), e.name)
     binop(e, e.name, t, oa, ob)
 
@@ -2245,10 +2488,10 @@ to binop (node ptr ast.node, op string, t ptr types.ty, a string, b string)
             div = "sdiv"
         emit(cat3(cat3(cat3(div, " x2, ", a), ", ", b), "", ""))
         if same(op, "/")
+            -- canonical operands give a canonical quotient (but for MIN / -1, an overflow)
             emit("mov x0, x2")
             if dbg and s and t.bits < 64
                 check_range(node, t)
-            normalize(t)
         else
             emit(cat3(cat3("msub x0, x2, ", b, ", "), a, ""))
         give
@@ -2288,9 +2531,10 @@ to binop (node ptr ast.node, op string, t ptr types.ty, a string, b string)
         emit(three("sub", a, b))
     else
         emit(three("mul", a, b))
+    -- a result that fits (checked in debug builds; overflow is an error, not a wrap,
+    -- so release builds may assume it) is already canonical
     if dbg
         check_range(node, t)
-    normalize(t)
 
 -- Trap unless the exact 64-bit result in x0 fits in narrow type t.
 to check_range (node ptr ast.node, t ptr types.ty)

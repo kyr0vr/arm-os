@@ -40,21 +40,26 @@ to set_motion (d ptr h264state.decoder, m ptr h264state.mbinfo, r u64, lst u64, 
     new dx = v[2]
     new dy = v[3]
     new ref = v[4]
+    new pid u32 = 0
+    if ref >= 0
+        new pic = h264mc.picture_of(d, lst, ref)
+        if pic as u64 is not 0
+            pid = pic.id
+    new cx = cap(dx)
+    new cy = cap(dy)
+    new done = d.done[lst]
     for each by in y / 4 until (y + h) / 4
         for each bx in x / 4 until (x + w) / 4
-            new blk = h264state.block_at(bx, by)
-            m.mv[(lst * 16 + blk) * 2] = mvx as i16
-            m.mv[(lst * 16 + blk) * 2 + 1] = mvy as i16
-            m.mvd[(lst * 16 + blk) * 2] = cap(dx)
-            m.mvd[(lst * 16 + blk) * 2 + 1] = cap(dy)
+            new blk = h264state.blk_at[by * 4 + bx] as u64
+            new k = (lst * 16 + blk) * 2
+            m.mv[k] = mvx as i16
+            m.mv[k + 1] = mvy as i16
+            m.mvd[k] = cx
+            m.mvd[k + 1] = cy
             m.ref[lst * 4 + blk / 4] = ref as i8
-            d.done[lst] = d.done[lst] | ((1 as u32) << blk as u32)
-            new pid u32 = 0
-            if ref >= 0
-                new pic = h264mc.picture_of(d, lst, ref)
-                if pic as u64 is not 0
-                    pid = pic.id
             m.refpic[lst * 4 + blk / 4] = pid
+            done = done | ((1 as u32) << blk as u32)
+    d.done[lst] = done
 
 to set_none (d ptr h264state.decoder, m ptr h264state.mbinfo, r u64, lst u64)
     new v [5] i32

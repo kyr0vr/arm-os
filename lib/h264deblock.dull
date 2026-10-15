@@ -60,114 +60,123 @@ to strength (p ptr h264state.mbinfo, pb u64, q ptr h264state.mbinfo, qb u64, mb_
         give 1
     give 0
 
--- Filter one line of samples across an edge: p[-k * step] and q[k * step].
-to line (s ptr u8, step i64, bs u32, alpha i32, beta i32, tc0 i32, luma bool)
-    new base = s as i64
-    new p0 = ((base - step) as ptr u8)[0] as i32
-    new q0 = s[0] as i32
-    new d0 = p0 - q0
-    if d0 < 0
-        d0 = 0 - d0
-    if d0 >= alpha
-        give
-    new p1 = ((base - 2 * step) as ptr u8)[0] as i32
-    new d1 = p1 - p0
-    if d1 < 0
-        d1 = 0 - d1
-    if d1 >= beta
-        give
-    new q1 = ((base + step) as ptr u8)[0] as i32
-    new d2 = q1 - q0
-    if d2 < 0
-        d2 = 0 - d2
-    if d2 >= beta
-        give
-    new p2 i32 = 0
-    new q2 i32 = 0
-    new ap i32 = 0
-    new aq i32 = 0
-    if luma
-        p2 = ((base - 3 * step) as ptr u8)[0] as i32
-        q2 = ((base + 2 * step) as ptr u8)[0] as i32
-        ap = p2 - p0
-        if ap < 0
-            ap = 0 - ap
-        aq = q2 - q0
-        if aq < 0
-            aq = 0 - aq
-    if bs < 4
-        new tc = tc0 + 1
-        if luma
-            tc = tc0
-            if ap < beta
-                tc += 1
-            if aq < beta
-                tc += 1
-        new delta = (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3
-        if delta < 0 - tc
-            delta = 0 - tc
-        else if delta > tc
-            delta = tc
-        new np0 = p0 + delta
-        if np0 < 0
-            np0 = 0
-        else if np0 > 255
-            np0 = 255
-        new nq0 = q0 - delta
-        if nq0 < 0
-            nq0 = 0
-        else if nq0 > 255
-            nq0 = 255
-        ((base - step) as ptr u8)[0] = np0 as u8
-        s[0] = nq0 as u8
-        if luma
-            if ap < beta
-                new t = (p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1
-                if t < 0 - tc0
-                    t = 0 - tc0
-                else if t > tc0
-                    t = tc0
-                ((base - 2 * step) as ptr u8)[0] = (p1 + t) as u8
-            if aq < beta
-                new t = (q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1
-                if t < 0 - tc0
-                    t = 0 - tc0
-                else if t > tc0
-                    t = tc0
-                ((base + step) as ptr u8)[0] = (q1 + t) as u8
-        give
-    -- bS 4
-    new strong = d0 < ((alpha >> 2) + 2)
-    if luma and ap < beta and strong
-        new p3 = ((base - 4 * step) as ptr u8)[0] as i32
-        ((base - step) as ptr u8)[0] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) as u8
-        ((base - 2 * step) as ptr u8)[0] = ((p2 + p1 + p0 + q0 + 2) >> 2) as u8
-        ((base - 3 * step) as ptr u8)[0] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) as u8
-    else
-        ((base - step) as ptr u8)[0] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8
-    if luma and aq < beta and strong
-        new q3 = ((base + 3 * step) as ptr u8)[0] as i32
-        s[0] = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3) as u8
-        ((base + step) as ptr u8)[0] = ((p0 + q0 + q1 + q2 + 2) >> 2) as u8
-        ((base + 2 * step) as ptr u8)[0] = ((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) as u8
-    else
-        s[0] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8
-
--- One edge: `n` lines starting at `s`, `along` apart, filtered across with `step`.
+-- One edge: `n` lines starting at `s`, `along` apart, each filtered across with
+-- `step`: p[-k * step] and q[k * step] (8.7.2).
 -- np: lines | per << 8 (how many lines share one bS)
 to edge (d ptr h264state.decoder, s ptr u8, along i64, step i64, np u64, bs ptr u32, qp i32, luma bool)
     new n = np & 255
     new per = np >> 8
-    new ia = h264state.clip(qp + d.alpha_off, 0, 51)
-    new ib = h264state.clip(qp + d.beta_off, 0, 51)
+    new shift u64 = 1
+    if per is 4
+        shift = 2
+    new ia = qp + d.alpha_off
+    if ia < 0
+        ia = 0
+    else if ia > 51
+        ia = 51
+    new ib = qp + d.beta_off
+    if ib < 0
+        ib = 0
+    else if ib > 51
+        ib = 51
     new alpha = h264tables.alpha[(ia + 12) as u64] as i32
     new beta = h264tables.beta[(ib + 12) as u64] as i32
+    new tcs = (addr of h264tables.tc0[0]) + ((ia + 12) as u64) * 4
     for each k in 0 until n
-        new b = bs[k / per]
+        new b = bs[k >> shift]
         if b is 0
             skip
-        new tc0 = h264tables.tc0[((ia + 12) as u64) * 4 + b as u64] as i32
-        line((s as i64 + k as i64 * along) as ptr u8, step, b, alpha, beta, tc0, luma)
+        new tc0 = tcs[b as u64] as i32
+        new base = s as i64 + k as i64 * along
+        new p0 = ((base - step) as ptr u8)[0] as i32
+        new q0 = (base as ptr u8)[0] as i32
+        new d0 = p0 - q0
+        if d0 < 0
+            d0 = 0 - d0
+        if d0 >= alpha
+            skip
+        new p1 = ((base - 2 * step) as ptr u8)[0] as i32
+        new d1 = p1 - p0
+        if d1 < 0
+            d1 = 0 - d1
+        if d1 >= beta
+            skip
+        new q1 = ((base + step) as ptr u8)[0] as i32
+        new d2 = q1 - q0
+        if d2 < 0
+            d2 = 0 - d2
+        if d2 >= beta
+            skip
+        new p2 i32 = 0
+        new q2 i32 = 0
+        new ap i32 = 0
+        new aq i32 = 0
+        if luma
+            p2 = ((base - 3 * step) as ptr u8)[0] as i32
+            q2 = ((base + 2 * step) as ptr u8)[0] as i32
+            ap = p2 - p0
+            if ap < 0
+                ap = 0 - ap
+            aq = q2 - q0
+            if aq < 0
+                aq = 0 - aq
+        if b < 4
+            new tc = tc0 + 1
+            if luma
+                tc = tc0
+                if ap < beta
+                    tc += 1
+                if aq < beta
+                    tc += 1
+            new delta = (((q0 - p0) << 2) + (p1 - q1) + 4) >> 3
+            if delta < 0 - tc
+                delta = 0 - tc
+            else if delta > tc
+                delta = tc
+            new np0 = p0 + delta
+            if np0 < 0
+                np0 = 0
+            else if np0 > 255
+                np0 = 255
+            new nq0 = q0 - delta
+            if nq0 < 0
+                nq0 = 0
+            else if nq0 > 255
+                nq0 = 255
+            ((base - step) as ptr u8)[0] = np0 as u8
+            (base as ptr u8)[0] = nq0 as u8
+            if luma
+                if ap < beta
+                    new t = (p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1
+                    if t < 0 - tc0
+                        t = 0 - tc0
+                    else if t > tc0
+                        t = tc0
+                    ((base - 2 * step) as ptr u8)[0] = (p1 + t) as u8
+                if aq < beta
+                    new t = (q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1
+                    if t < 0 - tc0
+                        t = 0 - tc0
+                    else if t > tc0
+                        t = tc0
+                    ((base + step) as ptr u8)[0] = (q1 + t) as u8
+            skip
+        -- bS 4
+        new strong = d0 < ((alpha >> 2) + 2)
+        if luma and ap < beta and strong
+            new p3 = ((base - 4 * step) as ptr u8)[0] as i32
+            ((base - step) as ptr u8)[0] = ((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3) as u8
+            ((base - 2 * step) as ptr u8)[0] = ((p2 + p1 + p0 + q0 + 2) >> 2) as u8
+            ((base - 3 * step) as ptr u8)[0] = ((2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3) as u8
+        else
+            ((base - step) as ptr u8)[0] = ((2 * p1 + p0 + q1 + 2) >> 2) as u8
+        if luma and aq < beta and strong
+            new q3 = ((base + 3 * step) as ptr u8)[0] as i32
+            (base as ptr u8)[0] = ((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3) as u8
+            ((base + step) as ptr u8)[0] = ((p0 + q0 + q1 + q2 + 2) >> 2) as u8
+            ((base + 2 * step) as ptr u8)[0] = ((2 * q3 + 3 * q2 + q1 + q0 + p0 + 4) >> 3) as u8
+        else
+            (base as ptr u8)[0] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8
 
 to picture (d ptr h264state.decoder)
     if d.deblock_idc is 1
@@ -205,6 +214,8 @@ to picture (d ptr h264state.decoder)
                         qb = h264state.block_at(k, e)
                         pb = h264state.block_at(k, (e + 3) % 4)
                     bs[k] = strength(p, pb, q, qb, e is 0)
+                if bs[0] | bs[1] | bs[2] | bs[3] is 0
+                    skip
                 new qpav = (p.qp + q.qp + 1) >> 1
                 if dir is 0
                     new s = (pic.y as i64 + (my as i64) * pic.stride as i64 + (mx + e * 4) as i64) as ptr u8
