@@ -1,0 +1,763 @@
+-- An AAC decoder (AAC LC, the kind in MP4 videos and .m4a files): mono or stereo,
+-- all sampling rates, long and short windows, mid/side and intensity stereo, TNS.
+-- Fixed point: spectra are Q4 (PCM units x 16: a loud tone's spectral peak is about
+-- its amplitude x 512, so this leaves room in 32 bits).
+--
+--   new a = aac.make()
+--   aac.configure(a, config, size)         -- the AudioSpecificConfig (from the MP4)
+--   aac.frame(a, data, size, pcm)          -- one access unit -> 1024 stereo frames
+--
+-- Not done: noise substitution (PNS) bands come out silent; HE-AAC's SBR and PS
+-- are ignored (the core plays at half the rate's detail); main/LTP profiles.
+
+use mem
+use aactables
+
+fixed only_long u32 = 0
+fixed long_start u32 = 1
+fixed eight_short u32 = 2
+fixed long_stop u32 = 3
+
+fixed rates [12] u32 = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000]
+fixed tns_max_long [12] u32 = [31, 31, 34, 40, 42, 51, 46, 46, 42, 42, 42, 39]
+fixed tns_max_short [12] u32 = [9, 9, 10, 14, 14, 14, 14, 14, 14, 14, 14, 14]
+
+-- One channel's side information and spectrum.
+shape ics
+    seq        u32
+    wshape     u32
+    max_sfb    u32
+    ngroups    u32
+    groups     [8] u32
+    windows    u32
+    cb         [408] u8                -- [group * 51 + band]
+    sf         [408] i32
+    q          [1024] i32              -- quantized values, window by window (128 each when short)
+    x          [1024] i32              -- the spectrum, Q4
+    tns_on     bool
+    tns_nf     [8] u32                 -- filters per window
+    tns_len    [24] u32                -- up to 3 filters per window
+    tns_order  [24] u32
+    tns_dir    [24] u32
+    tns_coef   [480] i32               -- reflection coefficients (Q30), 20 per filter
+    pulse_n    u32
+    pulse_k    [4] u32
+    pulse_amp  [4] i32
+
+shape decoder
+    ready      bool
+    sri        u64
+    rate       u32
+    channels   u32
+    nlong      u64
+    nshort     u64
+    ch         [2] ics
+    ms         [408] u8
+    overlap    [2048] i32              -- [channel * 1024 + n], Q4
+    prev_shape [2] u32
+    -- bits
+    data       ptr u8
+    size       u64
+    pos        u64
+    -- IMDCT work
+    re         [512] i64
+    im         [512] i64
+    out        [2048] i32
+
+to make gives ptr decoder
+    give mem.alloc(size_of(decoder)) as ptr decoder
+
+-- ---------------------------------------------------------------- bits
+
+to bits (a ptr decoder, n u32) gives u32
+    new v u32 = 0
+    for each i in 0 until n as u64
+        new at_byte = a.pos >> 3
+        new b u32 = 0
+        if at_byte < a.size
+            b = a.data[at_byte] as u32
+        new shift = (7 - (a.pos & 7)) as u32
+        v = (v << 1) | ((b >> shift) & 1)
+        a.pos += 1
+    give v
+
+-- A Huffman value from book `book` (1-11, or 12 for scale factors).
+to huff (a ptr decoder, book u64) gives u32
+    new node = aactables.huff_start[book - 1] as i64
+    repeat
+        new child = aactables.huff[(node * 2) as u64 + bits(a, 1) as u64] as i64
+        if child < 0
+            give (0 - child - 1) as u32
+        if child is 0
+            give 0                                       -- a broken stream
+        node = child
+
+-- ---------------------------------------------------------------- configuration
+
+to configure (a ptr decoder, config ptr u8, size u64) gives bool
+    a.data = config
+    a.size = size
+    a.pos = 0
+    new aot = bits(a, 5)
+    if aot is 31
+        aot = 32 + bits(a, 6)
+    new sri = bits(a, 4) as u64
+    if sri is 15
+        new rate = bits(a, 24)
+        sri = 4
+        for each i in 0 until 12
+            if rates[i] is rate
+                sri = i
+    a.channels = bits(a, 4)
+    if aot is not 2 and aot is not 5 and aot is not 29
+        give false                                       -- not LC (5 and 29 are LC with SBR/PS)
+    if sri > 11 or a.channels < 1 or a.channels > 2
+        give false
+    a.sri = sri
+    a.rate = rates[sri]
+    a.nlong = aactables.long_count[sri] as u64
+    a.nshort = aactables.short_count[sri] as u64
+    a.ready = true
+    give true
+
+to band (a ptr decoder, s ptr ics, k u64) gives u64
+    if s.windows is 8
+        give aactables.short_bands[a.sri * 16 + k] as u64
+    give aactables.long_bands[a.sri * 52 + k] as u64
+
+-- ---------------------------------------------------------------- one channel's syntax
+
+to ics_info (a ptr decoder, s ptr ics) gives bool
+    bits(a, 1)
+    s.seq = bits(a, 2)
+    s.wshape = bits(a, 1)
+    if s.seq is eight_short
+        s.max_sfb = bits(a, 4)
+        new grouping = bits(a, 7)
+        s.ngroups = 1
+        s.groups[0] = 1
+        for each i in 0 until 7
+            if (grouping >> (6 - i) as u32) & 1 is 1
+                s.groups[(s.ngroups - 1) as u64] += 1
+            else
+                s.groups[s.ngroups as u64] = 1
+                s.ngroups += 1
+        s.windows = 8
+        give s.max_sfb as u64 <= a.nshort
+    s.max_sfb = bits(a, 6)
+    if bits(a, 1) is 1
+        give false                                       -- prediction: not AAC LC
+    s.ngroups = 1
+    s.groups[0] = 1
+    s.windows = 1
+    give s.max_sfb as u64 <= a.nlong
+
+to section (a ptr decoder, s ptr ics) gives bool
+    new width u32 = 5
+    if s.windows is 8
+        width = 3
+    new esc = ((1 as u32) << width) - 1
+    for each g in 0 until s.ngroups as u64
+        new k u32 = 0
+        while k < s.max_sfb
+            new cb = bits(a, 4)
+            new length u32 = 0
+            repeat
+                new inc = bits(a, width)
+                length += inc
+                if inc is not esc
+                    stop
+            if k + length > s.max_sfb
+                give false
+            for each i in 0 until length as u64
+                s.cb[g * 51 + k as u64 + i] = cb as u8
+            k += length
+    give true
+
+to scalefactors (a ptr decoder, s ptr ics, gain i32)
+    new sf = gain
+    new is_pos i32 = 0
+    new noise = gain - 90
+    new first_noise = true
+    for each g in 0 until s.ngroups as u64
+        for each b in 0 until s.max_sfb as u64
+            new i = g * 51 + b
+            new cb = s.cb[i]
+            if cb is 0
+                s.sf[i] = 0
+            else if cb is 14 or cb is 15
+                is_pos += huff(a, 12) as i32 - 60
+                s.sf[i] = is_pos
+            else if cb is 13
+                if first_noise
+                    noise += bits(a, 9) as i32 - 256
+                    first_noise = false
+                else
+                    noise += huff(a, 12) as i32 - 60
+                s.sf[i] = noise
+            else
+                sf += huff(a, 12) as i32 - 60
+                s.sf[i] = sf
+
+to pulses (a ptr decoder, s ptr ics)
+    s.pulse_n = 0
+    if bits(a, 1) is 0
+        give
+    s.pulse_n = bits(a, 2) + 1
+    new start = bits(a, 6) as u64
+    new k = band(a, s, start)
+    for each i in 0 until s.pulse_n as u64
+        k += bits(a, 5) as u64
+        s.pulse_k[i] = k as u32
+        s.pulse_amp[i] = bits(a, 4) as i32
+
+to tns_read (a ptr decoder, s ptr ics)
+    s.tns_on = bits(a, 1) is 1
+    if not s.tns_on
+        give
+    new short = s.windows is 8
+    for each w in 0 until s.windows as u64
+        new nbits u32 = 2
+        if short
+            nbits = 1
+        new nf = bits(a, nbits)
+        s.tns_nf[w] = nf
+        if nf is 0
+            skip
+        new res = bits(a, 1)
+        for each f in 0 until nf as u64
+            new slot = w * 3 + f
+            if short
+                s.tns_len[slot] = bits(a, 4)
+                s.tns_order[slot] = bits(a, 3)
+            else
+                s.tns_len[slot] = bits(a, 6)
+                s.tns_order[slot] = bits(a, 5)
+            new order = s.tns_order[slot]
+            if order is 0
+                skip
+            s.tns_dir[slot] = bits(a, 1)
+            new compress = bits(a, 1)
+            new width = res + 3 - compress
+            for each c in 0 until order as u64
+                new v = bits(a, width) as i32
+                if v >= (1 as i32) << (width - 1)
+                    v -= (1 as i32) << width
+                s.tns_coef[slot * 20 + c] = aactables.tns_coef[(res as i32 * 16 + v + 8) as u64]
+
+-- The quantized spectrum, window by window.
+to spectral (a ptr decoder, s ptr ics) gives bool
+    for each i in 0 until 1024
+        s.q[i] = 0
+    new w0 u64 = 0
+    for each g in 0 until s.ngroups as u64
+        new glen = s.groups[g] as u64
+        for each b in 0 until s.max_sfb as u64
+            new cb = s.cb[g * 51 + b] as u64
+            if cb is 0 or cb >= 13
+                skip
+            new lo = band(a, s, b)
+            new hi = band(a, s, b + 1)
+            for each w in 0 until glen
+                new base = (w0 + w) * 128
+                if s.windows is 1
+                    base = 0
+                new k = lo
+                while k < hi
+                    new idx = huff(a, cb) as i32
+                    new v [4] i32
+                    new dim u64 = 2
+                    if cb <= 4
+                        dim = 4
+                        v[0] = idx / 27
+                        v[1] = (idx / 9) % 3
+                        v[2] = (idx / 3) % 3
+                        v[3] = idx % 3
+                        if cb <= 2
+                            for each i in 0 until 4
+                                v[i] -= 1
+                    else if cb <= 6
+                        v[0] = idx / 9 - 4
+                        v[1] = idx % 9 - 4
+                    else
+                        new m i32 = 8
+                        if cb is 9 or cb is 10
+                            m = 13
+                        else if cb is 11
+                            m = 17
+                        v[0] = idx / m
+                        v[1] = idx % m
+                    if cb is 3 or cb is 4 or cb >= 7
+                        for each i in 0 until dim
+                            if v[i] is not 0 and bits(a, 1) is 1
+                                v[i] = 0 - v[i]
+                    if cb is 11
+                        for each i in 0 until 2
+                            if v[i] is 16 or v[i] is -16
+                                new n u32 = 4
+                                while bits(a, 1) is 1 and n < 13
+                                    n += 1
+                                new e = ((1 as i32) << n) + bits(a, n) as i32
+                                if v[i] < 0
+                                    e = 0 - e
+                                v[i] = e
+                    for each i in 0 until dim
+                        if k + i < hi
+                            s.q[base + k + i] = v[i]
+                    k += dim
+        w0 += glen
+    give a.pos <= a.size * 8
+
+to channel (a ptr decoder, s ptr ics, common bool) gives bool
+    new gain = bits(a, 8) as i32
+    if not common and not ics_info(a, s)
+        give false
+    if not section(a, s)
+        give false
+    scalefactors(a, s, gain)
+    pulses(a, s)
+    tns_read(a, s)
+    if bits(a, 1) is 1
+        give false                                       -- gain control: not AAC LC
+    if not spectral(a, s)
+        give false
+    for each i in 0 until s.pulse_n as u64
+        new k = s.pulse_k[i] as u64
+        if k < 1024
+            if s.q[k] >= 0
+                s.q[k] += s.pulse_amp[i]
+            else
+                s.q[k] -= s.pulse_amp[i]
+    give true
+
+-- ---------------------------------------------------------------- dequantization
+
+-- sign(v) x |v|^(4/3) x 2^(quarters / 4), Q4.
+to dequant (v i32, quarters i32) gives i32
+    if v is 0
+        give 0
+    new n = v as i64
+    if n < 0
+        n = 0 - n
+    if n > 8191
+        n = 8191
+    new m = aactables.pow43_m[n as u64] as i64
+    new e = aactables.pow43_e[n as u64] as i64
+    new qq i64 = 0
+    if quarters >= 0
+        qq = (quarters / 4) as i64
+    else
+        qq = 0 - ((3 - quarters) / 4) as i64
+    new r = quarters as i64 - qq * 4
+    new prod = (m * aactables.quarter[r as u64] as i64) >> 30   -- Q30
+    new shift = e + qq - 26
+    new x i64 = 0
+    if shift >= 0
+        if shift > 30
+            x = 0x7FFF_FFFF
+        else
+            x = prod << (shift as u64)
+            if x > 0x7FFF_FFFF
+                x = 0x7FFF_FFFF
+    else if shift > -62
+        new sh = (0 - shift) as u64
+        x = (prod + ((1 as i64) << (sh - 1))) >> sh
+    if v < 0
+        x = 0 - x
+    give x as i32
+
+to spectrum (a ptr decoder, s ptr ics)
+    for each i in 0 until 1024
+        s.x[i] = 0
+    new w0 u64 = 0
+    for each g in 0 until s.ngroups as u64
+        new glen = s.groups[g] as u64
+        for each b in 0 until s.max_sfb as u64
+            new cb = s.cb[g * 51 + b]
+            if cb is 0 or cb >= 13
+                skip
+            new quarters = s.sf[g * 51 + b] - 100
+            new lo = band(a, s, b)
+            new hi = band(a, s, b + 1)
+            for each w in 0 until glen
+                new base = (w0 + w) * 128
+                if s.windows is 1
+                    base = 0
+                for each k in lo until hi
+                    s.x[base + k] = dequant(s.q[base + k], quarters)
+        w0 += glen
+
+-- Mid/side and intensity stereo of a channel pair with a common window.
+to stereo (a ptr decoder, l ptr ics, r ptr ics)
+    new w0 u64 = 0
+    for each g in 0 until l.ngroups as u64
+        new glen = l.groups[g] as u64
+        for each b in 0 until l.max_sfb as u64
+            new i = g * 51 + b
+            new lo = band(a, l, b)
+            new hi = band(a, l, b + 1)
+            new rcb = r.cb[i]
+            if rcb is 14 or rcb is 15
+                -- right = +/- left x 2^(-is_position / 4)
+                new quarters = 0 - r.sf[i]
+                new qq i64 = 0
+                if quarters >= 0
+                    qq = (quarters / 4) as i64
+                else
+                    qq = 0 - ((3 - quarters) / 4) as i64
+                new rr = quarters as i64 - qq * 4
+                new f = aactables.quarter[rr as u64] as i64
+                new negative = rcb is 14
+                if a.ms[i] is 1
+                    negative = not negative
+                for each w in 0 until glen
+                    new base = (w0 + w) * 128
+                    if l.windows is 1
+                        base = 0
+                    for each k in lo until hi
+                        new v = (l.x[base + k] as i64) * f
+                        if qq >= 0
+                            v = v << (qq as u64)
+                        else
+                            v = v >> ((0 - qq) as u64)
+                        v = v >> 30
+                        if negative
+                            v = 0 - v
+                        r.x[base + k] = v as i32
+            else if a.ms[i] is 1 and l.cb[i] < 13 and rcb < 13
+                for each w in 0 until glen
+                    new base = (w0 + w) * 128
+                    if l.windows is 1
+                        base = 0
+                    for each k in lo until hi
+                        new m = l.x[base + k]
+                        new sd = r.x[base + k]
+                        l.x[base + k] = m + sd
+                        r.x[base + k] = m - sd
+        w0 += glen
+
+-- ---------------------------------------------------------------- TNS
+
+to tns_apply (a ptr decoder, s ptr ics)
+    if not s.tns_on
+        give
+    new short = s.windows is 8
+    new nb = a.nlong
+    new top_limit = tns_max_long[a.sri] as u64
+    if short
+        nb = a.nshort
+        top_limit = tns_max_short[a.sri] as u64
+    if top_limit > s.max_sfb as u64
+        top_limit = s.max_sfb as u64
+    for each w in 0 until s.windows as u64
+        new bottom = nb
+        for each f in 0 until s.tns_nf[w] as u64
+            new slot = w * 3 + f
+            new topb = bottom
+            new length = s.tns_len[slot] as u64
+            if length > topb
+                bottom = 0
+            else
+                bottom = topb - length
+            new order = s.tns_order[slot] as u64
+            if order is 0
+                skip
+            -- reflection coefficients -> LPC (Q24)
+            new lpc [21] i64
+            new tmp [21] i64
+            lpc[0] = (1 as i64) << 24
+            for each m in 0 until order
+                new kc = s.tns_coef[slot * 20 + m] as i64      -- Q30
+                for each i in 1 until m + 1
+                    tmp[i] = lpc[i] + ((kc * lpc[m + 1 - i]) >> 30)
+                for each i in 1 until m + 1
+                    lpc[i] = tmp[i]
+                lpc[m + 1] = kc >> 6
+            new lo = bottom
+            if lo > top_limit
+                lo = top_limit
+            new hi = topb
+            if hi > top_limit
+                hi = top_limit
+            new start = band(a, s, lo)
+            new finish = band(a, s, hi)
+            if finish <= start
+                skip
+            new base = w * 128
+            if not short
+                base = 0
+            new state [20] i64
+            for each i in 0 until 20
+                state[i] = 0
+            new size = finish - start
+            for each n in 0 until size
+                new k = start + n
+                if s.tns_dir[slot] is 1
+                    k = finish - 1 - n
+                new y = (s.x[base + k] as i64) << 24
+                for each i in 0 until order
+                    y -= lpc[i + 1] * state[i]
+                y = y >> 24
+                new i = order
+                while i > 1
+                    state[i - 1] = state[i - 2]
+                    i -= 1
+                state[0] = y
+                s.x[base + k] = y as i32
+
+-- ---------------------------------------------------------------- the filter bank
+
+-- In-place FFT of a.re / a.im (n points, a power of two up to 512).
+to fft (a ptr decoder, n u64)
+    new j u64 = 0
+    for each i in 1 until n
+        new bit = n >> 1
+        while j & bit is not 0
+            j = j ^ bit
+            bit = bit >> 1
+        j = j | bit
+        if i < j
+            new tr = a.re[i]
+            a.re[i] = a.re[j]
+            a.re[j] = tr
+            new ti = a.im[i]
+            a.im[i] = a.im[j]
+            a.im[j] = ti
+    new size u64 = 2
+    while size <= n
+        new half = size / 2
+        new step = (512 / size)                         -- in the 512-point twiddle table
+        new start u64 = 0
+        while start < n
+            for each k in 0 until half
+                new c = aactables.fft_tw[k * step * 2] as i64
+                new sn = aactables.fft_tw[k * step * 2 + 1] as i64
+                new p = start + k
+                new q = p + half
+                new br = (a.re[q] * c + a.im[q] * sn) >> 30
+                new bi = (a.im[q] * c - a.re[q] * sn) >> 30
+                a.re[q] = a.re[p] - br
+                a.im[q] = a.im[p] - bi
+                a.re[p] = a.re[p] + br
+                a.im[p] = a.im[p] + bi
+            start += size
+        size = size * 2
+
+-- IMDCT of x[0 .. N/2) (N = 2048 or 256) into a.out[0 .. N), scaled by 2/N.
+to imdct (a ptr decoder, x ptr i32, long bool)
+    new N u64 = 256
+    if long
+        N = 2048
+    new n2 = N / 2
+    new n4 = N / 4
+    for each k in 0 until n4
+        new c i64 = 0
+        new sn i64 = 0
+        if long
+            c = aactables.tw_long[k * 2] as i64
+            sn = aactables.tw_long[k * 2 + 1] as i64
+        else
+            c = aactables.tw_short[k * 2] as i64
+            sn = aactables.tw_short[k * 2 + 1] as i64
+        new xr = x[2 * k] as i64
+        new xi = x[n2 - 1 - 2 * k] as i64
+        a.re[k] = (xr * c + xi * sn) >> 30
+        a.im[k] = (xi * c - xr * sn) >> 30
+    fft(a, n4)
+    for each k in 0 until n4
+        new c i64 = 0
+        new sn i64 = 0
+        if long
+            c = aactables.tw_long[k * 2] as i64
+            sn = aactables.tw_long[k * 2 + 1] as i64
+        else
+            c = aactables.tw_short[k * 2] as i64
+            sn = aactables.tw_short[k * 2 + 1] as i64
+        new vr = a.re[k]
+        new vi = a.im[k]
+        a.re[k] = (vr * c + vi * sn) >> 30
+        a.im[k] = (vi * c - vr * sn) >> 30
+    new shift u64 = 7
+    if long
+        shift = 10
+    for each n in 0 until N
+        new m u32 = 0
+        if long
+            m = aactables.map_long[n] as u32
+        else
+            m = aactables.map_short[n] as u32
+        new k = (m >> 2) as u64
+        new v = a.re[k]
+        if (m >> 1) & 1 is 1
+            v = a.im[k]
+        if m & 1 is 1
+            v = 0 - v
+        a.out[n] = (v >> shift) as i32
+
+-- The rising half of a window (n < half), Q24.
+to rising (form u32, long bool, n u64) gives i64
+    if long
+        if form is 1
+            give aactables.kbd_long[n] as i64
+        give aactables.sine_long[n] as i64
+    if form is 1
+        give aactables.kbd_short[n] as i64
+    give aactables.sine_short[n] as i64
+
+to windowed (v i32, w i64) gives i64
+    give ((v as i64) * w) >> 24
+
+-- The time samples of channel `c`: the IMDCT, the window, overlap-add; into pcm
+-- (Q4, 1024 samples).
+to synthesis (a ptr decoder, c u64, s ptr ics, pcm ptr i32)
+    new prev = a.prev_shape[c]
+    new full [2048] i32
+    for each i in 0 until 2048
+        full[i] = 0
+    if s.seq is eight_short
+        for each w in 0 until 8
+            imdct(a, addr of s.x[w * 128], false)
+            for each n in 0 until 256
+                new win i64 = 0
+                if n < 128
+                    if w is 0
+                        win = rising(prev, false, n)
+                    else
+                        win = rising(s.wshape, false, n)
+                else
+                    win = rising(s.wshape, false, 255 - n)
+                full[448 + w * 128 + n] += windowed(a.out[n], win) as i32
+    else
+        imdct(a, addr of s.x[0], true)
+        for each n in 0 until 2048
+            new win i64 = 0
+            if s.seq is only_long
+                if n < 1024
+                    win = rising(prev, true, n)
+                else
+                    win = rising(s.wshape, true, 2047 - n)
+            else if s.seq is long_start
+                if n < 1024
+                    win = rising(prev, true, n)
+                else if n < 1472
+                    win = (1 as i64) << 24
+                else if n < 1600
+                    win = rising(s.wshape, false, 1599 - n)
+            else
+                if n < 448
+                    win = 0
+                else if n < 576
+                    win = rising(prev, false, n - 448)
+                else if n < 1024
+                    win = (1 as i64) << 24
+                else
+                    win = rising(s.wshape, true, 2047 - n)
+            full[n] = windowed(a.out[n], win) as i32
+    for each n in 0 until 1024
+        pcm[n] = full[n] + a.overlap[c * 1024 + n]
+        a.overlap[c * 1024 + n] = full[1024 + n]
+    a.prev_shape[c] = s.wshape
+
+-- ---------------------------------------------------------------- one access unit
+
+to copy_info (from ptr ics, into ptr ics)
+    into.seq = from.seq
+    into.wshape = from.wshape
+    into.max_sfb = from.max_sfb
+    into.ngroups = from.ngroups
+    into.windows = from.windows
+    for each i in 0 until 8
+        into.groups[i] = from.groups[i]
+
+-- Decode one access unit into `pcm` (1024 interleaved stereo frames, mono doubled).
+-- Gives the number of frames, 0 if it could not be decoded.
+to frame (a ptr decoder, data ptr u8, size u64, pcm ptr i16) gives u64
+    if not a.ready
+        give 0
+    a.data = data
+    a.size = size
+    a.pos = 0
+    new outs u64 = 0
+    new samples [2048] i32
+    repeat
+        if a.pos + 3 > a.size * 8
+            stop
+        new element = bits(a, 3)
+        if element is 7
+            stop
+        if element is 0 or element is 3
+            bits(a, 4)
+            new s = addr of a.ch[outs]
+            if outs >= 2 or not channel(a, s, false)
+                give 0
+            spectrum(a, s)
+            tns_apply(a, s)
+            synthesis(a, outs, s, addr of samples[outs * 1024])
+            outs += 1
+        else if element is 1
+            bits(a, 4)
+            if outs > 0
+                give 0
+            new l = addr of a.ch[0]
+            new r = addr of a.ch[1]
+            new common = bits(a, 1) is 1
+            for each i in 0 until 408
+                a.ms[i] = 0
+            if common
+                if not ics_info(a, l)
+                    give 0
+                copy_info(l, r)
+                new mask = bits(a, 2)
+                if mask is 1
+                    for each g in 0 until l.ngroups as u64
+                        for each b in 0 until l.max_sfb as u64
+                            a.ms[g * 51 + b] = bits(a, 1) as u8
+                else if mask is 2
+                    for each g in 0 until l.ngroups as u64
+                        for each b in 0 until l.max_sfb as u64
+                            a.ms[g * 51 + b] = 1
+            if not channel(a, l, common) or not channel(a, r, common)
+                give 0
+            spectrum(a, l)
+            spectrum(a, r)
+            if common
+                stereo(a, l, r)
+            tns_apply(a, l)
+            tns_apply(a, r)
+            synthesis(a, 0, l, addr of samples[0])
+            synthesis(a, 1, r, addr of samples[1024])
+            outs = 2
+        else if element is 4
+            bits(a, 4)
+            new align = bits(a, 1)
+            new count = bits(a, 8) as u64
+            if count is 255
+                count += bits(a, 8) as u64
+            if align is 1
+                a.pos = (a.pos + 7) & 0xFFFF_FFFF_FFFF_FFF8
+            a.pos += 8 * count
+        else if element is 6
+            new count = bits(a, 4) as u64
+            if count is 15
+                count += bits(a, 8) as u64 - 1
+            a.pos += 8 * count
+        else
+            give 0                                       -- coupling, program config: not supported
+    if outs is 0
+        give 0
+    for each n in 0 until 1024
+        new left = (samples[n] + 8) >> 4
+        new right = left
+        if outs is 2
+            right = (samples[1024 + n] + 8) >> 4
+        if left > 32767
+            left = 32767
+        if left < -32768
+            left = -32768
+        if right > 32767
+            right = 32767
+        if right < -32768
+            right = -32768
+        pcm[n * 2] = left as i16
+        pcm[n * 2 + 1] = right as i16
+    give 1024

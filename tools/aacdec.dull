@@ -1,0 +1,67 @@
+-- Decode the audio of an MP4 file (AAC) to raw 16-bit stereo PCM with lib/aac.dull,
+-- on the PC (QEMU, semihosting). tests/aac_test.py compares it with ffmpeg's.
+--
+--   aacdec <in.mp4> <out.pcm>
+
+use sys
+use mem
+use mp4
+use aac
+
+to word_from_end (line string, n u64) gives string
+    new words [8] u64
+    new ends [8] u64
+    new count u64 = 0
+    new i u64 = 0
+    while i < line.len and count < 8
+        while i < line.len and line[i] is ' '
+            i += 1
+        if i >= line.len
+            stop
+        words[count] = i
+        while i < line.len and line[i] is not ' '
+            i += 1
+        ends[count] = i
+        count += 1
+    new empty string
+    if n >= count
+        give empty
+    new k = count - 1 - n
+    give line[words[k] until ends[k]]
+
+to main gives u8
+    new line = sys.command_line()
+    new input = word_from_end(line, 1)
+    new output = word_from_end(line, 0)
+    new file string
+    if not sys.read_file(input, addr of file)
+        sys.print("aacdec: cannot read the input\n")
+        give 1
+    new moov_size u64 = 0
+    new moov = mp4.moov_of(file.ptr, file.len, addr of moov_size)
+    new m = mp4.make()
+    if moov as u64 is 0 or not mp4.parse(m, moov, moov_size)
+        sys.print("aacdec: not an MP4 file\n")
+        give 2
+    new t = 0 as ptr mp4.track
+    for each i in 0 until m.ntracks
+        if m.tracks[i].kind is mp4.audio
+            t = addr of m.tracks[i]
+    if t as u64 is 0 or t.config as u64 is 0
+        sys.print("aacdec: no AAC track\n")
+        give 3
+    new a = aac.make()
+    if not aac.configure(a, t.config, t.config_size)
+        sys.print("aacdec: not AAC LC\n")
+        give 4
+    new pcm = mem.alloc(t.count * 4096 + 4096)
+    new used u64 = 0
+    for each s in 0 until t.count
+        new got = aac.frame(a, file.ptr + t.offsets[s], t.sizes[s] as u64, (pcm + used) as ptr i16)
+        used += got * 4
+    new out string
+    out.ptr = pcm
+    out.len = used
+    if not sys.write_file(output, out)
+        give 5
+    give 0
