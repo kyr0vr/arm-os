@@ -95,6 +95,22 @@ to audio_queued gives u64
 to audio_drop
     call(28, 0, 0, 0, 0, 0)
 
+-- ---------------------------------------------------------------- open files
+
+-- Open a file for reading; a handle (>= 0) or negative if it is not there.
+to open (path string) gives i64
+    give call(29, path.ptr as u64, path.len, 0, 0, 0) as i64
+
+-- Bytes from an open file at `offset`; reading on from the last read is quick.
+to read_open (h i64, offset u64, buffer ptr u8, count u64) gives i64
+    give call(30, h as u64, offset, buffer as u64, count, 0) as i64
+
+to close (h i64)
+    call(31, h as u64, 0, 0, 0, 0)
+
+to file_size (h i64) gives u64
+    give call(32, h as u64, 0, 0, 0, 0)
+
 -- ---------------------------------------------------------------- facts
 
 fixed info_memory u64 = 0

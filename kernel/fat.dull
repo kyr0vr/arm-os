@@ -14,6 +14,12 @@ shape entry
     cluster  u32
     size     u32
 
+-- Where an open file was last read: the cluster and the file offset it starts at,
+-- so reading on from there does not walk the chain from the beginning again.
+shape cursor
+    cluster  u32
+    start    u64
+
 shape dir
     cluster  u32               -- current cluster of the directory
     index    u32               -- next entry within that cluster
@@ -255,6 +261,39 @@ to find (path string, out ptr entry) gives bool
         if out.cluster is 0 and out.attr & attr_dir is not 0
             out.cluster = root                 -- ".." of a top-level folder
     give true
+
+-- Read up to `max` bytes from `offset` of a file, starting the cluster walk from the
+-- cursor when that is not past `offset`. Gives how many were read.
+to read_cursor (e ptr entry, cur ptr cursor, offset u64, into ptr u8, max u64) gives u64
+    new size = e.size as u64
+    if offset >= size
+        give 0
+    new want = size - offset
+    if want > max
+        want = max
+    new cb = cluster_bytes()
+    if cur.cluster < 2 or cur.start > offset
+        cur.cluster = e.cluster
+        cur.start = 0
+    while offset >= cur.start + cb and cur.cluster >= 2 and cur.cluster < end_of_chain
+        cur.cluster = next_cluster(cur.cluster)
+        cur.start += cb
+    new done u64 = 0
+    new skip_bytes = offset - cur.start
+    while done < want and cur.cluster >= 2 and cur.cluster < end_of_chain
+        if not load_cluster(cur.cluster)
+            stop
+        new n = cb - skip_bytes
+        if n > want - done
+            n = want - done
+        for each k in 0 until n
+            into[done + k] = cluster_buf[skip_bytes + k]
+        done += n
+        skip_bytes = 0
+        if done < want
+            cur.cluster = next_cluster(cur.cluster)
+            cur.start += cb
+    give done
 
 -- Read up to `max` bytes of a file into `into`. Gives how many were read.
 to read_file (e ptr entry, into ptr u8, max u64) gives u64

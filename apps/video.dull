@@ -1,0 +1,553 @@
+-- Video: the ArmOS video player. Choose an .mp4 file (H.264 video, AAC sound) on the
+-- SD card and it plays full screen, the sound keeping time.
+--
+-- `video bench <file>` decodes a file as fast as it can, without sound or waiting,
+-- and prints how fast that was (to the serial console).
+
+use sys
+use gfx
+use keys
+use line
+use mem
+use ui
+use files
+use mp4
+use h264
+use h264state
+use aac
+
+new handle i64
+new movie ptr mp4.movie
+new vt ptr mp4.track
+new at_track ptr mp4.track
+new vd ptr h264state.decoder
+new ad ptr aac.decoder
+new vnext u64                  -- next video sample to decode
+new anext u64                  -- next audio sample
+new sample ptr u8              -- a buffer for one sample
+new sample_cap u64
+new pcm [2048] i16
+new packed [1024] u32
+new have_sound bool
+new rate u32
+new audio_frames u64           -- sound frames handed to the kernel since the start (or seek)
+new audio_base_ms u64          -- the movie time those frames start at
+new paused bool
+new ended bool
+-- presentation times (ms) of decoded pictures not shown yet, smallest first
+new pending [64] u64
+new npending u64
+-- the picture converted into the surface, waiting for its time
+new ready bool
+new ready_ms u64
+-- statistics
+new decoded u64
+new shown u64
+new dropped u64
+new skipped u64
+new decode_ms u64
+new convert_ms u64
+new message line.line
+new name line.line
+new overlay_until u64
+-- where the picture goes on the screen
+new dst_x u32
+new dst_y u32
+new dst_w u32
+new dst_h u32
+new bt709 bool
+new placed bool
+
+-- ---------------------------------------------------------------- the file
+
+to read_at (offset u64, into ptr u8, count u64) gives bool
+    give sys.read_open(handle, offset, into, count) is count as i64
+
+to be32 (p ptr u8) gives u64
+    give mp4.be32(p) as u64
+
+-- Open `path`, find its moov box, the tracks and set up the decoders.
+to load (path ptr line.line) gives bool
+    line.clear(addr of message)
+    handle = sys.open(line.text(path))
+    if handle < 0
+        line.add(addr of message, "Cannot open the file.")
+        give false
+    new size = sys.file_size(handle)
+    new head [16] u8
+    new pos u64 = 0
+    new moov = 0 as ptr u8
+    new moov_size u64 = 0
+    while pos + 8 <= size
+        if not read_at(pos, addr of head[0], 16)
+            stop
+        new box = be32(addr of head[0])
+        new hlen u64 = 8
+        if box is 1
+            box = mp4.be64(addr of head[8])
+            hlen = 16
+        else if box is 0
+            box = size - pos
+        if box < hlen
+            stop
+        if mp4.named(addr of head[4], "moov")
+            moov_size = box - hlen
+            moov = mem.alloc(moov_size + 8)
+            if not read_at(pos + hlen, moov, moov_size)
+                moov = 0 as ptr u8
+            stop
+        pos += box
+    if moov as u64 is 0
+        line.add(addr of message, "Not an MP4 file (no moov box).")
+        give false
+    movie = mp4.make()
+    if not mp4.parse(movie, moov, moov_size)
+        line.add(addr of message, "This MP4 file could not be read.")
+        give false
+    vt = 0 as ptr mp4.track
+    at_track = 0 as ptr mp4.track
+    for each i in 0 until movie.ntracks
+        new t = addr of movie.tracks[i]
+        if t.kind is mp4.video and vt as u64 is 0
+            vt = t
+        if t.kind is mp4.audio and at_track as u64 is 0 and t.config as u64 is not 0
+            at_track = t
+    if vt as u64 is 0
+        line.add(addr of message, "No H.264 video in this file.")
+        give false
+    vd = h264.make()
+    new c = vt.config
+    new p u64 = 6
+    for each k in 0 until (c[5] & 31) as u64
+        new len = mp4.be16(c + p) as u64
+        h264.nal(vd, c + p + 2, len)
+        p += 2 + len
+    new npps = c[p] as u64
+    p += 1
+    for each k in 0 until npps
+        new len = mp4.be16(c + p) as u64
+        h264.nal(vd, c + p + 2, len)
+        p += 2 + len
+    have_sound = false
+    if at_track as u64 is not 0
+        ad = aac.make()
+        if aac.configure(ad, at_track.config, at_track.config_size)
+            rate = ad.rate
+            have_sound = sys.audio_start(rate)
+    vnext = 0
+    anext = 0
+    audio_frames = 0
+    audio_base_ms = 0
+    npending = 0
+    ready = false
+    ended = false
+    decoded = 0
+    shown = 0
+    dropped = 0
+    skipped = 0
+    decode_ms = 0
+    convert_ms = 0
+    give true
+
+to fetch (t ptr mp4.track, i u64) gives ptr u8
+    new size = t.sizes[i] as u64
+    if size + 16 > sample_cap
+        sample_cap = size + 65536
+        sample = mem.alloc(sample_cap)
+    if not read_at(t.offsets[i], sample, size)
+        give 0 as ptr u8
+    give sample
+
+to ms_of (t ptr mp4.track, time u64) gives u64
+    give time * 1000 / (t.timescale as u64)
+
+-- ---------------------------------------------------------------- sound
+
+-- The movie time now (ms): from the sound that has been played, or the clock.
+new wall_start u64
+
+to now_ms gives u64
+    if have_sound
+        new q = sys.audio_queued()
+        new played u64 = 0
+        if audio_frames > q
+            played = audio_frames - q
+        give audio_base_ms + played * 1000 / (rate as u64)
+    give sys.time() - wall_start
+
+to feed_audio
+    if not have_sound or paused
+        give
+    new want = (rate as u64) * 300 / 1000
+    while sys.audio_queued() < want and anext < at_track.count
+        new data = fetch(at_track, anext)
+        anext += 1
+        if data as u64 is 0
+            skip
+        new n = aac.frame(ad, data, at_track.sizes[anext - 1] as u64, addr of pcm[0])
+        for each i in 0 until n
+            packed[i] = ((pcm[i * 2] as u32) & 0xFFFF) | (((pcm[i * 2 + 1] as u32) & 0xFFFF) << 16)
+        new sent u64 = 0
+        while sent < n
+            new took = sys.audio_write(addr of packed[sent], n - sent)
+            sent += took
+            if took is 0
+                sys.sleep(5)
+        audio_frames += n
+
+-- ---------------------------------------------------------------- pictures
+
+to push_pending (ms u64)
+    if npending >= 64
+        give
+    new i = npending
+    while i > 0 and pending[i - 1] > ms
+        pending[i] = pending[i - 1]
+        i -= 1
+    pending[i] = ms
+    npending += 1
+
+to pop_pending gives u64
+    if npending is 0
+        give 0
+    new v = pending[0]
+    for each i in 1 until npending
+        pending[i - 1] = pending[i]
+    npending -= 1
+    give v
+
+to place
+    new w = h264.width(vd)
+    new h = h264.height(vd)
+    -- fit the screen, keeping the shape
+    dst_w = gfx.width
+    dst_h = ((h as u64) * (gfx.width as u64) / (w as u64)) as u32
+    if dst_h > gfx.height
+        dst_h = gfx.height
+        dst_w = ((w as u64) * (gfx.height as u64) / (h as u64)) as u32
+    dst_x = (gfx.width - dst_w) / 2
+    dst_y = (gfx.height - dst_h) / 2
+    bt709 = h > 576
+
+to clamp8 (v i32) gives u32
+    if v < 0
+        give 0
+    if v > 255
+        give 255
+    give v as u32
+
+-- YUV 4:2:0 -> RGB into the surface, scaled to the video rectangle.
+to convert (pic ptr h264state.picture)
+    new w = h264.width(vd) as u64
+    new h = h264.height(vd) as u64
+    new cx = h264.crop_x(vd) as u64
+    new cy = h264.crop_y(vd) as u64
+    new kr i32 = 409
+    new kgu i32 = 100
+    new kgv i32 = 208
+    new kb i32 = 516
+    if bt709
+        kr = 459
+        kgu = 55
+        kgv = 136
+        kb = 541
+    for each oy in 0 until dst_h as u64
+        new sy = oy * h / (dst_h as u64)
+        new yrow = pic.y + (cy + sy) * pic.stride + cx
+        new urow = pic.u + ((cy + sy) / 2) * pic.cstride + cx / 2
+        new vrow = pic.v + ((cy + sy) / 2) * pic.cstride + cx / 2
+        new out = gfx.pixels + ((dst_y as u64) + oy) * (gfx.width as u64) + dst_x as u64
+        for each ox in 0 until dst_w as u64
+            new sx = ox * w / (dst_w as u64)
+            new c = 298 * (yrow[sx] as i32 - 16)
+            new du = urow[sx / 2] as i32 - 128
+            new dv = vrow[sx / 2] as i32 - 128
+            new r = clamp8((c + kr * dv + 128) >> 8)
+            new g = clamp8((c - kgu * du - kgv * dv + 128) >> 8)
+            new b = clamp8((c + kb * du + 128) >> 8)
+            out[ox] = (r << 16) | (g << 8) | b
+
+-- Is the slice NAL in this sample a non-reference one (safe to skip)?
+to droppable (data ptr u8, size u64) gives bool
+    new ls = mp4.nal_length_size(vt)
+    new q u64 = 0
+    while q + ls < size
+        new len u64 = 0
+        for each k in 0 until ls
+            len = (len << 8) | data[q + k] as u64
+        q += ls
+        if q + len > size or len is 0
+            give false
+        new kind = data[q] & 31
+        if kind is 1 or kind is 5
+            give (data[q] >> 5) & 3 is 0 and kind is 1
+        q += len
+    give false
+
+-- Decode video samples until a picture comes out; it is converted into the surface
+-- (unless it is already too late) and waits in `ready`. Gives false at the end.
+to next_picture (late_ms u64, bench bool) gives bool
+    repeat
+        new pic = h264.frame(vd, vnext >= vt.count)
+        if pic as u64 is not 0
+            new pts = pop_pending()
+            if not bench and pts + 40 < now_ms()
+                dropped += 1
+                skip
+            new t0 = sys.time()
+            if not placed
+                place()
+                placed = true
+            if not bench
+                convert(pic)
+            convert_ms += sys.time() - t0
+            ready = true
+            ready_ms = pts
+            give true
+        if vnext >= vt.count
+            give false
+        new i = vnext
+        vnext += 1
+        new data = fetch(vt, i)
+        if data as u64 is 0
+            skip
+        new size = vt.sizes[i] as u64
+        if not bench and late_ms > 100 and droppable(data, size)
+            skipped += 1
+            skip
+        push_pending(ms_of(vt, vt.times[i] + vt.shift[i] as u64))
+        new t0 = sys.time()
+        new ls = mp4.nal_length_size(vt)
+        new q u64 = 0
+        while q + ls <= size
+            new len u64 = 0
+            for each k in 0 until ls
+                len = (len << 8) | data[q + k] as u64
+            q += ls
+            if q + len > size
+                stop
+            h264.nal(vd, data + q, len)
+            q += len
+        decode_ms += sys.time() - t0
+        decoded += 1
+
+-- ---------------------------------------------------------------- the overlay
+
+to time_text (ms u64, into ptr line.line)
+    new s = ms / 1000
+    if s >= 3600
+        line.number(into, s / 3600)
+        line.byte(into, ':')
+        if (s / 60) % 60 < 10
+            line.byte(into, '0')
+    line.number(into, (s / 60) % 60)
+    line.byte(into, ':')
+    if s % 60 < 10
+        line.byte(into, '0')
+    line.number(into, s % 60)
+
+to length_ms gives u64
+    if vt.timescale is 0
+        give 0
+    give vt.duration * 1000 / (vt.timescale as u64)
+
+fixed bar_h u32 = 120
+
+to draw_overlay
+    new y = gfx.height - bar_h
+    gfx.fill(0, y, gfx.width, bar_h, ui.bg)
+    new total = length_ms()
+    new pos = now_ms()
+    if pos > total
+        pos = total
+    new left = ui.margin
+    new right = gfx.width - ui.margin
+    gfx.round_rect(left, y + 30, right - left, 8, 4, ui.slot)
+    new done u32 = 0
+    if total > 0
+        done = (((right - left) as u64) * pos / total) as u32
+    if done > 0
+        gfx.round_rect(left, y + 30, done, 8, 4, ui.amber)
+    gfx.disc(left + done, y + 34, 10, 0, ui.amber_soft)
+    new t line.line
+    time_text(pos, addr of t)
+    line.add(addr of t, " / ")
+    time_text(total, addr of t)
+    gfx.text(left, y + 60, line.text(addr of t), gfx.regular, ui.putty)
+    new title = line.text(addr of name)
+    gfx.text(left + 300, y + 60, title, gfx.regular, ui.muted)
+    new hint = "Space pause   < > 10 s   q back"
+    if paused
+        hint = "paused - Space to go on   < > 10 s   q back"
+    gfx.text(right - gfx.text_width(hint, gfx.small), y + 62, hint, gfx.small, ui.dim)
+    gfx.present(0, y, gfx.width, bar_h)
+
+to hide_overlay
+    -- the picture is back on the next frame; until then clear the bar
+    gfx.fill(0, gfx.height - bar_h, gfx.width, bar_h, 0)
+    gfx.present(0, gfx.height - bar_h, gfx.width, bar_h)
+
+-- ---------------------------------------------------------------- seeking
+
+-- Jump to the key frame at or before `target` ms.
+to seek (target u64)
+    new best u64 = 0
+    for each i in 0 until vt.count
+        if vt.sync[i] is 1 and ms_of(vt, vt.times[i]) <= target
+            best = i
+    vnext = best
+    h264.reset(vd)
+    npending = 0
+    ready = false
+    new start = ms_of(vt, vt.times[best])
+    if have_sound
+        sys.audio_drop()
+        anext = 0
+        while anext < at_track.count and ms_of(at_track, at_track.times[anext]) < start
+            anext += 1
+        audio_base_ms = start
+        audio_frames = 0
+    wall_start = sys.time() - start
+
+-- ---------------------------------------------------------------- playing
+
+to report (label string)
+    new l line.line
+    line.add(addr of l, label)
+    line.add(addr of l, ": ")
+    line.number(addr of l, decoded)
+    line.add(addr of l, " decoded, ")
+    line.number(addr of l, shown)
+    line.add(addr of l, " shown, ")
+    line.number(addr of l, dropped)
+    line.add(addr of l, " late, ")
+    line.number(addr of l, skipped)
+    line.add(addr of l, " skipped; ")
+    if decoded > 0
+        line.number(addr of l, decode_ms / decoded)
+        line.add(addr of l, " ms to decode and ")
+    if shown > 0
+        line.number(addr of l, convert_ms / shown)
+        line.add(addr of l, " ms to show a frame")
+    line.add(addr of l, "; sound ")
+    line.number(addr of l, audio_frames)
+    line.add(addr of l, " frames from ")
+    line.number(addr of l, anext)
+    line.add(addr of l, " packets")
+    line.byte(addr of l, 10)
+    sys.write(line.text(addr of l), sys.muted)
+
+to play (path ptr line.line)
+    line.clear(addr of name)
+    new p = line.text(path)
+    new cut u64 = 0
+    for each i in 0 until p.len
+        if p[i] is '/'
+            cut = i + 1
+    line.add(addr of name, p[cut until p.len])
+    if not load(path)
+        give
+    gfx.fill(0, 0, gfx.width, gfx.height, 0)
+    gfx.present_all()
+    placed = false
+    paused = false
+    wall_start = sys.time()
+    overlay_until = sys.time() + 3000
+    repeat
+        feed_audio()
+        new k = keys.within(2)
+        if k is ' ' as u32 or k is keys.enter or k is keys.left_down
+            paused = not paused
+            if paused
+                sys.audio_drop()
+                -- resume from where the picture is
+                audio_base_ms = ready_ms
+                audio_frames = 0
+                seek(ready_ms)
+            else
+                wall_start = sys.time() - audio_base_ms
+            overlay_until = sys.time() + 3000
+            draw_overlay()
+        else if k is keys.right or k is keys.left
+            new now = now_ms()
+            new target = now + 10_000
+            if k is keys.left
+                target = 0
+                if now > 10_000
+                    target = now - 10_000
+            seek(target)
+            overlay_until = sys.time() + 3000
+        else if k is 'q' as u32 or k is keys.escape or k is keys.backspace or k is keys.right_down
+            stop
+        else if k is keys.pointer_moved
+            overlay_until = sys.time() + 3000
+        if paused
+            skip
+        -- the picture
+        new now = now_ms()
+        if not ready
+            new late u64 = 0
+            if npending > 0 and pending[0] < now
+                late = now - pending[0]
+            if not next_picture(late, false)
+                if not have_sound or sys.audio_queued() is 0
+                    ended = true
+                    stop
+                skip
+        if ready and ready_ms <= now_ms()
+            if sys.time() < overlay_until
+                draw_overlay()
+            gfx.present(dst_x, dst_y, dst_w, dst_h)
+            shown += 1
+            ready = false
+    sys.audio_drop()
+    sys.close(handle)
+    report("video")
+
+to bench (path string) gives u64
+    new l line.line
+    line.add(addr of l, path)
+    if not load(addr of l)
+        sys.write(line.text(addr of message), sys.deep)
+        sys.print("\n")
+        give 1
+    have_sound = false
+    new t0 = sys.time()
+    while next_picture(0, true)
+        shown += 1
+    new took = sys.time() - t0
+    new out line.line
+    line.add(addr of out, "bench: ")
+    line.number(addr of out, h264.width(vd) as u64)
+    line.byte(addr of out, 'x')
+    line.number(addr of out, h264.height(vd) as u64)
+    line.add(addr of out, ", ")
+    line.number(addr of out, decoded)
+    line.add(addr of out, " frames in ")
+    line.number(addr of out, took)
+    line.add(addr of out, " ms = ")
+    if took > 0
+        line.number(addr of out, decoded * 1000 / took)
+        line.byte(addr of out, '.')
+        line.number(addr of out, (decoded * 10000 / took) % 10)
+    line.add(addr of out, " frames per second\n")
+    sys.print(line.text(addr of out))
+    sys.close(handle)
+    give 0
+
+to main gives u64
+    new a line.line
+    a.len = sys.args(addr of a.bytes[0], 160)
+    new args = line.text(addr of a)
+    if args.len > 6 and files.same(args[0 until 6], "bench ")
+        give bench(args[6 until args.len])
+    if not gfx.open()
+        sys.print("video: no screen\n")
+        give 1
+    sys.want_pointer(true)
+    files.setup("Video", ".mp4")
+    new path line.line
+    new size u64 = 0
+    while files.browse(addr of path, addr of size)
+        play(addr of path)
+    give 0

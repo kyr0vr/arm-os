@@ -386,6 +386,19 @@ to frame (d ptr h264state.decoder, flush bool) gives ptr h264state.picture
     best.waiting = false
     give best
 
+-- Forget every picture (before decoding from another key frame, after a seek).
+to reset (d ptr h264state.decoder)
+    for each i in 0 until h264state.max_pics
+        new p = slot_pic(d, i)
+        p.ref = 0
+        p.waiting = false
+    d.cur = 0 as ptr h264state.picture
+    d.pic_done = true
+    d.prev_msb = 0
+    d.prev_lsb = 0
+    d.prev_fn = 0
+    d.prev_fn_off = 0
+
 to width (d ptr h264state.decoder) gives u32
     give d.s.mb_w * 16 - 2 * (d.s.crop_l + d.s.crop_r)
 

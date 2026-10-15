@@ -452,6 +452,14 @@ to check_finished
 
 -- ---------------------------------------------------------------- what system calls ask for
 
+-- Is process `pid` still running (or waiting)?
+to alive (pid u32) gives bool
+    for each i in 1 until slots
+        new s = table[i].state
+        if s is not unused and s is not finished and table[i].pid is pid
+            give true
+    give false
+
 to me gives ptr process
     give addr of table[current]
 

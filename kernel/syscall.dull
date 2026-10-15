@@ -42,6 +42,20 @@ fixed call_audio_start u64 = 25
 fixed call_audio_write u64 = 26
 fixed call_audio_queued u64 = 27
 fixed call_audio_drop u64 = 28
+fixed call_open u64 = 29
+fixed call_read_open u64 = 30
+fixed call_close u64 = 31
+fixed call_file_size u64 = 32
+
+-- Open files: a FAT entry and where it was last read, owned by a process.
+shape opened
+    used     bool
+    owner    u32
+    entry    fat.entry
+    cur      fat.cursor
+
+fixed max_handles u64 = 16
+new handles [16] opened
 
 fixed bad u64 = 0xFFFF_FFFF_FFFF_FFFF      -- -1
 fixed no_folder u64 = 0xFFFF_FFFF_FFFF_FFFE  -- -2
@@ -171,6 +185,22 @@ to answer (n u64, a u64, b u64, c u64, d u64, e u64) gives u64
     if n is call_audio_drop
         audio.drop()
         give 0
+    if n is call_open
+        give open_file(a, b)
+    if n is call_read_open
+        if a >= max_handles or not handles[a].used or handles[a].owner is not proc.me().pid
+            give bad
+        if not ok(c, d)
+            give bad
+        give fat.read_cursor(addr of handles[a].entry, addr of handles[a].cur, b, c as ptr u8, d)
+    if n is call_close
+        if a < max_handles and handles[a].owner is proc.me().pid
+            handles[a].used = false
+        give 0
+    if n is call_file_size
+        if a >= max_handles or not handles[a].used or handles[a].owner is not proc.me().pid
+            give bad
+        give handles[a].entry.size as u64
     if n is call_want_pointer
         proc.me().pointer = a is not 0
         give 0
@@ -231,6 +261,28 @@ to sound (l ptr line.line)
     line.add(l, " frames played, ")
     line.number(l, audio.dry)
     line.add(l, " of silence")
+
+-- Open a file for reading: a handle number, or negative.
+to open_file (path u64, size u64) gives u64
+    new e fat.entry
+    new err = look_up(path, size, addr of e)
+    if err is not 0
+        give err
+    if e.attr & fat.attr_dir is not 0
+        give no_folder
+    for each i in 0 until max_handles
+        new h = addr of handles[i]
+        if h.used and proc.alive(h.owner)
+            skip
+        h.used = true
+        h.owner = proc.me().pid
+        h.entry.cluster = e.cluster
+        h.entry.size = e.size
+        h.entry.attr = e.attr
+        h.cur.cluster = 0
+        h.cur.start = 0
+        give i
+    give bad
 
 -- Find a path for an app; the error to give if it is not a file or folder.
 to look_up (path u64, size u64, out ptr fat.entry) gives u64
