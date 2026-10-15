@@ -211,6 +211,34 @@ arch_resume:
     mov     sp, x0
     b       resume
 
+// arch_enter_user(entry, arg, stack): run `entry(arg)` at EL0 on this core with
+// stack `stack`, interrupts on. The exception stack is where we are now. Never returns.
+.global arch_enter_user
+arch_enter_user:
+    msr     elr_el1, x0
+    msr     sp_el0, x2
+    msr     spsr_el1, xzr                 // EL0t, nothing masked
+    mov     x0, x1
+    mov     x1, xzr
+    mov     x2, xzr
+    mov     x29, xzr
+    mov     x30, xzr
+    eret
+
+// arch_helper_loop(which): start over on this helper core's own stack, waiting for
+// work (smp.helper_wait). Never returns.
+.global arch_helper_loop
+arch_helper_loop:
+    adrp    x9, core_stacks
+    add     x9, x9, :lo12:core_stacks
+    add     x10, x0, #1
+    lsl     x10, x10, #16                 // STACK_SIZE
+    add     x9, x9, x10
+    mov     sp, x9
+    bl      smp.helper_wait
+1:  wfe
+    b       1b
+
 // arch_idle_entry() gives the address of the idle loop (the context that runs when
 // no process is ready).
 .global arch_idle_entry

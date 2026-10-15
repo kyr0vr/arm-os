@@ -77,6 +77,7 @@ to main
     check(arch_current_el() is 1, "running at EL1")
 
     -- exceptions
+    write_sysreg(tpidr_el1, 0)                    -- this is core 0 (kernel/trap.dull asks)
     arch_install_vectors()
     asm "brk #1"
     check(trap.breakpoints is 1, "a test breakpoint was caught and stepped over")

@@ -9,6 +9,7 @@ use timer
 use proc
 use syscall
 use gui
+use helper
 
 fixed elr_slot u64 = 31
 fixed brk_class u64 = 0x3C
@@ -20,6 +21,9 @@ fixed sources [4] string = ["EL1 with SP0", "EL1", "EL0 (64-bit)", "EL0 (32-bit)
 new breakpoints u64       -- `brk` instructions caught and stepped over (the self-test uses one)
 
 to handle (frame ptr u64, entry u64) gives ptr u64
+    new which = read_sysreg(tpidr_el1)
+    if which is not 0
+        give helper.trap(which, frame, entry)
     if entry is 5 or entry is 9           -- an interrupt (in the kernel, or in an app)
         new iar = gic.ack()
         new id = iar & 0x3FF

@@ -1,0 +1,224 @@
+-- Rebuilding pictures apart from parsing them, so other cores can do it: the parser
+-- (lib/h264.dull) keeps every macroblock's coefficients and each slice's settings,
+-- and lanes rebuild the picture row by row from those and the motion stored per
+-- macroblock. With n lanes, lane i takes rows i, i + n, i + 2n ...: it rebuilds its
+-- row as far as the parser and the row above have got (intra prediction looks up
+-- and to the right), then deblocks the row above it, whose samples nothing reads
+-- any more. With no lanes the same rows are rebuilt here once a picture is parsed.
+--
+-- Lanes run on helper cores (rt/app/helpers.dull): the app starts `lane` on each
+-- with `lane_arg` and then calls `use_lanes`. Cores wait for each other by watching
+-- counters in memory, with a dmb after each look and before each change.
+
+use mem
+use h264state
+use h264mc
+use h264recon
+use h264deblock
+
+fixed coef_size u64 = 408       -- i32s per macroblock: 256 luma, 16 luma DC, 8 chroma DC, 128 chroma AC
+
+shape lanerec
+    main  ptr h264state.decoder
+    own   ptr h264state.decoder         -- the lane's own copy (current macroblock, scratch)
+    index u64
+    gone  bool                          -- the lane has stopped
+
+-- ---------------------------------------------------------------- the parser's side
+
+-- Where macroblock `a`'s coefficients go.
+to point (d ptr h264state.decoder, a u64)
+    new c = d.coef + a * coef_size
+    d.luma = c
+    d.luma8 = c
+    d.dc = c + 256
+    d.cdc = c + 272
+    d.cac = c + 280
+
+-- A slice header has been read: keep what rebuilding its macroblocks needs.
+to snapshot (d ptr h264state.decoder)
+    new ss = d.slices + (d.slice_no as u64) % h264state.max_slices
+    ss.p = d.p
+    ss.s = d.s
+    ss.stype = d.stype
+    ss.lw_denom = d.lw_denom
+    ss.cw_denom = d.cw_denom
+    ss.deblock_idc = d.deblock_idc
+    ss.alpha_off = d.alpha_off
+    ss.beta_off = d.beta_off
+    ss.w[0] = d.w[0]
+    ss.w[1] = d.w[1]
+    for each i in 0 until 64
+        ss.list[i] = d.list[i]
+    dmb()
+
+-- A new picture: room for its coefficients, counters back to zero, the lanes told.
+to begin (d ptr h264state.decoder)
+    if d.mb_count > d.coef_mbs
+        d.coef = mem.alloc(d.mb_count * coef_size * 4) as ptr i32
+        d.coef_mbs = d.mb_count
+    new nrows = d.s.mb_h as u64
+    if nrows > d.rows_cap
+        d.rows_done = mem.alloc(nrows * 8) as ptr u64
+        d.rows_cap = nrows
+    for each y in 0 until nrows
+        d.rows_done[y] = 0
+    d.parsed = 0
+    d.deblocked = 0
+    for each i in 0 until d.lane_count
+        new l = d.lane_recs[i] as ptr lanerec
+        deref l.own = deref d
+    dmb()
+    d.gen += 1
+    dmb()
+
+-- Macroblocks below `count` are parsed.
+to parsed (d ptr h264state.decoder, count u64)
+    dmb()
+    d.parsed = count
+
+-- The picture is parsed: rebuild it here, or wait for the lanes to finish it.
+to finish (d ptr h264state.decoder)
+    d.parsed = d.mb_count
+    dmb()
+    if d.lane_count is 0
+        if d.solo as u64 is 0
+            d.solo = mem.alloc(size_of(h264state.decoder)) as ptr h264state.decoder
+        deref d.solo = deref d
+        rows(d, d.solo, 0, 1)
+        give
+    new all = d.s.mb_h as u64
+    while d.deblocked < all
+        dmb()
+    dmb()
+
+-- ---------------------------------------------------------------- lanes
+
+-- The address of `lane`, for helpers.start.
+to lane_function gives u64
+    new f u64 = 0
+    asm
+        "adrp {f}, h264par.lane"
+        "add {f}, {f}, :lo12:h264par.lane"
+    give f
+
+-- The argument for the lane with number `i` (0 or 1).
+to lane_arg (d ptr h264state.decoder, i u64) gives u64
+    if d.lane_recs[i] is 0
+        new l = mem.alloc(size_of(lanerec)) as ptr lanerec
+        l.main = d
+        l.own = mem.alloc(size_of(h264state.decoder)) as ptr h264state.decoder
+        l.index = i
+        d.lane_recs[i] = l as u64
+    give d.lane_recs[i]
+
+-- `n` lanes are running (before the first picture).
+to use_lanes (d ptr h264state.decoder, n u64)
+    d.lane_count = n
+    dmb()
+
+-- Stop the lanes (their cores go back to the kernel); the decoder rebuilds pictures
+-- itself from then on.
+to stop_lanes (d ptr h264state.decoder)
+    if d.lane_count is 0
+        give
+    d.quit = true
+    dmb()
+    for each i in 0 until d.lane_count
+        new l = d.lane_recs[i] as ptr lanerec
+        while not l.gone
+            dmb()
+    d.lane_count = 0
+    dmb()
+
+-- A helper core's work: rebuild this lane's rows of every picture until told to stop.
+to lane (arg u64)
+    new l = arg as ptr lanerec
+    new d = l.main
+    new seen = d.gen
+    repeat
+        while d.gen is seen and not d.quit
+            dmb()
+        if d.quit
+            l.gone = true
+            dmb()
+            give
+        seen = d.gen
+        dmb()
+        rows(d, l.own, l.index, d.lane_count)
+
+-- ---------------------------------------------------------------- rebuilding
+
+-- Rows first, first + step ... of the picture, each rebuilt and the one above it
+-- deblocked (the last one deblocked too).
+to rows (d ptr h264state.decoder, w ptr h264state.decoder, first u64, step u64)
+    new h = w.s.mb_h as u64
+    new y = first
+    while y < h
+        row(d, w, y)
+        if y >= 1
+            while d.deblocked + 1 < y
+                dmb()
+            dmb()
+            h264deblock.row(w, y - 1)
+            dmb()
+            d.deblocked = y
+        if y + 1 is h
+            dmb()
+            h264deblock.row(w, y)
+            dmb()
+            d.deblocked = h
+        y += step
+
+-- Rebuild macroblock row `y`, waiting for the parser and the row above.
+to row (d ptr h264state.decoder, w ptr h264state.decoder, y u64)
+    new mw = w.s.mb_w as u64
+    for each x in 0 until mw
+        new a = y * mw + x
+        while d.parsed <= a
+            dmb()
+        if y > 0
+            new need = x + 2
+            if need > mw
+                need = mw
+            while d.rows_done[y - 1] < need
+                dmb()
+        dmb()
+        macroblock(w, a)
+        dmb()
+        d.rows_done[y] = x + 1
+
+-- Rebuild macroblock `a` (prediction plus residual) in `w`, a lane's decoder.
+to macroblock (w ptr h264state.decoder, a u64)
+    new m = h264state.mb(w, a)
+    if not m.avail or m.kind is h264state.k_pcm or m.kind is h264state.k_none
+        give
+    if m.slice is not w.slice_no
+        apply(w, m.slice)
+    new mw = w.s.mb_w as u64
+    w.mba = a
+    w.mbx = (a % mw) * 16
+    w.mby = (a / mw) * 16
+    point(w, a)
+    if m.intra
+        h264recon.intra(w, m)
+    else
+        h264mc.predict_mb(w, m)
+        h264recon.inter(w, m)
+
+-- Take on the settings of slice `n`.
+to apply (w ptr h264state.decoder, n u32)
+    new ss = w.slices + (n as u64) % h264state.max_slices
+    w.p = ss.p
+    w.s = ss.s
+    w.stype = ss.stype
+    w.lw_denom = ss.lw_denom
+    w.cw_denom = ss.cw_denom
+    w.deblock_idc = ss.deblock_idc
+    w.alpha_off = ss.alpha_off
+    w.beta_off = ss.beta_off
+    w.w[0] = ss.w[0]
+    w.w[1] = ss.w[1]
+    for each i in 0 until 64
+        w.list[i] = ss.list[i]
+    w.slice_no = n

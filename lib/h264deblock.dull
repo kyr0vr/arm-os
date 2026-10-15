@@ -63,18 +63,18 @@ to strength (p ptr h264state.mbinfo, pb u64, q ptr h264state.mbinfo, qb u64, mb_
 -- One edge: `n` lines starting at `s`, `along` apart, each filtered across with
 -- `step`: p[-k * step] and q[k * step] (8.7.2).
 -- np: lines | per << 8 (how many lines share one bS)
-to edge (d ptr h264state.decoder, s ptr u8, along i64, step i64, np u64, bs ptr u32, qp i32, luma bool)
+to edge (ss ptr h264state.slicestate, s ptr u8, along i64, step i64, np u64, bs ptr u32, qp i32, luma bool)
     new n = np & 255
     new per = np >> 8
     new shift u64 = 1
     if per is 4
         shift = 2
-    new ia = qp + d.alpha_off
+    new ia = qp + ss.alpha_off
     if ia < 0
         ia = 0
     else if ia > 51
         ia = 51
-    new ib = qp + d.beta_off
+    new ib = qp + ss.beta_off
     if ib < 0
         ib = 0
     else if ib > 51
@@ -178,13 +178,18 @@ to edge (d ptr h264state.decoder, s ptr u8, along i64, step i64, np u64, bs ptr 
         else
             (base as ptr u8)[0] = ((2 * q1 + q0 + p1 + 2) >> 2) as u8
 
-to picture (d ptr h264state.decoder)
-    if d.deblock_idc is 1
-        give
+-- Deblock macroblock row `y` (the rows above it are done; its samples are not read
+-- for prediction any more). Each macroblock goes by its own slice's settings.
+to row (d ptr h264state.decoder, y u64)
     new w = d.s.mb_w as u64
     new pic = d.cur
-    for each mbn in 0 until d.mb_count
+    for each mbn in y * w until y * w + w
         new q = h264state.mb(d, mbn)
+        if not q.avail
+            skip
+        new ss = h264state.slice_of(d, q)
+        if ss.deblock_idc is 1
+            skip
         new mx = (mbn % w) * 16
         new my = (mbn / w) * 16
         for each dir in 0 until 2
@@ -201,7 +206,7 @@ to picture (d ptr h264state.decoder)
                         p = h264state.mb(d, mbn - 1)
                     else
                         p = h264state.mb(d, mbn - w)
-                    if d.deblock_idc is 2 and p.slice is not q.slice
+                    if ss.deblock_idc is 2 and p.slice is not q.slice
                         skip
                 new bs [4] u32
                 for each k in 0 until 4
@@ -219,10 +224,10 @@ to picture (d ptr h264state.decoder)
                 new qpav = (p.qp + q.qp + 1) >> 1
                 if dir is 0
                     new s = (pic.y as i64 + (my as i64) * pic.stride as i64 + (mx + e * 4) as i64) as ptr u8
-                    edge(d, s, pic.stride as i64, 1, 16 | (4 << 8), addr of bs[0], qpav, true)
+                    edge(ss, s, pic.stride as i64, 1, 16 | (4 << 8), addr of bs[0], qpav, true)
                 else
                     new s = (pic.y as i64 + ((my + e * 4) as i64) * pic.stride as i64 + mx as i64) as ptr u8
-                    edge(d, s, 1, pic.stride as i64, 16 | (4 << 8), addr of bs[0], qpav, true)
+                    edge(ss, s, 1, pic.stride as i64, 16 | (4 << 8), addr of bs[0], qpav, true)
                 if e % 2 is 0
                     for each c in 0 until 2
                         new plane = pic.u
@@ -233,7 +238,7 @@ to picture (d ptr h264state.decoder)
                         new cy = my / 2
                         if dir is 0
                             new s = (plane as i64 + (cy as i64) * pic.cstride as i64 + (cx + e * 2) as i64) as ptr u8
-                            edge(d, s, pic.cstride as i64, 1, 8 | (2 << 8), addr of bs[0], qpc, false)
+                            edge(ss, s, pic.cstride as i64, 1, 8 | (2 << 8), addr of bs[0], qpc, false)
                         else
                             new s = (plane as i64 + ((cy + e * 2) as i64) * pic.cstride as i64 + cx as i64) as ptr u8
-                            edge(d, s, 1, pic.cstride as i64, 8 | (2 << 8), addr of bs[0], qpc, false)
+                            edge(ss, s, 1, pic.cstride as i64, 8 | (2 << 8), addr of bs[0], qpc, false)

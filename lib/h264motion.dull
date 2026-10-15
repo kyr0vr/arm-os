@@ -192,10 +192,6 @@ to p_skip (d ptr h264state.decoder, m ptr h264state.mbinfo)
     v[0] = mv[0]
     v[1] = mv[1]
     set_motion(d, m, rect(0, 0, 16, 16), 0, addr of v[0])
-    new refs [2] i32
-    refs[0] = 0
-    refs[1] = -1
-    h264mc.predict(d, 0, 0, 16, 16, addr of refs[0], addr of mv[0])
 
 -- ---------------------------------------------------------------- B direct
 
@@ -333,34 +329,11 @@ to direct_motion (d ptr h264state.decoder, m ptr h264state.mbinfo, b8 u64)
         set_motion(d, m, rect(x, y, 4, 4), 1, addr of v[0])
 
 -- Motion compensation for 8x8 block b8 after direct prediction.
-to direct_samples (d ptr h264state.decoder, m ptr h264state.mbinfo, b8 u64)
-    new bx = (b8 % 2) * 8
-    new by = (b8 / 2) * 8
-    new step u64 = 4
-    if d.s.direct8
-        step = 8
-    new y = by
-    while y < by + 8
-        new x = bx
-        while x < bx + 8
-            new blk = h264state.block_at(x / 4, y / 4)
-            new refs [2] i32
-            new mv [4] i32
-            for each lst in 0 until 2
-                refs[lst] = m.ref[lst * 4 + b8] as i32
-                mv[lst * 2] = m.mv[(lst * 16 + blk) * 2] as i32
-                mv[lst * 2 + 1] = m.mv[(lst * 16 + blk) * 2 + 1] as i32
-            h264mc.predict(d, x, y, step, step, addr of refs[0], addr of mv[0])
-            x += step
-        y += step
-
 to b_skip (d ptr h264state.decoder, m ptr h264state.mbinfo)
     m.kind = h264state.k_skip
     m.btype = 0
     for each b8 in 0 until 4
         direct_motion(d, m, b8)
-    for each b8 in 0 until 4
-        direct_samples(d, m, b8)
 
 -- ---------------------------------------------------------------- partitions
 
@@ -380,19 +353,6 @@ to part_mv (d ptr h264state.decoder, m ptr h264state.mbinfo, lst u64, ref i32, r
     v[4] = ref
     set_motion(d, m, r, lst, addr of v[0])
 
--- Sample prediction of a partition from the motion already stored.
-to part_samples (d ptr h264state.decoder, m ptr h264state.mbinfo, x u64, y u64, w u64, h u64, pred u8, refs8 ptr i32)
-    new blk = h264state.block_at(x / 4, y / 4)
-    new refs [2] i32
-    new mv [4] i32
-    for each lst in 0 until 2
-        refs[lst] = -1
-        if uses(pred, lst)
-            refs[lst] = refs8[lst]
-        mv[lst * 2] = m.mv[(lst * 16 + blk) * 2] as i32
-        mv[lst * 2 + 1] = m.mv[(lst * 16 + blk) * 2 + 1] as i32
-    h264mc.predict(d, x, y, w, h, addr of refs[0], addr of mv[0])
-
 -- A P or B macroblock that is not skipped and not intra. Gives true if the 8x8
 -- transform may be used (no partitions smaller than 8x8).
 to inter (d ptr h264state.decoder, m ptr h264state.mbinfo, mtype i32) gives bool
@@ -407,8 +367,6 @@ to inter (d ptr h264state.decoder, m ptr h264state.mbinfo, mtype i32) gives bool
     if is_b and mtype is 0                              -- B_Direct_16x16
         for each b8 in 0 until 4
             direct_motion(d, m, b8)
-        for each b8 in 0 until 4
-            direct_samples(d, m, b8)
         give d.s.direct8
     new lists u64 = 1
     if is_b
@@ -471,36 +429,6 @@ to inter (d ptr h264state.decoder, m ptr h264state.mbinfo, mtype i32) gives bool
                         part_mv(d, m, lst, refs[lst * 4 + b8], rect(sx, sy, w, h), 0)
                     else
                         set_none(d, m, rect(sx, sy, w, h), lst)
-        -- samples
-        for each b8 in 0 until 4
-            if is_b and subs[b8] is 0
-                direct_samples(d, m, b8)
-                skip
-            new bx = (b8 % 2) * 8
-            new by = (b8 / 2) * 8
-            new count = ps_count[subs[b8] as u64] as u64
-            new w = ps_w[subs[b8] as u64] as u64
-            new h = ps_h[subs[b8] as u64] as u64
-            new pred u8 = 1
-            if is_b
-                count = bs_count[subs[b8] as u64] as u64
-                w = bs_w[subs[b8] as u64] as u64
-                h = bs_h[subs[b8] as u64] as u64
-                pred = bs_pred[subs[b8] as u64]
-            new r [2] i32
-            r[0] = refs[b8]
-            r[1] = refs[4 + b8]
-            for each s in 0 until count
-                new sx = bx
-                new sy = by
-                if count is 4
-                    sx = bx + (s % 2) * 4
-                    sy = by + (s / 2) * 4
-                else if w is 8
-                    sy = by + s * h
-                else
-                    sx = bx + s * w
-                part_samples(d, m, sx, sy, w, h, pred, addr of r[0])
         new ok = true
         for each b8 in 0 until 4
             if is_b
@@ -558,15 +486,4 @@ to inter (d ptr h264state.decoder, m ptr h264state.mbinfo, mtype i32) gives bool
                 part_mv(d, m, lst, refs[lst * 2 + p], rect(x, y, w, h), form | ((p as u32) << 8))
             else
                 set_none(d, m, rect(x, y, w, h), lst)
-    for each p in 0 until count
-        new x u64 = 0
-        new y u64 = 0
-        if p is 1 and form is 1
-            y = 8
-        if p is 1 and form is 2
-            x = 8
-        new r [2] i32
-        r[0] = refs[p]
-        r[1] = refs[2 + p]
-        part_samples(d, m, x, y, w, h, preds[p], addr of r[0])
     give true

@@ -107,6 +107,22 @@ shape weights
     cb         [64] i32
     cr         [64] i32
 
+-- What reconstruction needs to know of a slice (lib/h264par.dull keeps one per
+-- slice of the picture, as the macroblocks of different slices may be rebuilt later).
+shape slicestate
+    p          ptr pps
+    s          ptr sps
+    stype      u32
+    lw_denom   u32
+    cw_denom   u32
+    deblock_idc u32
+    alpha_off  i32
+    beta_off   i32
+    w          [2] weights
+    list       [64] u64
+
+fixed max_slices u64 = 256
+
 shape decoder
     spss       [32] sps
     ppss       [64] pps
@@ -163,24 +179,43 @@ shape decoder
     mby        u64
     done       [2] u32                 -- blocks whose motion is decoded, per list
     rem        [16] i32
-    luma       [256] i32               -- 16 blocks x 16 coefficients (raster)
-    luma8      [256] i32               -- 4 blocks x 64
-    dc         [16] i32
-    cdc        [8] i32
-    cac        [128] i32               -- 2 x 4 blocks x 16
+    luma       ptr i32                 -- this macroblock's coefficients (h264par.point):
+    luma8      ptr i32                 --   16 blocks x 16 (raster), or 4 x 64 in the same place
+    dc         ptr i32                 --   16
+    cdc        ptr i32                 --   8
+    cac        ptr i32                 --   2 x 4 blocks x 16
     pred_y     [256] i32
     pred_c     [128] i32
     tmp        [1024] i32
     spatial_done bool
     spatial_ref [2] i32
     spatial_mv [4] i32
+    vbuf       [336] i32               -- motion compensation: half samples, 16 rows of 21
     -- output
     out_count  u64
+    -- reconstruction, maybe on other cores (lib/h264par.dull)
+    coef       ptr i32                 -- every macroblock's coefficients
+    coef_mbs   u64
+    slices     ptr slicestate          -- [max_slices], by slice number
+    lane_count u64                     -- helper lanes rebuilding pictures (0: done here)
+    lane_recs  [2] u64                 -- each lane's record (h264par.lanerec)
+    solo       ptr decoder             -- the copy used to rebuild here
+    gen        u64                     -- pictures handed to the lanes
+    parsed     u64                     -- macroblocks of the picture parsed so far
+    rows_done  ptr u64                 -- per macroblock row: how many are rebuilt
+    rows_cap   u64
+    deblocked  u64                     -- rows deblocked
+    quit       bool                    -- lanes: stop (h264par.stop_lanes)
 
 to make gives ptr decoder
     new d = mem.alloc(size_of(decoder)) as ptr decoder
     d.next_id = 1
+    d.slices = mem.alloc(size_of(slicestate) * max_slices) as ptr slicestate
     give d
+
+-- The settings of the slice macroblock `m` belongs to.
+to slice_of (d ptr decoder, m ptr mbinfo) gives ptr slicestate
+    give d.slices + (m.slice as u64) % max_slices
 
 -- ---------------------------------------------------------------- small helpers
 

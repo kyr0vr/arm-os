@@ -21,6 +21,7 @@ use fat
 use tty
 use xhci
 use audio
+use helper
 
 elsewhere to arch_resume (frame ptr u64)
 elsewhere to arch_idle_entry gives u64
@@ -383,6 +384,13 @@ to park gives ptr u64
 -- The timer: pick up keys, wake sleepers, and take turns.
 to tick (frame ptr u64) gives ptr u64
     table[current].frame = frame
+    if helper.kill_pid is not 0                -- an app's helper crashed: stop the app
+        new victim = helper.kill_pid
+        helper.kill_pid = 0
+        new was_current = current is not 0 and table[current].pid is victim
+        kill(victim)
+        if was_current
+            give park()
     if current is not 0
         table[current].ticks += 1
         if prof_pid is not 0 and table[current].pid is prof_pid
@@ -540,6 +548,7 @@ to grow (bytes u64) gives u64
 -- Stop process `slot` with `code`.
 to finish (slot u64, code u64)
     new p = addr of table[slot]
+    helper.stop_all(p.pid)                 -- its helper cores first: they use its memory
     if slot is current
         use_space(mmu.l1)
     free_space(p)

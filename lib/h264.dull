@@ -19,6 +19,7 @@ use h264mb
 use h264motion
 use h264recon
 use h264deblock
+use h264par
 
 to make gives ptr h264state.decoder
     give h264state.make()
@@ -343,12 +344,13 @@ to start_picture (d ptr h264state.decoder)
         h264state.mb(d, a).avail = false
     d.slice_no = 0
     d.pic_done = false
+    h264par.begin(d)
 
 to finish_picture (d ptr h264state.decoder)
     if d.pic_done or d.cur as u64 is 0
         give
     d.pic_done = true
-    h264deblock.picture(d)
+    h264par.finish(d)
     new w = (d.s.mb_w as u64) * 16
     new h = (d.s.mb_h as u64) * 16
     pad_plane(d.cur.y, d.cur.stride, w, h, h264state.pad)
@@ -793,6 +795,7 @@ to slice (d ptr h264state.decoder, b ptr h264state.bits, idr bool)
         give                                            -- a slice without its picture's start
     d.slice_no += 1
     build_lists(d, addr of mods[0])
+    h264par.snapshot(d)
     h264cabac.start(d, b.data, b.size, b.pos, init_type, qp)
     d.qp = qp
     d.prev_qpd = 0
@@ -803,6 +806,7 @@ to slice (d ptr h264state.decoder, b ptr h264state.bits, idr bool)
             skip_mb(d)
         else
             macroblock(d)
+        h264par.parsed(d, a + 1)
         if h264cabac.terminate(d) is 1
             stop
         a += 1
@@ -842,6 +846,7 @@ to start_mb (d ptr h264state.decoder, a u64)
     for each k in 0 until 64
         m.mv[k] = 0
         m.mvd[k] = 0
+    h264par.point(d, a)
 
 to set_qp (d ptr h264state.decoder, m ptr h264state.mbinfo)
     m.qp = d.qp
@@ -856,7 +861,6 @@ to skip_mb (d ptr h264state.decoder)
         h264motion.b_skip(d, m)
     set_qp(d, m)
     d.prev_qpd = 0
-    h264recon.inter(d, m)
 
 to macroblock (d ptr h264state.decoder)
     new m = h264state.mb(d, d.mba)
@@ -877,7 +881,6 @@ to macroblock (d ptr h264state.decoder)
             d.prev_qpd = 0
         set_qp(d, m)
         h264mb.residual(d, m)
-        h264recon.inter(d, m)
         give
     if d.stype is 2
         h264mb.i_type(d, m)
@@ -905,4 +908,3 @@ to macroblock (d ptr h264state.decoder)
         d.prev_qpd = 0
     set_qp(d, m)
     h264mb.residual(d, m)
-    h264recon.intra(d, m)

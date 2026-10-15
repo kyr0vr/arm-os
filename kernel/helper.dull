@@ -1,0 +1,139 @@
+-- Helper cores: an app may run code of its own on the cores the kernel leaves free
+-- (1 and 2; core 3 plays sound), in its own memory, until it ends the helper or
+-- the app ends. A helper never makes system calls except `helper_done`; anything
+-- else it does that traps (a bad address, a stray call) stops the whole app.
+--
+-- Core 0 hands a core its work through `table` and wakes it with `sev`. To take
+-- a core back, core 0 marks it stopping and sends it a software interrupt; the
+-- core drops what it was running and goes back to waiting.
+
+use io
+use gic
+use mmu
+use lock
+
+elsewhere to arch_switch_space (ttbr0 u64)
+elsewhere to arch_enter_user (entry u64, arg u64, stack u64)
+elsewhere to arch_helper_loop (which u64)
+
+fixed first u64 = 1
+fixed last u64 = 2                      -- the highest core that helps
+fixed stop_sgi u32 = 1                  -- the software interrupt that takes a core back
+
+-- states
+fixed free u32 = 0
+fixed asked u32 = 1                     -- core 0 filled it in; the core has not started yet
+fixed busy u32 = 2
+fixed stopping u32 = 3
+
+shape slot
+    state  u32
+    pid    u32
+    l1     u64
+    entry  u64
+    arg    u64
+    stack  u64
+    ready  bool                         -- this core's interrupt interface is set up
+
+new table [4] slot
+new present u64                         -- cores that started (bit per core)
+new kill_pid u32                        -- an app whose helper crashed (core 0 stops it)
+new say lock.lock
+
+-- Core `which` has started and can help.
+to arrived (which u64)
+    if which >= first and which <= last
+        present = present | ((1 as u64) << which)
+
+-- Run `entry(arg)` at EL0 with stack `stack` in the address space `l1` of process
+-- `pid` on a free core. Gives the core's number, or 0 if none is free.
+to start (pid u32, l1 u64, entry u64, arg u64, stack u64) gives u64
+    for each c in first until last + 1
+        if (present >> c) & 1 is 0 or table[c].state is not free
+            skip
+        table[c].pid = pid
+        table[c].l1 = l1
+        table[c].entry = entry
+        table[c].arg = arg
+        table[c].stack = stack
+        dmb()
+        table[c].state = asked
+        dsb()
+        sev()
+        give c
+    give 0
+
+-- Take back every core helping `pid` (before its memory is freed). Core 0 only.
+to stop_all (pid u32)
+    for each c in first until last + 1
+        if table[c].state is free or table[c].pid is not pid
+            skip
+        table[c].state = stopping
+        dsb()
+        gic.send_sgi(c, stop_sgi)
+        sev()
+        new spins u64 = 0
+        while table[c].state is not free and spins < 100_000_000
+            spins += 1
+        if table[c].state is not free
+            io.line("helper: a core did not stop")
+
+-- What a waiting helper core does when woken (from smp's idle loop). Never returns
+-- if there is work.
+to check (which u64)
+    if which < first or which > last
+        give
+    if table[which].state is stopping
+        table[which].state = free
+        dsb()
+        give
+    if table[which].state is not asked
+        give
+    dmb()
+    if not table[which].ready
+        gic.init_core()
+        gic.enable(stop_sgi)
+        table[which].ready = true
+    table[which].state = busy
+    arch_switch_space(table[which].l1)
+    arch_enter_user(table[which].entry, table[which].arg, table[which].stack)
+
+-- Give the core back and wait for more work. Never returns.
+to retire (which u64)
+    arch_switch_space(mmu.l1)
+    table[which].state = free
+    dsb()
+    sev()
+    arch_helper_loop(which)
+
+-- An exception on a helper core (from kernel/trap.dull): `entry` as there.
+to trap (which u64, frame ptr u64, entry u64) gives ptr u64
+    if entry is 5 or entry is 9
+        new iar = gic.ack()
+        if iar & 0x3FF < 1020
+            gic.done(iar)
+        if table[which].state is stopping
+            retire(which)
+        give frame
+    new esr = read_sysreg(esr_el1)
+    if entry is 8 and esr >> 26 is 0x15 and frame[8] is 35        -- helper_done
+        retire(which)
+    lock.acquire(addr of say)
+    io.print("helper on core ")
+    io.print_u64(which)
+    io.print(" stopped: exception class ")
+    io.print_hex(esr >> 26)
+    io.print(" at ")
+    io.print_hex(frame[31])
+    io.print(", address ")
+    io.print_hex(read_sysreg(far_el1))
+    io.line("")
+    lock.release(addr of say)
+    if entry is 8
+        kill_pid = table[which].pid
+        retire(which)
+    -- something went wrong inside the kernel on this core: leave it parked
+    io.line("helper: kernel exception, core parked")
+    repeat
+        wfe()
+    give frame

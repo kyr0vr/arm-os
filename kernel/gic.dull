@@ -40,6 +40,12 @@ to enable (id u32)
     new set = (dist_base + 0x100 + (id as u64 / 32) * 4) as ptr u32
     deref set = (1 as u32) << (id % 32)
 
+-- Send software interrupt `id` (0-15) to core `target`.
+to send_sgi (target u64, id u32)
+    new sgir = (dist_base + 0xF00) as ptr u32
+    dsb()
+    deref sgir = (((1 as u64) << (16 + target)) as u32) | id
+
 -- Which interrupt fired (the raw acknowledge value; low 10 bits are the number).
 to ack gives u32
     give gicc.iar

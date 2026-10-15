@@ -15,6 +15,8 @@ use mp4
 use h264
 use h264state
 use aac
+use h264par
+use helpers
 
 new handle i64
 new movie ptr mp4.movie
@@ -42,6 +44,8 @@ new ready bool
 new ready_ms u64
 -- statistics
 new decoded u64
+new last_pic ptr h264state.picture       -- the picture next_picture found
+new use_helpers bool                     -- rebuild pictures on helper cores (bench1: not)
 new shown u64
 new dropped u64
 new skipped u64
@@ -115,7 +119,16 @@ to load (path ptr line.line) gives bool
     if vt as u64 is 0
         line.add(addr of message, "No H.264 video in this file.")
         give false
+    if vd as u64 is not 0
+        h264par.stop_lanes(vd)
     vd = h264.make()
+    -- two helper cores rebuild pictures while this one parses
+    new started u64 = 0
+    if use_helpers
+        for each i in 0 until 2
+            if helpers.start(h264par.lane_function(), h264par.lane_arg(vd, started)) is not 0
+                started += 1
+    h264par.use_lanes(vd, started)
     new c = vt.config
     new p u64 = 6
     for each k in 0 until (c[5] & 31) as u64
@@ -302,6 +315,7 @@ to next_picture (late_ms u64, bench bool) gives bool
                 convert(pic)
             convert_ms += sys.time() - t0
             ready = true
+            last_pic = pic
             ready_ms = pts
             give true
         if vnext >= vt.count
@@ -524,11 +538,16 @@ to bench (args string) gives u64
     have_sound = false
     sys.profile_start()
     new t0 = sys.time()
+    new sum u64 = 0
+    new summing u64 = 0                 -- ms spent on the checksum, left out
     while next_picture(0, true)
         shown += 1
+        new s0 = sys.time()
+        sum = checksum(sum, last_pic)
+        summing += sys.time() - s0
         if limit > 0 and decoded >= limit
             stop
-    new took = sys.time() - t0
+    new took = sys.time() - t0 - summing
     sys.profile_stop()
     new out line.line
     line.add(addr of out, "bench: ")
@@ -544,17 +563,42 @@ to bench (args string) gives u64
         line.number(addr of out, decoded * 1000 / took)
         line.byte(addr of out, '.')
         line.number(addr of out, (decoded * 10000 / took) % 10)
-    line.add(addr of out, " frames per second\n")
+    line.add(addr of out, " frames per second, ")
+    line.number(addr of out, vd.lane_count)
+    line.add(addr of out, " helper cores, pictures ")
+    line.hex(addr of out, sum)
+    line.byte(addr of out, 10)
     sys.print(line.text(addr of out))
     sys.close(handle)
     give 0
+
+-- A checksum of every sample of a picture (the shown part), added to `sum`.
+to checksum (sum u64, p ptr h264state.picture) gives u64
+    new w = h264.width(vd) as u64
+    new h = h264.height(vd) as u64
+    new s = sum
+    for each y in 0 until h
+        new r = p.y + y * p.stride
+        for each x in 0 until w
+            s = (s ^ r[x] as u64) *% 0x100_0000_01B3
+    for each y in 0 until h / 2
+        new u = p.u + y * p.cstride
+        new v = p.v + y * p.cstride
+        for each x in 0 until w / 2
+            s = (s ^ u[x] as u64) *% 0x100_0000_01B3
+            s = (s ^ v[x] as u64) *% 0x100_0000_01B3
+    give s
 
 to main gives u64
     new a line.line
     a.len = sys.args(addr of a.bytes[0], 160)
     new args = line.text(addr of a)
+    use_helpers = true
     if args.len > 6 and files.same(args[0 until 6], "bench ")
         give bench(args[6 until args.len])
+    if args.len > 7 and files.same(args[0 until 7], "bench1 ")
+        use_helpers = false
+        give bench(args[7 until args.len])
     if not gfx.open()
         sys.print("video: no screen\n")
         give 1

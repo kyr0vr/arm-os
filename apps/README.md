@@ -76,4 +76,12 @@ the app's memory ends (with `.bss`) and its entry point. Apps are linked at
 | 22 | font(style) - advance \| height << 32 | 23 | pointer() - x \| y << 16 \| buttons << 32 |
 | 24 | want_pointer(on) | 25 | audio_start(rate) |
 | 26 | audio_write(frames, count) | 27 | audio_queued() |
-| 28 | audio_drop() | | |
+| 28 | audio_drop() | 29 | open(path, length) - a file handle |
+| 30 | read_open(handle, buffer, count) | 31 | close(handle) |
+| 32 | file_size(handle) | 33 | profile(1 start, 2 stop and print) |
+| 34 | helper(entry, arg, stack) - a core number, 0 if none | 35 | helper_done() - helper cores only |
+
+Helper cores (`rt/app/helpers.dull`) run a function of the app on core 1 or 2, in the
+app's memory, until it returns or the app ends. They cannot make other calls; they
+wait by watching memory. `cores` shows them at work; `lib/h264par.dull` uses them to
+rebuild video pictures while the app's own core parses the stream.

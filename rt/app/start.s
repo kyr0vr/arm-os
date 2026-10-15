@@ -16,6 +16,18 @@ _start:
     svc     #0
 1:  b       1b
 
+// A helper core starts here (rt/app/helpers.dull) with x0 = a block holding the
+// function to run and its argument; when the function returns, the core goes back
+// to the kernel (helper_done).
+.global helper_start
+helper_start:
+    ldr     x9, [x0]
+    ldr     x0, [x0, #8]
+    blr     x9
+    mov     x8, #35               // helper_done
+    svc     #0
+1:  b       1b
+
 // dull_trap(x0 = message): debug checks (overflow, bad index) end the app.
 .global dull_trap
 dull_trap:

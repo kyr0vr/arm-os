@@ -1,0 +1,79 @@
+-- `cores`: checks the helper cores. Two helpers and the app itself each add up the
+-- same numbers; if the helpers really run beside the app, all three finish in about
+-- the time one takes. `cores hang` leaves two helpers spinning and ends: the kernel
+-- has to take the cores back.
+
+use sys
+use line
+use helpers
+
+fixed rounds u64 = 20_000_000
+
+new results [4] u64
+new done [4] u64
+
+to spin (which u64)
+    repeat
+        done[which] += 1
+
+to count (which u64)
+    new sum u64 = 0
+    for each i in 0 until rounds
+        sum += i
+    results[which] = sum
+    dmb()
+    done[which] = 1
+    dmb()
+
+to main gives u64
+    new a0 line.line
+    a0.len = sys.args(addr of a0.bytes[0], 160)
+    if a0.len >= 4
+        new h u64 = 0
+        asm
+            "adrp {h}, cores.spin"
+            "add {h}, {h}, :lo12:cores.spin"
+        new x = helpers.start(h, 1)
+        new y = helpers.start(h, 2)
+        new out line.line
+        line.add(addr of out, "cores: two helpers left spinning on cores ")
+        line.number(addr of out, x)
+        line.add(addr of out, " and ")
+        line.number(addr of out, y)
+        line.byte(addr of out, 10)
+        sys.print(line.text(addr of out))
+        give 0
+    new f u64 = 0
+    asm
+        "adrp {f}, cores.count"
+        "add {f}, {f}, :lo12:cores.count"
+    new t0 = sys.time()
+    count(0)
+    new alone = sys.time() - t0
+    new t1 = sys.time()
+    new a = helpers.start(f, 1)
+    new b = helpers.start(f, 2)
+    count(3)
+    new waited u64 = 0
+    while (a is not 0 and done[1] is 0) or (b is not 0 and done[2] is 0)
+        dmb()
+        waited += 1
+        if sys.time() - t1 > 10_000
+            stop
+    new together = sys.time() - t1
+    new out line.line
+    line.add(addr of out, "cores: helpers on cores ")
+    line.number(addr of out, a)
+    line.add(addr of out, " and ")
+    line.number(addr of out, b)
+    line.add(addr of out, "; one count ")
+    line.number(addr of out, alone)
+    line.add(addr of out, " ms, three at once ")
+    line.number(addr of out, together)
+    line.add(addr of out, " ms; ")
+    if done[1] is 1 and done[2] is 1 and results[1] is results[0] and results[2] is results[0]
+        line.add(addr of out, "all agree\n")
+    else
+        line.add(addr of out, "the helpers did not finish\n")
+    sys.print(line.text(addr of out))
+    give 0

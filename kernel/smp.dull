@@ -5,6 +5,7 @@ use lock
 use board
 use timer
 use audio
+use helper
 
 elsewhere to arch_psci (function u64, a u64, b u64, c u64, use_smc bool) gives i64
 elsewhere to arch_secondary_entry gives u64
@@ -39,11 +40,22 @@ to secondary_main (which u64)
     io.print(" says hello (EL")
     io.print_u64(arch_current_el())
     io.line(", MMU on)")
+    write_sysreg(tpidr_el1, which)
+    helper.arrived(which)
     arrived += 1
     lock.release(addr of console)
     sev()
-    -- core 3 becomes the audio core when sound starts (kernel/audio.dull)
+    helper_wait(which)
+
+-- An idle core waits here for work: core 3 becomes the audio core when sound starts
+-- (kernel/audio.dull), cores 1 and 2 run apps' helpers (kernel/helper.dull).
+to helper_wait (which u64)
     repeat
         wfe()
         if which is 3 and audio.core_go
             audio.pump_forever()
+        helper.check(which)
+
+-- The core this runs on (0-3).
+to this_core gives u64
+    give read_sysreg(tpidr_el1)

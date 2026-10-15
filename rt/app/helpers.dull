@@ -1,0 +1,26 @@
+-- Helper cores: run a function of this app on another core at the same time as the
+-- app goes on (kernel/helper.dull). A helper shares the app's memory; it may not
+-- make system calls. Wait for helpers by watching memory (with dmb), not with wfe.
+
+use sys
+use mem
+
+fixed stack_size u64 = 0x10000
+
+-- Start `function(arg)` on a free core: gives the core's number, or 0 if none is
+-- free. `function` is the address of a `to f (arg u64)` (see address_of in
+-- lib/h264par.dull); when it returns, the core goes back to the kernel.
+to start (function u64, arg u64) gives u64
+    new block = mem.alloc(16) as ptr u64
+    new stack = mem.alloc(stack_size) as u64
+    if block as u64 is 0 or stack is 0
+        give 0
+    block[0] = function
+    block[1] = arg
+    new top = (stack + stack_size) & 0xFFFF_FFFF_FFFF_FFF0
+    new entry u64 = 0
+    asm
+        "adrp {entry}, helper_start"
+        "add {entry}, {entry}, :lo12:helper_start"
+    dsb()
+    give sys.call(34, entry, block as u64, top, 0, 0)
