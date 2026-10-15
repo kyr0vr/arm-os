@@ -23,14 +23,17 @@ fixed full_reset u32 = 0x20
 
 use line
 use sdhci
+use hdmi_audio
 
 new revision u32               -- the firmware's board revision code
 new arm_hz u32                 -- the ARM cores' clock
+new pixel_hz u32               -- the HDMI pixel clock (for audio timing)
 
 -- Ask the firmware what this board is (call before the MMU is on).
 to probe
     revision = fb.board_revision()
     arm_hz = fb.clock_rate(3)
+    pixel_hz = fb.clock_rate(9)
 
 -- The disk: the microSD card the Pi booted from.
 to disk_read (lba u64, count u32, into ptr u8) gives bool
@@ -127,6 +130,21 @@ to usb_prepare (base u64)
 
 to dma_offset gives u64
     give inbound
+
+-- Sound over HDMI, pumped by core 3 (mode 2).
+to audio_begin (rate u32) gives u32
+    new pixel = pixel_hz as u64
+    if pixel < 25_000_000
+        pixel = 148_500_000                     -- 1080p60, if the firmware does not say
+    if hdmi_audio.begin(rate, pixel)
+        give 2
+    give 0
+
+to audio_put (f u32)
+    hdmi_audio.put(f)
+
+to audio_sink (frames ptr u32, count u64)
+    give
 
 -- Screenshots are a QEMU thing.
 to snapshot_key

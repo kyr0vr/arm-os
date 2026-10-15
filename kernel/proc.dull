@@ -20,6 +20,7 @@ use line
 use fat
 use tty
 use xhci
+use audio
 
 elsewhere to arch_resume (frame ptr u64)
 elsewhere to arch_idle_entry gives u64
@@ -382,6 +383,7 @@ to tick (frame ptr u64) gives ptr u64
         deliver_keys()
     xhci.tick()
     deliver_keys()
+    audio.tick()
     new now = timer.now()
     for each i in 1 until slots
         if table[i].state is asleep and now >= table[i].wake_at
@@ -440,7 +442,7 @@ to take_key gives u16
 
 -- QEMU's scripted keys have run out: once nothing is left to run, the test is over.
 to check_finished
-    if keys_count > 0
+    if keys_count > 0 or audio.queued() > 0
         give
     for each i in 1 until slots
         new s = table[i].state

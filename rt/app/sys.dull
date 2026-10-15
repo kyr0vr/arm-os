@@ -77,6 +77,24 @@ to pointer_x gives u32
 to pointer_y gives u32
     give ((call(23, 0, 0, 0, 0, 0) >> 16) & 0xFFFF) as u32
 
+-- ---------------------------------------------------------------- sound
+
+-- Start sound output at `rate` Hz (stereo, 16-bit). False if there is none.
+to audio_start (rate u32) gives bool
+    give call(25, rate as u64, 0, 0, 0, 0) is 1
+
+-- Queue up to `count` frames (left | right << 16); gives how many were taken.
+to audio_write (frames ptr u32, count u64) gives u64
+    give call(26, frames as u64, count, 0, 0, 0)
+
+-- Frames queued and not played yet.
+to audio_queued gives u64
+    give call(27, 0, 0, 0, 0, 0)
+
+-- Throw away what is queued.
+to audio_drop
+    call(28, 0, 0, 0, 0, 0)
+
 -- ---------------------------------------------------------------- facts
 
 fixed info_memory u64 = 0

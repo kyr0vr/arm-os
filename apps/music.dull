@@ -1,0 +1,379 @@
+-- Music: the ArmOS music player. Choose an .mp3 file on the SD card and it plays
+-- through the HDMI audio, with the next ones in the folder after it.
+--
+-- Decoding happens here (lib/mp3.dull), a fifth of a second ahead of what is heard;
+-- the kernel plays what is queued (kernel/audio.dull).
+
+use sys
+use gfx
+use keys
+use line
+use mem
+use mp3
+use ui
+use files
+
+fixed ahead_ms u64 = 200
+fixed bars u64 = 48
+
+new d ptr mp3.decoder
+new file ptr u8
+new file_size u64
+new name line.line             -- the file name, for when the file has no title
+new playing bool
+new ended bool
+new volume u64 = 80
+new history [48] u32           -- recent loudness, for the bars
+new decoded u64                -- frames of sound decoded so far (1152 samples each)
+new pcm [2304] i16
+new packed [1152] u32
+new message line.line
+new have_sound bool
+
+-- ---------------------------------------------------------------- layout
+
+fixed art_x u32 = 120
+fixed art_y u32 = 210
+fixed art_size u32 = 460
+fixed col_x u32 = 660
+fixed bars_y u32 = 430
+fixed bars_h u32 = 170
+fixed bar_y u32 = 660
+fixed buttons_y u32 = 790
+
+to col_w gives u32
+    give gfx.width - ui.margin - col_x
+
+-- ---------------------------------------------------------------- loading
+
+fixed max_file u64 = 0x800_0000        -- 128 MB
+
+to load (path ptr line.line, size u64) gives bool
+    if size is 0 or size > max_file
+        give false
+    file = mem.alloc(size)
+    file_size = 0
+    while file_size < size
+        new want = size - file_size
+        if want > 0x10_0000
+            want = 0x10_0000
+        new n = sys.read(line.text(path), file_size, file + file_size, want)
+        if n <= 0
+            stop
+        file_size += n as u64
+    -- the name without its folder and ".mp3"
+    new p = line.text(path)
+    new cut u64 = 0
+    for each i in 0 until p.len
+        if p[i] is '/'
+            cut = i + 1
+    new finish = p.len
+    if finish - cut > 4
+        finish -= 4
+    line.clear(addr of name)
+    line.add(addr of name, p[cut until finish])
+    give mp3.open(d, file, file_size)
+
+-- ---------------------------------------------------------------- drawing
+
+to time_text (ms u64, into ptr line.line)
+    new s = ms / 1000
+    line.number(into, s / 60)
+    line.byte(into, ':')
+    if s % 60 < 10
+        line.byte(into, '0')
+    line.number(into, s % 60)
+
+-- A string cut to fit `width` pixels in `style`.
+to fit (s string, style u8, width u32) gives string
+    new most = (width / gfx.advance(style)) as u64
+    if s.len > most
+        give s[0 until most]
+    give s
+
+to draw_art
+    gfx.round_rect(art_x, art_y, art_size, art_size, 36, ui.slot)
+    new cx = art_x + art_size / 2
+    new cy = art_y + art_size / 2
+    gfx.disc(cx, cy, 170, 160, ui.edge)
+    gfx.disc(cx, cy, 120, 116, ui.edge)
+    gfx.disc(cx, cy, 70, 0, ui.slot_lit)
+    -- a note in the middle
+    gfx.disc(cx - 18, cy + 30, 22, 0, ui.amber)
+    gfx.fill(cx - 2, cy - 52, 9, 84, ui.amber)
+    new flag [8] i64
+    flag[0] = (cx - 2) as i64
+    flag[1] = (cy - 52) as i64
+    flag[2] = (cx + 40) as i64
+    flag[3] = (cy - 30) as i64
+    flag[4] = (cx + 40) as i64
+    flag[5] = (cy - 14) as i64
+    flag[6] = (cx - 2) as i64
+    flag[7] = (cy - 34) as i64
+    gfx.quad(addr of flag[0], ui.amber)
+
+to draw_info
+    gfx.fill(col_x, art_y, col_w(), 200, ui.bg)
+    new title = line.text(addr of d.title)
+    if d.title.len is 0
+        title = line.text(addr of name)
+    gfx.text(col_x, art_y + 10, fit(title, gfx.large, col_w()), gfx.large, ui.putty)
+    new artist = line.text(addr of d.artist)
+    if d.artist.len is 0
+        artist = "unknown artist"
+    gfx.text(col_x, art_y + 86, fit(artist, gfx.regular, col_w()), gfx.regular, ui.amber)
+    new l line.line
+    line.number(addr of l, d.rate as u64 / 1000)
+    if d.rate % 1000 is not 0
+        line.byte(addr of l, '.')
+        line.number(addr of l, (d.rate as u64 % 1000) / 100)
+    line.add(addr of l, " kHz   ")
+    if d.channels is 1
+        line.add(addr of l, "mono")
+    else
+        line.add(addr of l, "stereo")
+    line.add(addr of l, "   ")
+    line.number(addr of l, d.kbps as u64)
+    line.add(addr of l, " kbps")
+    gfx.text(col_x, art_y + 136, line.text(addr of l), gfx.small, ui.dim)
+
+to draw_bars
+    gfx.fill(col_x, bars_y, col_w(), bars_h, ui.bg)
+    new step = col_w() / bars as u32
+    for each i in 0 until bars
+        new h = history[i] * bars_h / 32768
+        if h < 4
+            h = 4
+        new color = ui.edge
+        if playing
+            color = ui.amber
+            if i + 8 < bars
+                color = gfx.mix(ui.amber, ui.edge, (80 + i as u32 * 175 / bars as u32))
+        gfx.round_rect(col_x + i as u32 * step, bars_y + bars_h - h, step - 6, h, 3, color)
+
+to elapsed_ms gives u64
+    new frames = decoded * 1152
+    new q = sys.audio_queued()
+    if q < frames
+        frames -= q
+    else
+        frames = 0
+    give frames * 1000 / d.rate as u64
+
+to draw_progress
+    gfx.fill(col_x - 20, bar_y - 20, col_w() + 40, 100, ui.bg)
+    new w = col_w()
+    gfx.round_rect(col_x, bar_y, w, 10, 5, ui.slot)
+    new total = mp3.length_ms(d)
+    new now = elapsed_ms()
+    if now > total
+        now = total
+    new done u32 = 0
+    if total > 0
+        done = ((w as u64) * now / total) as u32
+    if done > 0
+        gfx.round_rect(col_x, bar_y, done, 10, 5, ui.amber)
+    gfx.disc(col_x + done, bar_y + 5, 11, 0, ui.amber_soft)
+    new a line.line
+    time_text(now, addr of a)
+    gfx.text(col_x, bar_y + 30, line.text(addr of a), gfx.regular, ui.putty)
+    new b line.line
+    time_text(total, addr of b)
+    new t = line.text(addr of b)
+    gfx.text(col_x + w - gfx.text_width(t, gfx.regular), bar_y + 30, t, gfx.regular, ui.muted)
+
+-- The buttons: previous, play/pause, next; and the volume.
+to play_x gives u32
+    give col_x + 170
+
+to draw_buttons
+    gfx.fill(col_x - 20, buttons_y - 70, col_w() + 40, 150, ui.bg)
+    new cy = buttons_y
+    -- previous
+    new px = col_x + 40
+    gfx.fill(px - 22, cy - 18, 6, 36, ui.putty)
+    gfx.triangle((px + 18) as i64, (cy - 18) as i64, (px + 18) as i64, (cy + 18) as i64, (px - 14) as i64, cy as i64, ui.putty)
+    -- play / pause
+    new cx = play_x()
+    gfx.disc(cx, cy, 52, 0, ui.amber)
+    if playing
+        gfx.round_rect(cx - 17, cy - 20, 12, 40, 3, ui.bg)
+        gfx.round_rect(cx + 5, cy - 20, 12, 40, 3, ui.bg)
+    else
+        gfx.triangle((cx - 14) as i64, (cy - 22) as i64, (cx - 14) as i64, (cy + 22) as i64, (cx + 24) as i64, cy as i64, ui.bg)
+    -- next
+    new nx = col_x + 300
+    gfx.triangle((nx - 18) as i64, (cy - 18) as i64, (nx - 18) as i64, (cy + 18) as i64, (nx + 14) as i64, cy as i64, ui.putty)
+    gfx.fill(nx + 16, cy - 18, 6, 36, ui.putty)
+    -- volume
+    new vx = col_x + 480
+    gfx.text(vx, cy - 15, "volume", gfx.small, ui.muted)
+    new track_x = vx + 110
+    gfx.round_rect(track_x, cy - 4, 300, 8, 4, ui.slot)
+    gfx.round_rect(track_x, cy - 4, (300 * volume / 100) as u32 + 1, 8, 4, ui.putty)
+    new l line.line
+    line.number(addr of l, volume)
+    line.byte(addr of l, '%')
+    gfx.text(track_x + 320, cy - 15, line.text(addr of l), gfx.small, ui.putty)
+    -- a message (no sound output, the end of the folder...)
+    if message.len > 0
+        gfx.text(col_x, cy + 60, line.text(addr of message), gfx.small, ui.deep)
+
+to draw_footer
+    ui.clear_footer()
+    new x = ui.hint(ui.margin, "Space", "play/pause")
+    x = ui.hint(x, "< >", "-/+ 10 s")
+    x = ui.hint(x, "Up/Down", "volume")
+    x = ui.hint(x, "n/p", "next/previous")
+    ui.hint(x, "q", "back to the list")
+
+to draw_all
+    gfx.fill(0, 0, gfx.width, gfx.height, ui.bg)
+    ui.title("Music", "now playing")
+    draw_art()
+    draw_info()
+    draw_bars()
+    draw_progress()
+    draw_buttons()
+    draw_footer()
+    gfx.present_all()
+
+to draw_live
+    draw_bars()
+    draw_progress()
+    gfx.present(col_x - 20, bars_y, col_w() + 40, bar_y + 80 - bars_y)
+
+-- ---------------------------------------------------------------- playing
+
+-- Keep about `ahead_ms` of sound queued.
+to feed
+    if not playing or ended
+        give
+    new want = d.rate as u64 * ahead_ms / 1000
+    while sys.audio_queued() < want
+        if mp3.next(d, addr of pcm[0]) is 0
+            ended = true
+            give
+        decoded += 1
+        new peak u32 = 0
+        for each i in 0 until 1152
+            new l = pcm[i * 2] as i64 * volume as i64 / 100
+            new r = pcm[i * 2 + 1] as i64 * volume as i64 / 100
+            new a = l
+            if a < 0
+                a = 0 - a
+            if a > peak as i64
+                peak = a as u32
+            packed[i] = ((l as u32) & 0xFFFF) | (((r as u32) & 0xFFFF) << 16)
+        sys.audio_write(addr of packed[0], 1152)
+        for each k in 1 until bars
+            history[k - 1] = history[k]
+        history[bars - 1] = peak
+
+to seek_to (ms u64)
+    new total = mp3.length_ms(d)
+    if total is 0
+        give
+    if ms > total
+        ms = total
+    mp3.seek(d, ms * 1000 / total)
+    decoded = d.frames
+    sys.audio_drop()
+    ended = false
+
+-- Play the file at `path`; gives -1 / 1 to go to the previous / next file, 0 to stop.
+to play (path ptr line.line, size u64) gives i64
+    line.clear(addr of message)
+    if not load(path, size)
+        line.add(addr of message, "Not an MP3 file this player can read.")
+        playing = false
+        give 0
+    for each i in 0 until bars
+        history[i] = 0
+    decoded = 0
+    ended = false
+    have_sound = sys.audio_start(d.rate)
+    playing = have_sound
+    if not have_sound
+        line.add(addr of message, "No sound output on this machine.")
+    draw_all()
+    new last_draw = sys.time()
+    repeat
+        feed()
+        if ended and sys.audio_queued() is 0
+            give 1                                   -- on to the next file
+        new k = keys.within(20)
+        if k is keys.timeout
+            skip_redraw(addr of last_draw)
+            skip
+        if k is ' ' as u32 or k is keys.enter
+            playing = not playing and have_sound
+            draw_buttons()
+            gfx.present(col_x - 20, buttons_y - 70, col_w() + 40, 150)
+        else if k is keys.right
+            seek_to(elapsed_ms() + 10_000)
+        else if k is keys.left
+            new now = elapsed_ms()
+            if now > 10_000
+                seek_to(now - 10_000)
+            else
+                seek_to(0)
+        else if k is keys.up or k is keys.wheel_up
+            if volume < 100
+                volume += 10
+            draw_buttons()
+            gfx.present(col_x - 20, buttons_y - 70, col_w() + 40, 150)
+        else if k is keys.down or k is keys.wheel_down
+            if volume > 0
+                volume -= 10
+            draw_buttons()
+            gfx.present(col_x - 20, buttons_y - 70, col_w() + 40, 150)
+        else if k is 'n' as u32
+            sys.audio_drop()
+            give 1
+        else if k is 'p' as u32
+            sys.audio_drop()
+            give -1
+        else if k is 'q' as u32 or k is keys.escape or k is keys.backspace or k is keys.right_down
+            sys.audio_drop()
+            give 0
+        else if k is keys.left_down
+            click(sys.pointer_x(), sys.pointer_y())
+        skip_redraw(addr of last_draw)
+
+-- Redraw the moving parts about ten times a second.
+to skip_redraw (last ptr u64)
+    new now = sys.time()
+    if now - deref last >= 100
+        deref last = now
+        draw_live()
+
+to click (x u32, y u32)
+    -- the progress bar
+    if y + 20 >= bar_y and y <= bar_y + 30 and x >= col_x and x <= col_x + col_w()
+        seek_to(mp3.length_ms(d) * ((x - col_x) as u64) / col_w() as u64)
+        give
+    -- play / pause
+    new cx = play_x()
+    if x + 52 >= cx and x <= cx + 52 and y + 52 >= buttons_y and y <= buttons_y + 52
+        playing = not playing and have_sound
+        draw_buttons()
+        gfx.present(col_x - 20, buttons_y - 70, col_w() + 40, 150)
+
+-- ---------------------------------------------------------------- start
+
+to main gives u64
+    if not gfx.open()
+        sys.print("music: no screen\n")
+        give 1
+    sys.want_pointer(true)
+    d = mp3.make()
+    files.setup("Music", ".mp3")
+    new path line.line
+    new size u64 = 0
+    while files.browse(addr of path, addr of size)
+        repeat
+            new step = play(addr of path, size)
+            if step is 0 or not files.neighbor(step, addr of path, addr of size)
+                stop
+    give 0

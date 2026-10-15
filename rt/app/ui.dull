@@ -1,0 +1,63 @@
+-- The look the ArmOS apps share: colors, margins, titles and the key hints at the
+-- bottom of the screen.
+
+use gfx
+use line
+
+fixed bg u32 = 0x12_12_11
+fixed slot u32 = 0x22_21_1F
+fixed slot_lit u32 = 0x30_2E_29
+fixed edge u32 = 0x3A_37_31
+fixed putty u32 = 0xE6_DB_C1
+fixed amber u32 = 0xFF_9A_1F
+fixed amber_soft u32 = 0xFF_C2_66
+fixed muted u32 = 0x8C_84_6F
+fixed dim u32 = 0x5A_55_4A
+fixed deep u32 = 0xE0_56_1B
+
+fixed margin u32 = 120
+fixed footer_y u32 = 980
+fixed header_h u32 = 160
+
+-- A big title, a line beside it, and a rule under them.
+to title (big string, sub string)
+    gfx.fill(0, 0, gfx.width, header_h, bg)
+    new x = gfx.text(margin, 56, big, gfx.large, amber)
+    gfx.text(x + 28, 72, sub, gfx.regular, muted)
+    gfx.fill(margin, 140, gfx.width - margin * 2, 2, edge)
+
+-- Text at the right end of the title row.
+to title_right (s string, color u32)
+    gfx.text(gfx.width - margin - gfx.text_width(s, gfx.small), 76, s, gfx.small, color)
+
+to key_cap (x u32, y u32, label string) gives u32
+    new w = gfx.text_width(label, gfx.small) + 28
+    gfx.round_rect(x, y, w, 40, 10, edge)
+    gfx.round_rect(x + 2, y + 2, w - 4, 36, 8, slot)
+    gfx.text(x + 14, y + 6, label, gfx.small, putty)
+    give x + w
+
+-- A key and what it does, along the bottom; gives where the next one goes.
+to hint (x u32, label string, what string) gives u32
+    new past = key_cap(x, footer_y, label)
+    give gfx.text(past + 14, footer_y + 6, what, gfx.small, muted) + 40
+
+to clear_footer
+    gfx.fill(0, footer_y - 20, gfx.width, gfx.height - footer_y + 20, bg)
+
+-- "1.2 MB" and so on.
+to size_text (bytes u64, into ptr line.line)
+    if bytes < 1024
+        line.number(into, bytes)
+        line.add(into, " B")
+    else if bytes < 1024 * 1024
+        line.number(into, bytes / 1024)
+        line.byte(into, '.')
+        line.number(into, (bytes % 1024) * 10 / 1024)
+        line.add(into, " KB")
+    else
+        line.number(into, bytes / (1024 * 1024))
+        line.byte(into, '.')
+        line.number(into, (bytes % (1024 * 1024)) * 10 / (1024 * 1024))
+        line.add(into, " MB")
+

@@ -24,8 +24,8 @@ fixed tile_y u32 = 300
 
 fixed titles [4] string = ["Text", "Music", "Video", "Console"]
 fixed blurbs [4] string = ["read .txt files", "play .mp3 files", "play .mp4 files", "the ArmOS shell"]
-fixed apps [4] string = ["text", "", "", "shell"]
-fixed later [4] string = ["", "arrives in phase 11", "arrives in phase 12", ""]
+fixed apps [4] string = ["text", "music", "", "shell"]
+fixed later [4] string = ["", "", "arrives in phase 12", ""]
 
 new chosen u32
 new note line.line             -- a message under the tiles ("arrives in phase 11")
@@ -171,7 +171,7 @@ to draw_footer
     x = key_cap(x + 48, 980, "1-4")
     x = gfx.text(x + 16, 986, "jump", gfx.small, muted)
     gfx.text(x + 48, 986, "or point and click", gfx.small, dim)
-    new v = "ArmOS 0.10"
+    new v = "ArmOS 0.11"
     gfx.text(gfx.width - 120 - gfx.text_width(v, gfx.small), 986, v, gfx.small, dim)
 
 to draw_note
@@ -218,7 +218,7 @@ to open (i u32)
         line.add(addr of note, titles[i])
         line.add(addr of note, " ")
         line.add(addr of note, later[i])
-        line.add(addr of note, ". Text works today.")
+        line.add(addr of note, ".")
         draw_note()
         give
     new pid = sys.spawn(apps[i], "", false)

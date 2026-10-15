@@ -83,7 +83,7 @@ DISK = os.path.join(ROOT, "build", "disk", "test.img")
 # What the kernel reads as typed keys (rt/virt/board.dull): the launcher, the text
 # reader, then the shell. Bytes 2-7 save a screenshot (screen<n>.raw) instead.
 RIGHT, DOWN, HOME = "\x1b[C", "\x1b[B", "\x1b[H"
-KEYS = ("\x02" + RIGHT + "\r"           # the launcher; Music is not here yet
+KEYS = ("\x02" + RIGHT * 2 + "\r"       # the launcher; Video is not here yet
         + "1" + "\x03"                   # Text: the folder list
         + DOWN * 4 + "\r" + "\x04"       # big.txt
         + "  G" + "\x05"                 # two pages on, then the end

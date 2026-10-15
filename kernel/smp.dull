@@ -4,6 +4,7 @@ use io
 use lock
 use board
 use timer
+use audio
 
 elsewhere to arch_psci (function u64, a u64, b u64, c u64, use_smc bool) gives i64
 elsewhere to arch_secondary_entry gives u64
@@ -41,5 +42,8 @@ to secondary_main (which u64)
     arrived += 1
     lock.release(addr of console)
     sev()
+    -- core 3 becomes the audio core when sound starts (kernel/audio.dull)
     repeat
         wfe()
+        if which is 3 and audio.core_go
+            audio.pump_forever()

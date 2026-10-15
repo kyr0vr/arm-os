@@ -1,0 +1,158 @@
+-- Sound over HDMI on the Pi 5 (BCM2712), the way Linux's vc4_hdmi driver sets it up.
+--
+-- The firmware already drives the screen. We switch on the 108 MHz audio clock, make
+-- sure the link is in HDMI (not DVI) mode, set up the MAI audio interface, tell the
+-- TV how fast samples come (N and CTS) and what they are (an audio infoframe), and
+-- then feed the MAI FIFO one IEC958 subframe at a time: the 16-bit sample in bits
+-- 27-12, a preamble in bits 3-0 (block start, left, right), the channel status bit
+-- for this frame in bit 30 and even parity in bit 31.
+
+use io
+use timer
+
+fixed hd u64 = 0x10_7c72_0000          -- MAI registers (shared block)
+fixed hdmi u64 = 0x10_7c70_1400        -- HDMI0 core
+fixed packets u64 = 0x10_7c70_3800     -- HDMI0 packet RAM
+fixed clock_gate u64 = 0x10_7c70_0008  -- bit 3: HDMI0 audio clock off
+fixed hvs_version u64 = 0x10_7c58_0000
+fixed audio_clock u64 = 108_000_000
+
+fixed mai_ctl u64 = 0x10
+fixed mai_thr u64 = 0x14
+fixed mai_fmt u64 = 0x18
+fixed mai_data u64 = 0x1C
+fixed mai_smp u64 = 0x20
+
+fixed ctl_full u32 = 0x800
+
+new frame u32                          -- position in the 192-frame channel status block
+new status [24] u8                     -- the channel status block (IEC 60958)
+new ready bool
+
+to rd (address u64) gives u32
+    give deref (address as ptr u32)
+
+to wr (address u64, v u32)
+    deref (address as ptr u32) = v
+
+to gcd (a u64, b u64) gives u64
+    while b is not 0
+        new t = a % b
+        a = b
+        b = t
+    give a
+
+-- Set up HDMI0 for `rate` Hz stereo. `pixel_hz` is the pixel clock (for CTS).
+to begin (rate u32, pixel_hz u64) gives bool
+    new r = rate as u64
+    new rate_code u32 = 0                -- for MAI_FMT
+    new cs_code u8 = 0                   -- for the channel status
+    new n_value u64 = 0
+    if rate is 48000
+        rate_code = 9
+        cs_code = 2
+        n_value = 6144
+    else if rate is 44100
+        rate_code = 8
+        cs_code = 0
+        n_value = 6272
+    else if rate is 32000
+        rate_code = 7
+        cs_code = 3
+        n_value = 4096
+    else
+        give false
+    if rd(hdmi + 0x1C8) & 1 is 0
+        io.line("audio: no screen on HDMI0")
+    -- HDMI mode (audio packets do not flow in DVI mode)
+    new sched = rd(hdmi + 0xE8)
+    if sched & 1 is 0
+        wr(hdmi + 0xE8, sched | 1)
+        new start = timer.now()
+        while rd(hdmi + 0xE8) & 2 is 0 and timer.now() - start < timer.frequency()
+            skip
+    -- the audio clock
+    wr(clock_gate, rd(clock_gate) & 0xFFFF_FFF7)
+    -- MAI: reset, then sample period, format, thresholds, channels
+    wr(hd + mai_ctl, 0x8207)
+    new g = gcd(audio_clock, r)
+    new nn = audio_clock / g
+    new mm = r / g
+    wr(hd + mai_smp, ((nn as u32) << 8) | ((mm - 1) as u32))
+    wr(hd + mai_ctl, (2 << 4) | 0x1000 | 0x2000 | 0x8)          -- 2 channels, whole samples, aligned, on
+    wr(hd + mai_fmt, (2 << 16) | (rate_code << 8))                -- PCM
+    if rd(hvs_version) & 0xFF is 0x54
+        wr(hd + mai_thr, 0x0808_0E1C)
+    else
+        wr(hd + mai_thr, 0x1010_1C1C)
+    wr(hdmi + 0xA8, 0x0C00_0003)                                -- MAI config: channels 0 and 1
+    wr(hdmi + 0xA4, 0x10)                                       -- channel map: 0 -> 0, 1 -> 1
+    wr(hdmi + 0xC0, 0x2100_2003)                                -- audio packets
+    -- clock regeneration: N, and CTS = pixel clock x N / (128 x rate)
+    new cts = pixel_hz * n_value / (128 * r)
+    wr(hdmi + 0xD0, 0x0100_0000 | n_value as u32)
+    wr(hdmi + 0xD4, cts as u32)
+    wr(hdmi + 0xD8, cts as u32)
+    -- the audio infoframe, in packet slot 4
+    wr(hdmi + 0xC4, rd(hdmi + 0xC4) & 0xFFFF_FFEF)
+    new start = timer.now()
+    while rd(hdmi + 0xCC) & 0x10 is not 0 and timer.now() - start < timer.frequency() / 10
+        skip
+    new slot = packets + 4 * 0x24
+    wr(slot, 0x000A_0184)
+    wr(slot + 4, 0x0000_0170)
+    for each i in 2 until 9
+        wr(slot + i * 4, 0)
+    wr(hdmi + 0xC4, rd(hdmi + 0xC4) | 0x1_0010)
+    start = timer.now()
+    while rd(hdmi + 0xCC) & 0x10 is 0 and timer.now() - start < timer.frequency() / 10
+        skip
+    -- channel status: consumer, PCM, the rate, 16-bit samples
+    for each i in 0 until 24
+        status[i] = 0
+    status[0] = 0x04
+    status[1] = 0x82
+    status[3] = cs_code
+    status[4] = 0x02
+    frame = 0
+    ready = true
+    io.print("audio: HDMI0 at ")
+    io.print_u64(r)
+    io.print(" Hz, N ")
+    io.print_u64(n_value)
+    io.print(", CTS ")
+    io.print_u64(cts)
+    io.print(", MAI ")
+    io.print_hex(rd(hd + mai_ctl) as u64)
+    io.line("")
+    give true
+
+to subframe (sample u32, preamble u32, cs u32) gives u32
+    new w = preamble | ((sample & 0xFFFF) << 12) | (cs << 30)
+    -- even parity over bits 4-30
+    new p = (w >> 4) & 0x7FF_FFFF
+    p = p ^ (p >> 16)
+    p = p ^ (p >> 8)
+    p = p ^ (p >> 4)
+    p = p ^ (p >> 2)
+    p = p ^ (p >> 1)
+    give w | ((p & 1) << 31)
+
+-- One stereo frame (left | right << 16), waiting for room in the FIFO.
+to put (f u32)
+    new bit = (frame & 7) as u8
+    new cs = ((status[(frame >> 3) as u64] >> bit) & 1) as u32
+    new left_pre u32 = 0x02
+    if frame is 0
+        left_pre = 0x08
+    hold until rd(hd + mai_ctl) & ctl_full is 0
+    wr(hd + mai_data, subframe(f & 0xFFFF, left_pre, cs))
+    hold until rd(hd + mai_ctl) & ctl_full is 0
+    wr(hd + mai_data, subframe(f >> 16, 0x04, cs))
+    frame += 1
+    if frame is 192
+        frame = 0
+
+-- How the MAI is doing (for diagnostics): its control register.
+to state gives u32
+    give rd(hd + mai_ctl)

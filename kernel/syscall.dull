@@ -11,6 +11,7 @@ use fat
 use board
 use timer
 use gui
+use audio
 
 fixed call_exit u64 = 0
 fixed call_write u64 = 1
@@ -37,6 +38,10 @@ fixed call_present u64 = 21
 fixed call_font u64 = 22
 fixed call_pointer u64 = 23
 fixed call_want_pointer u64 = 24
+fixed call_audio_start u64 = 25
+fixed call_audio_write u64 = 26
+fixed call_audio_queued u64 = 27
+fixed call_audio_drop u64 = 28
 
 fixed bad u64 = 0xFFFF_FFFF_FFFF_FFFF      -- -1
 fixed no_folder u64 = 0xFFFF_FFFF_FFFF_FFFE  -- -2
@@ -153,6 +158,19 @@ to answer (n u64, a u64, b u64, c u64, d u64, e u64) gives u64
         give gui.font_size(a as u8)
     if n is call_pointer
         give gui.pointer()
+    if n is call_audio_start
+        if audio.start(a as u32)
+            give 1
+        give 0
+    if n is call_audio_write
+        if b > 0x10_0000 or not ok(a, b * 4)
+            give bad
+        give audio.write(a as ptr u32, b)
+    if n is call_audio_queued
+        give audio.queued()
+    if n is call_audio_drop
+        audio.drop()
+        give 0
     if n is call_want_pointer
         proc.me().pointer = a is not 0
         give 0
@@ -184,6 +202,8 @@ to info (kind u64, l ptr line.line)
         line.add(l, ", ")
         line.number(l, board.disk_sectors() / 2048)
         line.add(l, " MB")
+    else if kind is 5
+        sound(l)
     else if kind is 4
         if not fat.mount()
             line.add(l, "none found")
@@ -199,6 +219,18 @@ to info (kind u64, l ptr line.line)
             line.number(l, cluster / 1024)
             line.add(l, " KB clusters, from sector ")
         line.number(l, fat.part_lba)
+
+-- What the sound output has done: its rate, frames played, and silence filled in.
+to sound (l ptr line.line)
+    if not audio.open_now
+        line.add(l, "not started")
+        give
+    line.number(l, audio.rate as u64)
+    line.add(l, " Hz, ")
+    line.number(l, audio.played)
+    line.add(l, " frames played, ")
+    line.number(l, audio.dry)
+    line.add(l, " of silence")
 
 -- Find a path for an app; the error to give if it is not a file or folder.
 to look_up (path u64, size u64, out ptr fat.entry) gives u64

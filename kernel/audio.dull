@@ -1,0 +1,116 @@
+-- Sound out: a ring of stereo 16-bit frames that an app fills (system calls) and
+-- the output drains at the sample rate.
+--
+-- On the Pi, core 3 does nothing but drain it into the HDMI audio FIFO (playing
+-- silence when the ring runs dry, so the stream to the TV never stops). On QEMU the
+-- timer tick drains it into a file (build/kernel_virt/audio.pcm), at the same pace.
+-- One writer (core 0) and one reader: `head` only moves forward on the writer's
+-- side and `tail` on the reader's, so no lock is needed.
+
+use board
+use timer
+
+fixed size u64 = 65536                 -- frames; 1.4 s at 48 kHz
+fixed mask u64 = 65535
+
+new ring [65536] u32                   -- left | right << 16
+new head u64                           -- frames written
+new tail u64                           -- frames played
+new rate u32
+new mode u32                           -- 0 none, 1 drained by the tick, 2 by a core of its own
+new open_now bool
+new flush bool                         -- the writer asks the reader to drop what is queued
+new played u64
+new dry u64                            -- frames of silence played because the ring was empty
+new due u64                            -- (tick mode) frames owed, x 1000
+new core_go bool                       -- core 3 should start pumping (kernel/smp.dull)
+
+-- Start (or restart) output at `rate` Hz. False if there is no audio output.
+to start (r u32) gives bool
+    if open_now and r is rate
+        drop()
+        give true
+    rate = r
+    flush = false
+    head = 0
+    tail = 0
+    due = 0
+    mode = board.audio_begin(r)
+    open_now = mode is not 0
+    if mode is 2
+        core_go = true
+        dmb()
+        sev()
+    give open_now
+
+-- How many frames are waiting to be played.
+to queued gives u64
+    give head - tail
+
+-- Copy up to `count` frames from `frames`; gives how many fit.
+to write (frames ptr u32, count u64) gives u64
+    if not open_now
+        give 0
+    new room = size - (head - tail)
+    new n = count
+    if n > room
+        n = room
+    for each i in 0 until n
+        ring[(head + i) & mask] = frames[i]
+    dmb()
+    head += n
+    give n
+
+-- Forget what is queued (pause, seek, a new track).
+to drop
+    if mode is 2
+        flush = true
+        dmb()
+        new start = timer.now()
+        while flush and timer.now() - start < timer.frequency() / 10
+            skip
+        flush = false
+    else
+        tail = head
+
+-- The next frame for the output (silence if there is none).
+to take gives u32
+    if flush
+        tail = head
+        dmb()
+        flush = false
+    if tail is head
+        dry += 1
+        give 0
+    new f = ring[tail & mask]
+    dmb()
+    tail += 1
+    played += 1
+    give f
+
+-- Core 3, forever: keep the HDMI FIFO full.
+to pump_forever
+    repeat
+        if not open_now
+            wfe()
+            skip
+        new f = take()
+        board.audio_put(f)
+
+-- Tick mode (QEMU): pass on what a millisecond of playing would use.
+to tick
+    if mode is not 1
+        give
+    due += rate as u64
+    new n = due / 1000
+    due = due % 1000
+    new chunk [64] u32
+    while n > 0 and tail is not head
+        new k u64 = 0
+        while k < 64 and k < n and tail is not head
+            chunk[k] = ring[tail & mask]
+            tail += 1
+            played += 1
+            k += 1
+        board.audio_sink(addr of chunk[0], k)
+        n -= k

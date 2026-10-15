@@ -10,10 +10,12 @@ started by its path too (`apps/hello.app`, or just `apps/hello`).
 |---|---|
 | `launcher` | The first app: Text, Music, Video and Console tiles |
 | `text` | The text reader: folders and .txt files on the SD card, word-wrapped |
+| `music` | The music player: .mp3 files on the SD card, over HDMI |
 | `shell` | The shell: reads keys, runs its own commands, starts other apps |
 | `hello` | Says hello, prints its arguments, checks 3 MB of heap |
 | `spin` | `spin <name> <rounds>`: keeps the CPU busy, to show apps taking turns |
 | `crash` | Reads kernel memory; the kernel stops it and everything else goes on |
+| `tone` | Plays a test chime (`tone 440` plays one note) |
 
 In the shell, `name args` runs an app and waits for it; `name args &` leaves it
 running in the background. `ps` lists what is running and `kill pid` stops an app.
@@ -42,6 +44,11 @@ same bytes as a serial terminal). An app that calls `sys.want_pointer(true)` als
 gets pointer events through `keys.next()`: movement, left and right buttons, the
 wheel; `sys.pointer_x()` / `sys.pointer_y()` say where the pointer is.
 
+`rt/app/ui.dull` holds the shared look (colors, titles, key hints) and
+`rt/app/files.dull` the file browser Text and Music use. Sound: `sys.audio_start(rate)`,
+then `sys.audio_write` stereo 16-bit frames (left | right << 16) and keep a little
+queued (`sys.audio_queued`); `lib/mp3.dull` decodes MP3 files.
+
 ## The image
 
 `rt/app/start.s` puts a header first: `"DULX"`, a version word, the address where
@@ -67,4 +74,6 @@ the app's memory ends (with `.bss`) and its entry point. Apps are linked at
 | 18 | key_within(ms) | 19 | surface(size) - the app's screen surface |
 | 20 | text(x \| y << 16, text, length, color, style) | 21 | present(x \| y << 32, w \| h << 32) |
 | 22 | font(style) - advance \| height << 32 | 23 | pointer() - x \| y << 16 \| buttons << 32 |
-| 24 | want_pointer(on) | | |
+| 24 | want_pointer(on) | 25 | audio_start(rate) |
+| 26 | audio_write(frames, count) | 27 | audio_queued() |
+| 28 | audio_drop() | | |

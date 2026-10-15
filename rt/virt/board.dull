@@ -7,6 +7,7 @@ use line
 use fb
 use virtio
 use pci
+use timer
 
 elsewhere new __stack_top u8
 
@@ -38,6 +39,34 @@ to usb_prepare (base u64)
 -- Devices see RAM where the CPU does.
 to dma_offset gives u64
     give 0
+
+-- Sound: written to build/kernel_virt/audio.pcm (16-bit stereo) as it "plays".
+new audio_file u64
+
+to audio_begin (rate u32) gives u32
+    if audio_file is 0
+        new path string = "build/kernel_virt/audio.pcm\0"
+        new block [3] u64
+        block[0] = path.ptr as u64
+        block[1] = 5                      -- "wb"
+        block[2] = path.len - 1
+        new h = semihost(0x01, addr of block[0])
+        if h as i64 < 0
+            give 0
+        audio_file = h
+    give 1
+
+to audio_sink (frames ptr u32, count u64)
+    if audio_file is 0 or count is 0
+        give
+    new block [3] u64
+    block[0] = audio_file
+    block[1] = frames as u64
+    block[2] = count * 4
+    semihost(0x05, addr of block[0])
+
+to audio_put (f u32)
+    give
 
 -- F12 on a USB keyboard saves the screen as screen<n>.raw, n = 2, 3, ...
 new shots u32 = 2
@@ -94,9 +123,18 @@ to cpu_mhz gives u64
 
 -- One scripted key, but only when an app is waiting for one (`wanted`), so the
 -- script runs the same way every time. Bytes 2-7 in the script are not keys: they
--- save the screen as build/kernel_virt/screen<n>.raw at that moment.
+-- save the screen as build/kernel_virt/screen<n>.raw at that moment; byte 1 holds
+-- the script back for a second.
+new resume_at u64                -- byte 1 in the script: wait a second
+
 to poll_key (wanted bool) gives maybe u8
     if not wanted
+        give nothing
+    if timer.now() < resume_at
+        give nothing
+    if script_pos < script_len and script[script_pos] is 1
+        script_pos += 1
+        resume_at = timer.now() + timer.frequency()
         give nothing
     while script_pos < script_len and script[script_pos] >= 2 and script[script_pos] <= 7
         save_raw(fb.ram_screen, 1920 * 1080 * 4, script[script_pos] as u32)

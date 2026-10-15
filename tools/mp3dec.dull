@@ -1,0 +1,59 @@
+-- Decode an MP3 file to raw 16-bit stereo PCM with lib/mp3.dull, on the PC (QEMU,
+-- semihosting). tests/mp3_test.py compares the result with ffmpeg's decode.
+--
+--   mp3dec <in.mp3> <out.pcm>
+
+use sys
+use mem
+use mp3
+
+-- The last two words of the command line.
+to word_from_end (line string, n u64) gives string
+    new words [8] u64
+    new ends [8] u64
+    new count u64 = 0
+    new i u64 = 0
+    while i < line.len and count < 8
+        while i < line.len and line[i] is ' '
+            i += 1
+        if i >= line.len
+            stop
+        words[count] = i
+        while i < line.len and line[i] is not ' '
+            i += 1
+        ends[count] = i
+        count += 1
+    new empty string
+    if n >= count
+        give empty
+    new k = count - 1 - n
+    give line[words[k] until ends[k]]
+
+to main gives u8
+    new line = sys.command_line()
+    new input = word_from_end(line, 1)
+    new output = word_from_end(line, 0)
+    new src string
+    if not sys.read_file(input, addr of src)
+        sys.print("mp3dec: cannot read the input\n")
+        give 1
+    new d = mp3.make()
+    if not mp3.open(d, src.ptr, src.len)
+        sys.print("mp3dec: no MP3 audio found\n")
+        give 2
+    new most = (src.len / 96 + 2) * 4608
+    new pcm = mem.alloc(most)
+    new used u64 = 0
+    repeat
+        if used + 4608 > most
+            stop
+        if mp3.next(d, (pcm + used) as ptr i16) is 0
+            stop
+        used += 4608
+    new out string
+    out.ptr = pcm
+    out.len = used
+    if not sys.write_file(output, out)
+        sys.print("mp3dec: cannot write the output\n")
+        give 3
+    give 0

@@ -1,0 +1,270 @@
+-- A file browser for apps: the SD card's folders and the files with one extension
+-- (".txt", ".mp3"), chosen with the keys or the pointer. Text and Music use it.
+--
+--   files.setup("Music", ".mp3")
+--   while files.browse(addr of path, addr of size)    -- false: the user left
+--       ... open path ...
+
+use sys
+use gfx
+use keys
+use line
+use ui
+
+fixed max_entries u64 = 200
+fixed list_y u32 = 180
+fixed row_h u32 = 52
+fixed list_rows u32 = 14
+
+new app_name line.line
+new extension line.line
+new folder line.line           -- "" is the top of the card
+new names [200] line.line
+new is_dir [200] bool
+new sizes [200] u32
+new count u64
+new selected u64
+new list_top u64
+new disk_ok bool
+new loaded bool
+
+to setup (name string, ext string)
+    line.clear(addr of app_name)
+    line.add(addr of app_name, name)
+    line.clear(addr of extension)
+    line.add(addr of extension, ext)
+    loaded = false
+
+to lower (c u8) gives u8
+    if c >= 'A' and c <= 'Z'
+        give c + 32
+    give c
+
+to has_extension (s string) gives bool
+    new e = line.text(addr of extension)
+    if s.len <= e.len
+        give false
+    for each i in 0 until e.len
+        if lower(s[s.len - e.len + i]) is not lower(e[i])
+            give false
+    give true
+
+to same (a string, b string) gives bool
+    if a.len is not b.len
+        give false
+    for each i in 0 until a.len
+        if a[i] is not b[i]
+            give false
+    give true
+
+-- Read the folder: subfolders first, then the files with our extension (hidden ones
+-- left out).
+to load_folder
+    count = 0
+    selected = 0
+    list_top = 0
+    loaded = true
+    new entry [176] u8
+    disk_ok = true
+    for each pass in 0 until 2 as u64
+        new index u64 = 0
+        repeat
+            new r = sys.dir(line.text(addr of folder), index, addr of entry[0], 176)
+            if r < 0
+                if index is 0
+                    disk_ok = false
+                stop
+            if r is 0
+                stop
+            index += 1
+            new words = (addr of entry[0]) as ptr u32
+            new length = deref ((addr of entry[8]) as ptr u64)
+            new name string
+            name.ptr = addr of entry[16]
+            name.len = length
+            new dir = words[0] & sys.attr_dir is not 0
+            if name.len is 0 or name[0] is '.' or same(name, "System Volume Information")
+                skip
+            if (pass is 0 and not dir) or (pass is 1 and (dir or not has_extension(name)))
+                skip
+            if count < max_entries
+                line.clear(addr of names[count])
+                line.add(addr of names[count], name)
+                is_dir[count] = dir
+                sizes[count] = words[1]
+                count += 1
+
+to folder_icon (x u32, y u32, color u32)
+    gfx.round_rect(x, y + 4, 14, 8, 3, color)
+    gfx.round_rect(x, y + 8, 30, 22, 4, color)
+
+to file_icon (x u32, y u32, color u32, back u32)
+    gfx.round_rect(x + 3, y, 24, 30, 4, color)
+    gfx.round_rect(x + 6, y + 3, 18, 24, 2, back)
+    for each k in 0 until 3 as u32
+        gfx.fill(x + 9, y + 9 + k * 6, 12, 2, color)
+
+to draw_list
+    new sub line.line
+    line.add(addr of sub, "SD card /")
+    line.add(addr of sub, line.text(addr of folder))
+    ui.title(line.text(addr of app_name), line.text(addr of sub))
+    gfx.fill(0, list_y - 20, gfx.width, ui.footer_y - list_y + 20, ui.bg)
+    if not disk_ok
+        gfx.text(ui.margin, list_y + 20, "No file system found on the SD card.", gfx.regular, ui.deep)
+    else if count is 0
+        new msg line.line
+        line.add(addr of msg, "No folders or ")
+        line.add(addr of msg, line.text(addr of extension))
+        line.add(addr of msg, " files here.")
+        gfx.text(ui.margin, list_y + 20, line.text(addr of msg), gfx.regular, ui.muted)
+    if selected < list_top
+        list_top = selected
+    if selected >= list_top + list_rows as u64
+        list_top = selected + 1 - list_rows as u64
+    for each r in 0 until list_rows as u64
+        new i = list_top + r
+        if i >= count
+            stop
+        new y = list_y + (r as u32) * row_h
+        new lit = i is selected
+        new back = ui.bg
+        if lit
+            back = ui.slot_lit
+            gfx.round_rect(ui.margin - 20, y, gfx.width - ui.margin * 2 + 40, row_h - 6, 12, ui.slot_lit)
+            gfx.round_rect(ui.margin - 20, y + 10, 5, row_h - 26, 2, ui.amber)
+        new ink = ui.muted
+        if lit
+            ink = ui.amber
+        if is_dir[i]
+            folder_icon(ui.margin + 4, y + 8, ink)
+        else
+            file_icon(ui.margin + 4, y + 8, ink, back)
+        new name_color = ui.putty
+        new style = gfx.regular
+        if lit
+            name_color = ui.amber
+            style = gfx.bold
+        new nx = gfx.text(ui.margin + 60, y + 9, line.text(addr of names[i]), style, name_color)
+        if is_dir[i]
+            gfx.text(nx, y + 9, "/", style, name_color)
+        else
+            new s line.line
+            ui.size_text(sizes[i] as u64, addr of s)
+            new t = line.text(addr of s)
+            gfx.text(gfx.width - ui.margin - gfx.text_width(t, gfx.small), y + 11, t, gfx.small, ui.muted)
+    if count > list_rows as u64
+        new l line.line
+        line.number(addr of l, selected + 1)
+        line.add(addr of l, " of ")
+        line.number(addr of l, count)
+        ui.title_right(line.text(addr of l), ui.dim)
+    ui.clear_footer()
+    new x = ui.hint(ui.margin, "Up/Down", "choose")
+    x = ui.hint(x, "Enter", "open")
+    x = ui.hint(x, "Backspace", "up a folder")
+    ui.hint(x, "q", "back to the launcher")
+    gfx.present_all()
+
+to child_path (i u64, into ptr line.line)
+    line.clear(into)
+    line.add(into, line.text(addr of folder))
+    if folder.len > 0
+        line.byte(into, '/')
+    line.add(into, line.text(addr of names[i]))
+
+to go_up gives bool
+    if folder.len is 0
+        give false
+    new cut u64 = 0
+    for each i in 0 until folder.len
+        if folder.bytes[i] is '/'
+            cut = i
+    folder.len = cut
+    load_folder()
+    give true
+
+-- The row of the list under (x, y), or `count` for none.
+to row_at (x u32, y u32) gives u64
+    if y < list_y or x < ui.margin - 20 or x > gfx.width - ui.margin + 20
+        give count
+    new r = ((y - list_y) / row_h) as u64
+    if r >= list_rows as u64 or list_top + r >= count
+        give count
+    give list_top + r
+
+-- Open the selected entry: gives true for a file (its path in `out`), false for a
+-- folder (which is now shown).
+to open_selected (out ptr line.line, size ptr u64) gives bool
+    if selected >= count
+        give false
+    new p line.line
+    child_path(selected, addr of p)
+    if is_dir[selected]
+        line.clear(addr of folder)
+        line.add(addr of folder, line.text(addr of p))
+        load_folder()
+        draw_list()
+        give false
+    line.clear(out)
+    line.add(out, line.text(addr of p))
+    deref size = sizes[selected] as u64
+    give true
+
+-- Let the user choose a file. Gives false when they leave instead.
+to browse (out ptr line.line, size ptr u64) gives bool
+    if not loaded
+        load_folder()
+    draw_list()
+    repeat
+        new k = keys.next()
+        if k is keys.pointer_moved
+            new r = row_at(sys.pointer_x(), sys.pointer_y())
+            if r < count and r is not selected
+                selected = r
+                draw_list()
+        else if k is keys.left_down
+            new r = row_at(sys.pointer_x(), sys.pointer_y())
+            if r < count
+                selected = r
+                if open_selected(out, size)
+                    give true
+        else if k is keys.right_down
+            if not go_up()
+                give false
+            draw_list()
+        else if k is keys.wheel_down or k is keys.down or k is 'j' as u32
+            if selected + 1 < count
+                selected += 1
+                draw_list()
+        else if k is keys.wheel_up or k is keys.up or k is 'k' as u32
+            if selected > 0
+                selected -= 1
+                draw_list()
+        else if k is keys.home
+            selected = 0
+            draw_list()
+        else if k is keys.finish and count > 0
+            selected = count - 1
+            draw_list()
+        else if k is keys.enter or k is keys.right
+            if open_selected(out, size)
+                give true
+        else if k is keys.backspace or k is keys.left
+            if go_up()
+                draw_list()
+        else if k is 'q' as u32 or k is keys.escape
+            give false
+
+-- The file `step` places away from the selected one in this folder (for next and
+-- previous track). Gives false if there is none.
+to neighbor (step i64, out ptr line.line, size ptr u64) gives bool
+    new i = selected as i64 + step
+    while i >= 0 and i < count as i64
+        if not is_dir[i as u64]
+            selected = i as u64
+            child_path(selected, out)
+            deref size = sizes[selected] as u64
+            give true
+        i += step
+    give false
