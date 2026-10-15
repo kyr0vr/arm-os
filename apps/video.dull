@@ -1,8 +1,8 @@
 -- Video: the ArmOS video player. Choose an .mp4 file (H.264 video, AAC sound) on the
 -- SD card and it plays full screen, the sound keeping time.
 --
--- `video bench <file>` decodes a file as fast as it can, without sound or waiting,
--- and prints how fast that was (to the serial console).
+-- `video bench <file> [frames]` decodes a file (or its first frames) as fast as it
+-- can, without sound or waiting, and prints how fast that was (to the serial console).
 
 use sys
 use gfx
@@ -504,18 +504,32 @@ to play (path ptr line.line)
     sys.close(handle)
     report("video")
 
-to bench (path string) gives u64
+to bench (args string) gives u64
+    -- an optional frame count after the file name
+    new path_len = args.len
+    new limit u64 = 0
+    new k = args.len
+    while k > 0 and args[k - 1] >= '0' and args[k - 1] <= '9'
+        k -= 1
+    if k > 1 and k < args.len and args[k - 1] is ' '
+        for each i in k until args.len
+            limit = limit * 10 + (args[i] - '0') as u64
+        path_len = k - 1
     new l line.line
-    line.add(addr of l, path)
+    line.add(addr of l, args[0 until path_len])
     if not load(addr of l)
         sys.write(line.text(addr of message), sys.deep)
         sys.print("\n")
         give 1
     have_sound = false
+    sys.profile_start()
     new t0 = sys.time()
     while next_picture(0, true)
         shown += 1
+        if limit > 0 and decoded >= limit
+            stop
     new took = sys.time() - t0
+    sys.profile_stop()
     new out line.line
     line.add(addr of out, "bench: ")
     line.number(addr of out, h264.width(vd) as u64)

@@ -120,11 +120,25 @@ to idct8 (c ptr i32)
 -- picture at `dst`.
 to add_block (dst ptr u8, stride u64, pred ptr i32, ps u64, res ptr i32, w u64)
     for each y in 0 until w
-        for each x in 0 until w
-            new v = pred[y * ps + x]
-            if res as u64 is not 0
-                v += res[y * w + x]
-            dst[y * stride + x] = h264state.clip1(v) as u8
+        new o = dst + y * stride
+        new p = pred + y * ps
+        if res as u64 is 0
+            for each x in 0 until w
+                new v = p[x]
+                if v < 0
+                    v = 0
+                else if v > 255
+                    v = 255
+                o[x] = v as u8
+        else
+            new r = res + y * w
+            for each x in 0 until w
+                new v = p[x] + r[x]
+                if v < 0
+                    v = 0
+                else if v > 255
+                    v = 255
+                o[x] = v as u8
 
 -- ---------------------------------------------------------------- intra prediction
 

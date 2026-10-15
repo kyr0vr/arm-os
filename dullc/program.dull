@@ -86,6 +86,7 @@ shape local
     ty       ptr types.ty
     offset   u64
     readonly bool
+    reg      u64                 -- x19-x28 when it lives in a register, else 0
 
 shape ref
     kind   u32

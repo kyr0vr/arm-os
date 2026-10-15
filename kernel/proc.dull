@@ -82,6 +82,14 @@ new switches u64
 new ranks u64
 new front_changed bool                 -- kernel/gui.dull should look again at what is in front
 
+-- The profiler: where in its code one app was at each timer tick (16-byte buckets
+-- over its first MB).
+fixed prof_buckets u64 = 65536
+new prof_pid u32
+new prof_hist ptr u32
+new prof_samples u64
+new prof_kernel u64                    -- ticks that found it inside a system call
+
 -- Keys typed but not yet read, and pointer events (codes from 0x100 up).
 new keys [1024] u16
 
@@ -377,6 +385,11 @@ to tick (frame ptr u64) gives ptr u64
     table[current].frame = frame
     if current is not 0
         table[current].ticks += 1
+        if prof_pid is not 0 and table[current].pid is prof_pid
+            new off = frame[elr] - user_base
+            if off < prof_buckets * 16
+                prof_hist[off / 16] += 1
+            prof_samples += 1
     repeat
         new k = board.poll_key(keys_count is 0 and someone_wants_key()) else stop
         push_key(k)

@@ -36,6 +36,7 @@ CASES = [
     ("cropped", "testsrc2", "176x120", 0.3, []),
     ("matrices", "testsrc2", "176x144", 0.3, ["-x264-params", "cqm=jvt"]),
     ("high-quality", "testsrc2", "160x96", 0.3, ["-crf", "4", "-x264-params", "ref=5:b-adapt=2:bframes=4"]),
+    ("weighted", "testsrc2", "176x144", 0.5, ["-vf", "fade=in:0:12", "-x264-params", "weightp=2"]),
 ]
 
 

@@ -111,6 +111,14 @@ to close (h i64)
 to file_size (h i64) gives u64
     give call(32, h as u64, 0, 0, 0, 0)
 
+-- Profiling: start (where this app spends its time is counted at every tick), then
+-- stop, which prints the counts on the serial console (tools/profile.py reads them).
+to profile_start
+    call(33, 1, 0, 0, 0, 0)
+
+to profile_stop
+    call(33, 2, 0, 0, 0, 0)
+
 -- ---------------------------------------------------------------- facts
 
 fixed info_memory u64 = 0
