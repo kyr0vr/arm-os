@@ -81,6 +81,9 @@ shape mbinfo
     refpic     [8] u32                 -- picture id behind each reference (0 = none)
     mv         [64] i16                -- [(list * 16 + block) * 2 + x/y]
     mvd        [64] u8                 -- |mvd|, capped at 255
+    mvs        [64] i16                -- the mvd itself (the parser's; motion is worked out later)
+    mtype      i32                     -- P or B macroblock type
+    subs       [4] u8                  -- sub-macroblock types (8x8 partitions)
 
 shape picture
     used       bool                    -- this slot holds a picture
@@ -99,6 +102,8 @@ shape picture
     ref        u8                      -- 0 none, 1 short-term, 2 long-term
     long_idx   i32
     waiting    bool                    -- decoded, not output yet
+    rebuilt    bool                    -- every sample is there (lib/h264par.dull)
+    held       bool                    -- the app is still reading it (its slot stays)
     idr_seq    u32
     mbs        ptr mbinfo
 
@@ -113,6 +118,8 @@ shape slicestate
     p          ptr pps
     s          ptr sps
     stype      u32
+    spatial    bool
+    nref       [2] u32
     lw_denom   u32
     cw_denom   u32
     deblock_idc u32
@@ -122,6 +129,20 @@ shape slicestate
     list       [64] u64
 
 fixed max_slices u64 = 256
+
+-- One picture on its way through lib/h264par.dull: what its macroblocks need to be
+-- rebuilt, and how far parsing and rebuilding have got.
+shape picjob
+    number     u64                     -- the picture's number (decoder.gen when it began)
+    coef       ptr i32                 -- every macroblock's coefficients
+    coef_mbs   u64
+    slices     ptr slicestate          -- [max_slices], by slice number
+    rows_done  ptr u64                 -- per macroblock row: how many are rebuilt
+    rows_cap   u64
+    parsed     u64                     -- macroblocks parsed so far
+    deblocked  u64                     -- rows deblocked
+    pic        ptr picture
+    snap       ptr decoder             -- the decoder as the picture began (the lanes copy it)
 
 shape decoder
     spss       [32] sps
@@ -195,26 +216,24 @@ shape decoder
     -- output
     out_count  u64
     -- reconstruction, maybe on other cores (lib/h264par.dull)
-    coef       ptr i32                 -- every macroblock's coefficients
-    coef_mbs   u64
-    slices     ptr slicestate          -- [max_slices], by slice number
+    coef       ptr i32                 -- the current picture's coefficients (its job's)
+    slices     ptr slicestate          -- its slices' settings
+    jobs       [2] picjob              -- the picture being parsed and the one before it
+    job        ptr picjob              -- the current picture's
     lane_count u64                     -- helper lanes rebuilding pictures (0: done here)
     lane_recs  [2] u64                 -- each lane's record (h264par.lanerec)
     solo       ptr decoder             -- the copy used to rebuild here
-    gen        u64                     -- pictures handed to the lanes
-    parsed     u64                     -- macroblocks of the picture parsed so far
-    rows_done  ptr u64                 -- per macroblock row: how many are rebuilt
-    rows_cap   u64
-    deblocked  u64                     -- rows deblocked
+    gen        u64                     -- pictures begun
+    completed  u64                     -- pictures rebuilt, deblocked and padded (in order)
     quit       bool                    -- lanes: stop (h264par.stop_lanes)
     job_fn     u64                     -- a side job for the lanes (h264par.run_job)
     job_arg    u64
     job_gen    u64
+    job_mine   bool                    -- this core's part of it is still to do
 
 to make gives ptr decoder
     new d = mem.alloc(size_of(decoder)) as ptr decoder
     d.next_id = 1
-    d.slices = mem.alloc(size_of(slicestate) * max_slices) as ptr slicestate
     give d
 
 -- The settings of the slice macroblock `m` belongs to.

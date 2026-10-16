@@ -135,7 +135,13 @@ to present (c ptr canvas, s ptr fb.screen, x u32, y u32, w u32, h u32)
     for each row in y until y1
         new src = c.pixels + (row as u64) * (c.width as u64)
         new dst = s.base + (row as u64) * (s.pitch as u64) / 4
-        if s.order is 0
+        if s.order is 0 and x % 2 is 0 and (x1 - x) % 2 is 0
+            -- two pixels at a time (the kernel leaves NEON to apps)
+            new s2 = (src + x as u64) as ptr u64
+            new d2 = (dst + x as u64) as ptr u64
+            for each k in 0 until ((x1 - x) / 2) as u64
+                d2[k] = s2[k]
+        else if s.order is 0
             for each col in x until x1
                 dst[col] = src[col]
         else

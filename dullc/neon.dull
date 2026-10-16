@@ -13,13 +13,17 @@ use encode
 
 fixed arr_names [8] string = ["8b", "16b", "4h", "8h", "2s", "4s", "1d", "2d"]
 
-fixed same_names [17] string = ["add", "sub", "mul", "mla", "mls", "smax", "smin", "umax", "umin",
-    "urhadd", "uhadd", "zip1", "zip2", "uzp1", "uzp2", "trn1", "trn2"]
-fixed same_words [17] u64 = [0x0E208400, 0x2E208400, 0x0E209C00, 0x0E209400, 0x2E209400,
+fixed same_names [28] string = ["add", "sub", "mul", "mla", "mls", "smax", "smin", "umax", "umin",
+    "urhadd", "uhadd", "zip1", "zip2", "uzp1", "uzp2", "trn1", "trn2", "uabd", "sabd", "cmhi",
+    "cmhs", "cmgt", "cmge", "cmeq", "sshl", "srshl", "ushl", "urshl"]
+fixed same_words [28] u64 = [0x0E208400, 0x2E208400, 0x0E209C00, 0x0E209400, 0x2E209400,
     0x0E206400, 0x0E206C00, 0x2E206400, 0x2E206C00, 0x2E201400, 0x2E200400, 0x0E003800,
-    0x0E007800, 0x0E001800, 0x0E005800, 0x0E002800, 0x0E006800]
-fixed bit_names [4] string = ["and", "orr", "eor", "bic"]
-fixed bit_words [4] u64 = [0x0E201C00, 0x0EA01C00, 0x2E201C00, 0x0E601C00]
+    0x0E007800, 0x0E001800, 0x0E005800, 0x0E002800, 0x0E006800, 0x2E207400, 0x0E207400,
+    0x2E203400, 0x2E203C00, 0x0E203400, 0x0E203C00, 0x2E208C00, 0x0E204400, 0x0E205400,
+    0x2E204400, 0x2E205400]
+fixed bit_names [8] string = ["and", "orr", "eor", "bic", "orn", "bsl", "bit", "bif"]
+fixed bit_words [8] u64 = [0x0E201C00, 0x0EA01C00, 0x2E201C00, 0x0E601C00, 0x0EE01C00, 0x2E601C00,
+    0x2EA01C00, 0x2EE01C00]
 fixed long_names [10] string = ["uaddl", "saddl", "usubl", "ssubl", "umull", "smull", "umlal",
     "smlal", "umlsl", "smlsl"]
 fixed long_words [10] u64 = [0x2E200000, 0x0E200000, 0x2E202000, 0x0E202000, 0x2E20C000,
@@ -187,8 +191,8 @@ to instruction (mnemonic string, ops ptr vec.vec) gives maybe u64
         new d = vreg(o(ops, 0))
         new n = vreg(o(ops, 1))
         give 0x0EA01C00 | (qq(d) << 30) | (rn(n) << 16) | (rn(n) << 5) | rn(d)
-    new si = find(addr of same_names[0], 17, mn)
-    new bi = find(addr of bit_names[0], 4, mn)
+    new si = find(addr of same_names[0], 28, mn)
+    new bi = find(addr of bit_names[0], 8, mn)
     if si > 0 or bi > 0
         need(ops, 3, mn)
         new d = vreg(o(ops, 0))
@@ -200,7 +204,7 @@ to instruction (mnemonic string, ops ptr vec.vec) gives maybe u64
             if sz(d) is not 0
                 asmtext.fail2(mn, " works on bytes (8b or 16b)")
             give bit_words[bi - 1] | (qq(d) << 30) | (rn(m) << 16) | (rn(n) << 5) | rn(d)
-        if sz(d) is 3 and si > 2 and si < 12
+        if sz(d) is 3 and ((si > 2 and si < 12) or si is 18 or si is 19)
             asmtext.fail2(mn, " has no 64-bit lanes")
         give same_words[si - 1] | (qq(d) << 30) | (sz(d) << 22) | (rn(m) << 16) | (rn(n) << 5) | rn(d)
     new ui = find(addr of unary_names[0], 2, mn)

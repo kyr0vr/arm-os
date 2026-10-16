@@ -41,6 +41,7 @@ to secondary_main (which u64)
     io.print_u64(arch_current_el())
     io.line(", MMU on)")
     write_sysreg(tpidr_el1, which)
+    write_sysreg(cntkctl_el1, 2)
     helper.arrived(which)
     arrived += 1
     lock.release(addr of console)

@@ -19,9 +19,13 @@ SAME = {"add": 0x0E208400, "sub": 0x2E208400, "mul": 0x0E209C00, "mla": 0x0E2094
         "mls": 0x2E209400, "smax": 0x0E206400, "smin": 0x0E206C00, "umax": 0x2E206400,
         "umin": 0x2E206C00, "urhadd": 0x2E201400, "uhadd": 0x2E200400,
         "zip1": 0x0E003800, "zip2": 0x0E007800, "uzp1": 0x0E001800, "uzp2": 0x0E005800,
-        "trn1": 0x0E002800, "trn2": 0x0E006800}
+        "trn1": 0x0E002800, "trn2": 0x0E006800, "uabd": 0x2E207400, "sabd": 0x0E207400,
+        "cmhi": 0x2E203400, "cmhs": 0x2E203C00, "cmgt": 0x0E203400, "cmge": 0x0E203C00,
+        "cmeq": 0x2E208C00, "sshl": 0x0E204400, "srshl": 0x0E205400, "ushl": 0x2E204400,
+        "urshl": 0x2E205400}
 # bitwise: bytes only, the size field is part of the opcode
-BITWISE = {"and": 0x0E201C00, "orr": 0x0EA01C00, "eor": 0x2E201C00, "bic": 0x0E601C00}
+BITWISE = {"and": 0x0E201C00, "orr": 0x0EA01C00, "eor": 0x2E201C00, "bic": 0x0E601C00,
+           "orn": 0x0EE01C00, "bsl": 0x2E601C00, "bit": 0x2EA01C00, "bif": 0x2EE01C00}
 # Rd wide, Rn and Rm narrow (the `2` forms use the upper halves)
 LONG = {"uaddl": 0x2E200000, "saddl": 0x0E200000, "usubl": 0x2E202000, "ssubl": 0x0E202000,
         "umull": 0x2E20C000, "smull": 0x0E20C000, "umlal": 0x2E208000, "smlal": 0x0E208000,
@@ -126,7 +130,9 @@ def encode(mn, ops, imm):
             if size != 0:
                 raise AsmError(f"`{mn}` works on bytes (8b or 16b)")
             return BITWISE[mn] | (q << 30) | (m << 16) | (n << 5) | d
-        if size == 3 and mn not in ("add", "sub", "zip1", "zip2", "uzp1", "uzp2", "trn1", "trn2"):
+        if size == 3 and mn not in ("add", "sub", "zip1", "zip2", "uzp1", "uzp2", "trn1", "trn2",
+                                    "cmhi", "cmhs", "cmgt", "cmge", "cmeq", "sshl", "srshl", "ushl",
+                                    "urshl"):
             raise AsmError(f"`{mn}` has no 64-bit lanes")
         return SAME[mn] | (q << 30) | (size << 22) | (m << 16) | (n << 5) | d
     if mn in UNARY:

@@ -48,6 +48,7 @@ new rca u32                    -- the card's address on the bus
 new sectors u64
 new base_mhz u32
 new failed_at u32              -- the command that failed (diagnostics), or 0xFF
+new fast bool                  -- the card runs at 50 MHz (high speed)
 
 -- --------------------------------------------------------------- waiting
 
@@ -189,8 +190,35 @@ to init gives bool
         sd.host = sd.host | 2
     if not set_clock(25_000)
         give false
+    fast = high_speed()
+    if not fast
+        sd.host = sd.host & (4 ^ 0xFFFF_FFFF)
+        if not set_clock(25_000)
+            give false
     ready = true
     give true
+
+-- High speed: CMD6 switches function group 1 to 1 (50 MHz); the card answers with a
+-- 64-byte status whose bits 379:376 (the low half of byte 16) say what it chose.
+to high_speed gives bool
+    sd.blocks = (1 << 16) | 64
+    if not send(6, 0x80FF_FFF1, r1 | with_data, 0x10)
+        give false
+    if not wait_irq(read_ready, 500)
+        reset(2)
+        reset(4)
+        give false
+    new status [16] u32
+    for each w in 0 until 16
+        status[w] = sd.data
+    if not wait_irq(xfer_done, 500)
+        reset(2)
+        reset(4)
+        give false
+    if status[4] & 0xF is not 1
+        give false
+    sd.host = sd.host | 4                                 -- high-speed timing
+    give set_clock(50_000)
 
 -- Card size from its CSD. The controller drops the CRC byte, so CSD bit k is
 -- response bit k - 8.
@@ -245,13 +273,10 @@ to read_some (lba u64, count u32, into ptr u8) gives bool
             reset(2)
             reset(4)
             give false
-        for each w in 0 until 128 as u32
-            new v = sd.data
-            out[0] = (v & 0xFF) as u8
-            out[1] = ((v >> 8) & 0xFF) as u8
-            out[2] = ((v >> 16) & 0xFF) as u8
-            out[3] = (v >> 24) as u8
-            out = out + 4
+        new words = out as ptr u32
+        for each w in 0 until 128
+            words[w] = sd.data
+        out = out + 512
     if not wait_irq(xfer_done, 500)
         failed_at = 0x40 | index
         reset(2)

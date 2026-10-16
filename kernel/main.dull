@@ -78,6 +78,7 @@ to main
 
     -- exceptions
     write_sysreg(tpidr_el1, 0)                    -- this is core 0 (kernel/trap.dull asks)
+    write_sysreg(cntkctl_el1, 2)                  -- apps may read the counter (cntvct_el0)
     arch_install_vectors()
     asm "brk #1"
     check(trap.breakpoints is 1, "a test breakpoint was caught and stepped over")

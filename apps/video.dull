@@ -65,6 +65,12 @@ new decode_ms u64
 new convert_ms u64
 new present_ms u64                      -- putting pictures on the screen
 new converting bool                     -- the lanes are turning a picture into pixels
+new converting_pic ptr h264state.picture
+new conv_wait_ms u64                    -- waiting for the lanes to finish converting
+new conv_own_ticks u64                  -- this core's share of converting (counter ticks)
+new play_c0 u64                         -- counter and lane waiting when playing began
+new play_i0 u64
+new play_i1 u64
 new first_late i64                      -- how late the first picture was (ms; negative: early)
 new worst_late u64
 new sound_ms u64                        -- decoding and queueing sound
@@ -495,16 +501,27 @@ to convert (pic ptr h264state.picture)
     asm
         "adrp {f}, video.convert_part"
         "add {f}, {f}, :lo12:video.convert_part"
+    pic.held = true                     -- its slot must not be reused meanwhile
+    converting_pic = pic
     h264par.start_job(vd, f, pic as u64)
     converting = true
 
 to converted
     if converting
+        new w0 = sys.time()
         h264par.end_job(vd)
+        conv_wait_ms += sys.time() - w0
         converting = false
+        converting_pic.held = false
 
 -- Rows part * dst_h / parts .. (part + 1) * dst_h / parts of `convert`.
 to convert_part (arg u64, part u64, parts u64)
+    new c0 = read_sysreg(cntvct_el0)
+    convert_rows(arg, part, parts)
+    if part + 1 is parts
+        conv_own_ticks += read_sysreg(cntvct_el0) - c0
+
+to convert_rows (arg u64, part u64, parts u64)
     new pic = arg as ptr h264state.picture
     new h = h264.height(vd) as u64
     new w = h264.width(vd) as u64
@@ -735,6 +752,19 @@ to report (label string)
         line.number(addr of l, first_late as u64)
     line.add(addr of l, " ms late, worst ")
     line.number(addr of l, worst_late)
+    if shown > 0
+        line.add(addr of l, "; of present, waiting ")
+        line.number(addr of l, conv_wait_ms / shown)
+        line.add(addr of l, " (own part ")
+        line.number(addr of l, conv_own_ticks * 1000 / read_sysreg(cntfrq_el0) / shown)
+        line.byte(addr of l, ')')
+    if vd.lane_count > 0
+        new el = read_sysreg(cntvct_el0) - play_c0
+        line.add(addr of l, "; lanes idle ")
+        line.number(addr of l, (h264par.idle_of(vd, 0) - play_i0) * 100 / el)
+        line.add(addr of l, "% ")
+        line.number(addr of l, (h264par.idle_of(vd, 1) - play_i1) * 100 / el)
+        line.byte(addr of l, '%')
     line.add(addr of l, "; card ")
     line.number(addr of l, have / 1024)
     line.add(addr of l, " KB in ")
@@ -758,6 +788,12 @@ to play (path ptr line.line)
     placed = false
     paused = false
     -- the first picture before any sound, so the two start together
+    conv_wait_ms = 0
+    conv_own_ticks = 0
+    play_c0 = read_sysreg(cntvct_el0)
+    play_i0 = h264par.idle_of(vd, 0)
+    play_i1 = h264par.idle_of(vd, 1)
+    wall_start = sys.time()
     next_picture(0, false)
     wall_start = sys.time()
     overlay_until = sys.time() + 3000
@@ -852,6 +888,9 @@ to bench (args string) gives u64
     have_sound = false
     sys.profile_start()
     new t0 = sys.time()
+    new c0 = read_sysreg(cntvct_el0)
+    new i0 = h264par.idle_of(vd, 0)
+    new i1 = h264par.idle_of(vd, 1)
     new sum u64 = 0
     new summing u64 = 0                 -- ms spent on the checksum, left out
     while next_picture(0, true)
@@ -882,6 +921,13 @@ to bench (args string) gives u64
     line.add(addr of out, " helper cores, pictures ")
     line.hex(addr of out, sum)
     line.byte(addr of out, 10)
+    if vd.lane_count > 0
+        new elapsed = read_sysreg(cntvct_el0) - c0
+        line.add(addr of out, "bench: lanes waiting ")
+        line.number(addr of out, (h264par.idle_of(vd, 0) - i0) * 100 / elapsed)
+        line.add(addr of out, "% and ")
+        line.number(addr of out, (h264par.idle_of(vd, 1) - i1) * 100 / elapsed)
+        line.add(addr of out, "% of the time\n")
     sys.print(line.text(addr of out))
     sys.close(handle)
     give 0
@@ -917,6 +963,38 @@ to main gives u64
         sys.print("video: no screen\n")
         give 1
     sys.want_pointer(true)
+    if args.len > 9 and files.same(args[0 until 9], "convtest ")
+        -- time converting one picture, into the screen surface and into plain memory
+        new one line.line
+        line.add(addr of one, args[9 until args.len])
+        if not load(addr of one)
+            give 1
+        have_sound = false
+        if not next_picture(0, true)
+            give 1
+        place()
+        placed = true
+        new pic = last_pic
+        new t0 = read_sysreg(cntvct_el0)
+        for each r in 0 until 10
+            convert_rows(pic as u64, 0, 1)
+        new t1 = read_sysreg(cntvct_el0)
+        new saved = gfx.pixels
+        gfx.pixels = mem.alloc((gfx.width as u64) * (gfx.height as u64) * 4) as ptr u32
+        new t2 = read_sysreg(cntvct_el0)
+        for each r in 0 until 10
+            convert_rows(pic as u64, 0, 1)
+        new t3 = read_sysreg(cntvct_el0)
+        gfx.pixels = saved
+        new f = read_sysreg(cntfrq_el0)
+        new out line.line
+        line.add(addr of out, "convtest: one picture in ")
+        line.number(addr of out, (t1 - t0) * 100_000 / f / 10)
+        line.add(addr of out, " us x10 into the surface, ")
+        line.number(addr of out, (t3 - t2) * 100_000 / f / 10)
+        line.add(addr of out, " us x10 into memory\n")
+        sys.print(line.text(addr of out))
+        give 0
     if args.len > 5 and files.same(args[0 until 5], "play ")
         -- one file, straight away (the report goes to the serial console)
         new one line.line

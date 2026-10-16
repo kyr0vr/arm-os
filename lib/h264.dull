@@ -288,7 +288,7 @@ to slot_pic (d ptr h264state.decoder, slot u64) gives ptr h264state.picture
 to new_slot (d ptr h264state.decoder) gives u64
     for each i in 0 until h264state.max_pics
         new p = slot_pic(d, i)
-        if p.used and (p.ref is not 0 or p.waiting)
+        if p.used and (p.ref is not 0 or p.waiting or not p.rebuilt or p.held)
             skip
         if p.alloc_w is not d.s.mb_w or p.alloc_h is not d.s.mb_h
             new w = (d.s.mb_w as u64) * 16
@@ -311,22 +311,6 @@ to new_slot (d ptr h264state.decoder) gives u64
         p.waiting = false
         give i
     give 0                                              -- the stream needs too many pictures
-
--- Copy the edge samples outwards into the border.
-to pad_plane (p ptr u8, stride u64, w u64, h u64, border u64)
-    for each y in 0 until h
-        new row = p + y * stride
-        for each k in 1 until border + 1
-            ((row as i64 - k as i64) as ptr u8)[0] = row[0]
-            row[w - 1 + k] = row[w - 1]
-    for each k in 1 until border + 1
-        new top = (p as i64 - (k * stride + border) as i64) as ptr u8
-        new first = (p as i64 - border as i64) as ptr u8
-        new bottom = p + (h - 1 + k) * stride - border
-        new last = p + (h - 1) * stride - border
-        for each x in 0 until w + 2 * border
-            top[x] = first[x]
-            bottom[x] = last[x]
 
 to start_picture (d ptr h264state.decoder)
     if d.idr
@@ -351,11 +335,6 @@ to finish_picture (d ptr h264state.decoder)
         give
     d.pic_done = true
     h264par.finish(d)
-    new w = (d.s.mb_w as u64) * 16
-    new h = (d.s.mb_h as u64) * 16
-    pad_plane(d.cur.y, d.cur.stride, w, h, h264state.pad)
-    pad_plane(d.cur.u, d.cur.cstride, w / 2, h / 2, h264state.cpad)
-    pad_plane(d.cur.v, d.cur.cstride, w / 2, h / 2, h264state.cpad)
     mark(d)
     d.cur.waiting = true
     if d.s.poc_type is 0 and d.nal_ref is not 0
@@ -385,11 +364,18 @@ to frame (d ptr h264state.decoder, flush bool) gives ptr h264state.picture
     -- keep a slot free for the next picture
     if not flush and waiting <= limit and busy + 1 < h264state.max_pics
         give 0 as ptr h264state.picture
+    -- it may still be being rebuilt
+    if not best.rebuilt
+        if not flush
+            give 0 as ptr h264state.picture
+        while not best.rebuilt
+            dmb()
     best.waiting = false
     give best
 
 -- Forget every picture (before decoding from another key frame, after a seek).
 to reset (d ptr h264state.decoder)
+    h264par.drain(d)
     for each i in 0 until h264state.max_pics
         new p = slot_pic(d, i)
         p.ref = 0
@@ -862,10 +848,10 @@ to set_qp (d ptr h264state.decoder, m ptr h264state.mbinfo)
 
 to skip_mb (d ptr h264state.decoder)
     new m = h264state.mb(d, d.mba)
-    if d.stype is 0
-        h264motion.p_skip(d, m)
-    else
-        h264motion.b_skip(d, m)
+    m.kind = h264state.k_skip
+    if d.stype is 1
+        m.btype = 0
+        m.direct = 0xFFFF
     set_qp(d, m)
     d.prev_qpd = 0
 

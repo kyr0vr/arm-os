@@ -342,20 +342,39 @@ to direct_motion (d ptr h264state.decoder, m ptr h264state.mbinfo, b8 u64)
         v[4] = 0
         set_motion(d, m, rect(x, y, 4, 4), 1, addr of v[0])
 
-to b_skip (d ptr h264state.decoder, m ptr h264state.mbinfo)
-    m.kind = h264state.k_skip
-    m.btype = 0
-    for each b8 in 0 until 4
-        direct_motion(d, m, b8)
-
 -- ---------------------------------------------------------------- partitions
+--
+-- The parser (`inter`) reads only the syntax: partition and sub-partition types,
+-- reference indexes and mvds, which it keeps in the macroblock's record (contexts of
+-- later syntax depend on nothing else). The motion itself (`derive`) is worked out
+-- when the macroblock is rebuilt, in the same order as the standard gives.
 
--- One (sub-)partition's mvd and motion vector, list `lst`.
-to part_mv (d ptr h264state.decoder, m ptr h264state.mbinfo, lst u64, ref i32, r u64, rule u32)
-    new x = (r & 255) as i32
-    new y = ((r >> 8) & 255) as i32
-    new dx = h264mb.mvd(d, lst, 0, x, y)
-    new dy = h264mb.mvd(d, lst, 1, x, y)
+to part_xy (r u64) gives u64
+    give h264state.blk_at[((r >> 8) & 255) / 4 * 4 + (r & 255) / 4] as u64
+
+-- Read one (sub-)partition's mvd for list `lst` and keep it with its blocks.
+to parse_mvd (d ptr h264state.decoder, m ptr h264state.mbinfo, lst u64, r u64)
+    new x = r & 255
+    new y = (r >> 8) & 255
+    new w = (r >> 16) & 255
+    new h = (r >> 24) & 255
+    new dx = h264mb.mvd(d, lst, 0, x as i32, y as i32)
+    new dy = h264mb.mvd(d, lst, 1, x as i32, y as i32)
+    new cx = cap(dx)
+    new cy = cap(dy)
+    for each by in y / 4 until (y + h) / 4
+        for each bx in x / 4 until (x + w) / 4
+            new k = (lst * 16 + h264state.blk_at[by * 4 + bx] as u64) * 2
+            m.mvd[k] = cx
+            m.mvd[k + 1] = cy
+            m.mvs[k] = dx as i16
+            m.mvs[k + 1] = dy as i16
+
+-- One (sub-)partition's motion vector from its kept mvd.
+to derive_mv (d ptr h264state.decoder, m ptr h264state.mbinfo, lst u64, ref i32, r u64, rule u32)
+    new k = (lst * 16 + part_xy(r)) * 2
+    new dx = m.mvs[k] as i32
+    new dy = m.mvs[k + 1] as i32
     new p [2] i32
     mv_pred(d, m, lst, ref, r, rule, addr of p[0])
     new v [5] i32
@@ -366,47 +385,154 @@ to part_mv (d ptr h264state.decoder, m ptr h264state.mbinfo, lst u64, ref i32, r
     v[4] = ref
     set_motion(d, m, r, lst, addr of v[0])
 
--- A P or B macroblock that is not skipped and not intra. Gives true if the 8x8
--- transform may be used (no partitions smaller than 8x8).
+-- Where sub-partition s of 8x8 block b8 is, for sub-macroblock type `sub`.
+to sub_rect (is_b bool, sub u64, b8 u64, s u64) gives u64
+    new bx = (b8 % 2) * 8
+    new by = (b8 / 2) * 8
+    new count = ps_count[sub] as u64
+    new w = ps_w[sub] as u64
+    new h = ps_h[sub] as u64
+    if is_b
+        count = bs_count[sub] as u64
+        w = bs_w[sub] as u64
+        h = bs_h[sub] as u64
+    new sx = bx
+    new sy = by
+    if count is 4
+        sx = bx + (s % 2) * 4
+        sy = by + (s / 2) * 4
+    else if w is 8
+        sy = by + s * h
+    else
+        sx = bx + s * w
+    give rect(sx, sy, w, h)
+
+to sub_count (is_b bool, sub u64) gives u64
+    if is_b
+        give bs_count[sub] as u64
+    give ps_count[sub] as u64
+
+-- Partition p of a 16x16, 16x8 or 8x16 macroblock (form 0, 1, 2).
+to big_rect (form u32, p u64) gives u64
+    if form is 0
+        give rect(0, 0, 16, 16)
+    if form is 1
+        give rect(0, p * 8, 16, 8)
+    give rect(p * 8, 0, 8, 16)
+
+to form_of (is_b bool, mtype i32) gives u32
+    if is_b
+        give b_shape[mtype as u64] as u32
+    give mtype as u32
+
+to pred_of (is_b bool, mtype i32, p u64) gives u8
+    if not is_b
+        give 1
+    if p is 0
+        give b_pred0[mtype as u64]
+    give b_pred1[mtype as u64]
+
+-- A P or B macroblock that is not skipped and not intra: its syntax. Gives true if
+-- the 8x8 transform may be used (no partitions smaller than 8x8).
 to inter (d ptr h264state.decoder, m ptr h264state.mbinfo, mtype i32) gives bool
     new is_b = d.stype is 1
     m.kind = h264state.k_p
     m.btype = -1
+    m.mtype = mtype
     if is_b
         m.kind = h264state.k_b
         m.btype = mtype
     for each k in 0 until 8
         m.ref[k] = -1
     if is_b and mtype is 0                              -- B_Direct_16x16
-        for each b8 in 0 until 4
-            direct_motion(d, m, b8)
+        m.direct = 0xFFFF
         give d.s.direct8
     new lists u64 = 1
     if is_b
         lists = 2
     if (not is_b and mtype is 3) or (is_b and mtype is 22)
-        new subs [4] u32
         for each b8 in 0 until 4
             if is_b
-                subs[b8] = h264mb.b_sub(d)
+                m.subs[b8] = h264mb.b_sub(d) as u8
             else
-                subs[b8] = h264mb.p_sub(d)
-            if is_b and subs[b8] is 0
+                m.subs[b8] = h264mb.p_sub(d) as u8
+            if is_b and m.subs[b8] is 0
                 m.direct = m.direct | ((15 as u32) << (b8 * 4) as u32)
-        new refs [8] i32                                -- [list * 4 + b8]
-        for each k in 0 until 8
-            refs[k] = -1
         for each lst in 0 until lists
             for each b8 in 0 until 4
+                new sub = m.subs[b8] as u64
                 new pred u8 = 1
                 if is_b
-                    pred = bs_pred[subs[b8] as u64]
-                if (not is_b or subs[b8] is not 0) and uses(pred, lst)
-                    refs[lst * 4 + b8] = h264mb.ref_idx(d, m, lst, ((b8 % 2) * 8) as i32, ((b8 / 2) * 8) as i32)
-                    m.ref[lst * 4 + b8] = refs[lst * 4 + b8] as i8
+                    pred = bs_pred[sub]
+                if (not is_b or sub is not 0) and uses(pred, lst)
+                    m.ref[lst * 4 + b8] = h264mb.ref_idx(d, m, lst, ((b8 % 2) * 8) as i32, ((b8 / 2) * 8) as i32) as i8
+        for each lst in 0 until lists
+            for each b8 in 0 until 4
+                new sub = m.subs[b8] as u64
+                if is_b and sub is 0
+                    skip
+                new pred u8 = 1
+                if is_b
+                    pred = bs_pred[sub]
+                if uses(pred, lst)
+                    for each s in 0 until sub_count(is_b, sub)
+                        parse_mvd(d, m, lst, sub_rect(is_b, sub, b8, s))
+        new ok = true
+        for each b8 in 0 until 4
+            new sub = m.subs[b8] as u64
+            if is_b
+                if sub is 0
+                    if not d.s.direct8
+                        ok = false
+                else if bs_w[sub] < 8 or bs_h[sub] < 8
+                    ok = false
+            else if sub is not 0
+                ok = false
+        give ok
+    -- 16x16, 16x8, 8x16
+    new form = form_of(is_b, mtype)
+    new count u64 = 2
+    if form is 0
+        count = 1
+    for each lst in 0 until lists
+        for each p in 0 until count
+            if uses(pred_of(is_b, mtype, p), lst)
+                new r = big_rect(form, p)
+                new x = r & 255
+                new y = (r >> 8) & 255
+                new ref = h264mb.ref_idx(d, m, lst, x as i32, y as i32)
+                for each by in y / 4 until (y + ((r >> 24) & 255)) / 4
+                    for each bx in x / 4 until (x + ((r >> 16) & 255)) / 4
+                        m.ref[lst * 4 + h264state.blk_at[by * 4 + bx] as u64 / 4] = ref as i8
+    for each lst in 0 until lists
+        for each p in 0 until count
+            if uses(pred_of(is_b, mtype, p), lst)
+                parse_mvd(d, m, lst, big_rect(form, p))
+    give true
+
+-- The motion of a P or B macroblock (also skipped ones) from its syntax, before its
+-- samples are predicted. d.done starts empty.
+to derive (d ptr h264state.decoder, m ptr h264state.mbinfo)
+    new is_b = d.stype is 1
+    if m.kind is h264state.k_skip
+        if is_b
+            for each b8 in 0 until 4
+                direct_motion(d, m, b8)
+        else
+            p_skip(d, m)
+        give
+    new mtype = m.mtype
+    if is_b and mtype is 0
+        for each b8 in 0 until 4
+            direct_motion(d, m, b8)
+        give
+    new lists u64 = 1
+    if is_b
+        lists = 2
+    if (not is_b and mtype is 3) or (is_b and mtype is 22)
         -- direct sub-blocks get their motion first (it does not depend on order)
         for each b8 in 0 until 4
-            if is_b and subs[b8] is 0
+            if is_b and m.subs[b8] is 0
                 new saved0 = d.done[0]
                 new saved1 = d.done[1]
                 direct_motion(d, m, b8)
@@ -414,89 +540,28 @@ to inter (d ptr h264state.decoder, m ptr h264state.mbinfo, mtype i32) gives bool
                 d.done[1] = saved1
         for each lst in 0 until lists
             for each b8 in 0 until 4
-                new bx = (b8 % 2) * 8
-                new by = (b8 / 2) * 8
-                if is_b and subs[b8] is 0
+                new sub = m.subs[b8] as u64
+                if is_b and sub is 0
                     d.done[lst] = d.done[lst] | ((15 as u32) << (b8 * 4) as u32)
                     skip
-                new count = ps_count[subs[b8] as u64] as u64
-                new w = ps_w[subs[b8] as u64] as u64
-                new h = ps_h[subs[b8] as u64] as u64
                 new pred u8 = 1
                 if is_b
-                    count = bs_count[subs[b8] as u64] as u64
-                    w = bs_w[subs[b8] as u64] as u64
-                    h = bs_h[subs[b8] as u64] as u64
-                    pred = bs_pred[subs[b8] as u64]
-                for each s in 0 until count
-                    new sx = bx
-                    new sy = by
-                    if count is 4
-                        sx = bx + (s % 2) * 4
-                        sy = by + (s / 2) * 4
-                    else if w is 8
-                        sy = by + s * h
-                    else
-                        sx = bx + s * w
+                    pred = bs_pred[sub]
+                for each s in 0 until sub_count(is_b, sub)
+                    new r = sub_rect(is_b, sub, b8, s)
                     if uses(pred, lst)
-                        part_mv(d, m, lst, refs[lst * 4 + b8], rect(sx, sy, w, h), 0)
+                        derive_mv(d, m, lst, m.ref[lst * 4 + b8] as i32, r, 0)
                     else
-                        set_none(d, m, rect(sx, sy, w, h), lst)
-        new ok = true
-        for each b8 in 0 until 4
-            if is_b
-                if subs[b8] is 0
-                    if not d.s.direct8
-                        ok = false
-                else if bs_w[subs[b8] as u64] < 8 or bs_h[subs[b8] as u64] < 8
-                    ok = false
-            else if subs[b8] is not 0
-                ok = false
-        give ok
-    -- 16x16, 16x8, 8x16
-    new form = mtype as u32
-    new preds [2] u8
-    preds[0] = 1
-    preds[1] = 1
-    if is_b
-        form = b_shape[mtype as u64] as u32
-        preds[0] = b_pred0[mtype as u64]
-        preds[1] = b_pred1[mtype as u64]
+                        set_none(d, m, r, lst)
+        give
+    new form = form_of(is_b, mtype)
     new count u64 = 2
-    new w u64 = 16
-    new h u64 = 16
     if form is 0
         count = 1
-    else if form is 1
-        h = 8
-    else
-        w = 8
-    new refs [4] i32                                    -- [list * 2 + part]
-    for each k in 0 until 4
-        refs[k] = -1
     for each lst in 0 until lists
         for each p in 0 until count
-            if uses(preds[p], lst)
-                new x u64 = 0
-                new y u64 = 0
-                if p is 1 and form is 1
-                    y = 8
-                if p is 1 and form is 2
-                    x = 8
-                refs[lst * 2 + p] = h264mb.ref_idx(d, m, lst, x as i32, y as i32)
-                for each by in y / 4 until (y + h) / 4
-                    for each bx in x / 4 until (x + w) / 4
-                        m.ref[lst * 4 + h264state.block_at(bx, by) / 4] = refs[lst * 2 + p] as i8
-    for each lst in 0 until lists
-        for each p in 0 until count
-            new x u64 = 0
-            new y u64 = 0
-            if p is 1 and form is 1
-                y = 8
-            if p is 1 and form is 2
-                x = 8
-            if uses(preds[p], lst)
-                part_mv(d, m, lst, refs[lst * 2 + p], rect(x, y, w, h), form | ((p as u32) << 8))
+            new r = big_rect(form, p)
+            if uses(pred_of(is_b, mtype, p), lst)
+                derive_mv(d, m, lst, m.ref[lst * 4 + part_xy(r) / 4] as i32, r, form | ((p as u32) << 8))
             else
-                set_none(d, m, rect(x, y, w, h), lst)
-    give true
+                set_none(d, m, r, lst)

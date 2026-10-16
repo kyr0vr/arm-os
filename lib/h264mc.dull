@@ -537,11 +537,89 @@ to predict (d ptr h264state.decoder, x u64, y u64, w u64, h u64, refs ptr i32, m
         new g = 8 | ((w / 2) << 8) | ((h / 2) << 16) | ((cd as u64) << 24)
         weigh_two(addr of d.tmp[512 + c * 128], addr of d.tmp[768 + c * 128], addr of d.pred_c[c * 64 + (y / 2) * 8 + x / 2], g, cw[c], cw[2 + c], (co[c] + co[2 + c] + 1) >> 1)
 
+-- NEON weighting, 4 samples at a time (blocks a multiple of 4 wide): the rounding
+-- shift right by a register (srshl by minus the shift) adds the same half as the
+-- sums above, and smax/smin clamp to 0..255.
+to weigh2_neon (a u64, b u64, out u64, g u64, w0 i32, w1 i32, o i32)
+    asm
+        "dup v16.4s, {w0}"
+        "dup v17.4s, {w1}"
+        "dup v18.4s, {o}"
+        "ubfx x16, {g}, #24, #8"
+        "add x16, x16, #1"
+        "sub x16, xzr, x16"
+        "dup v19.4s, w16"
+        "movi v20.4s, #0"
+        "movi v21.4s, #255"
+        "ubfx x17, {g}, #8, #8"
+        "lsr x17, x17, #2"
+        "ubfx x4, {g}, #16, #8"
+        "and x5, {g}, #255"
+        "lsl x5, x5, #2"
+        "1:"
+        "mov x6, {a}"
+        "mov x7, {b}"
+        "mov x8, {out}"
+        "mov x3, x17"
+        "2:"
+        "ld1 {v0.4s}, [x6], #16"
+        "ld1 {v1.4s}, [x7], #16"
+        "mul v0.4s, v0.4s, v16.4s"
+        "mla v0.4s, v1.4s, v17.4s"
+        "srshl v0.4s, v0.4s, v19.4s"
+        "add v0.4s, v0.4s, v18.4s"
+        "smax v0.4s, v0.4s, v20.4s"
+        "smin v0.4s, v0.4s, v21.4s"
+        "st1 {v0.4s}, [x8], #16"
+        "subs x3, x3, #1"
+        "b.ne 2b"
+        "add {a}, {a}, #64"
+        "add {b}, {b}, #64"
+        "add {out}, {out}, x5"
+        "subs x4, x4, #1"
+        "b.ne 1b"
+
+to weigh1_neon (src u64, out u64, g u64, wt i32, o i32)
+    asm
+        "dup v16.4s, {wt}"
+        "dup v18.4s, {o}"
+        "ubfx x16, {g}, #24, #8"
+        "sub x16, xzr, x16"
+        "dup v19.4s, w16"
+        "movi v20.4s, #0"
+        "movi v21.4s, #255"
+        "ubfx x17, {g}, #8, #8"
+        "lsr x17, x17, #2"
+        "ubfx x4, {g}, #16, #8"
+        "and x5, {g}, #255"
+        "lsl x5, x5, #2"
+        "1:"
+        "mov x6, {src}"
+        "mov x8, {out}"
+        "mov x3, x17"
+        "2:"
+        "ld1 {v0.4s}, [x6], #16"
+        "mul v0.4s, v0.4s, v16.4s"
+        "srshl v0.4s, v0.4s, v19.4s"
+        "add v0.4s, v0.4s, v18.4s"
+        "smax v0.4s, v0.4s, v20.4s"
+        "smin v0.4s, v0.4s, v21.4s"
+        "st1 {v0.4s}, [x8], #16"
+        "subs x3, x3, #1"
+        "b.ne 2b"
+        "add {src}, {src}, #64"
+        "add {out}, {out}, x5"
+        "subs x4, x4, #1"
+        "b.ne 1b"
+
 -- Explicit weighting of one prediction (8.4.2.3): src rows are 16 apart.
 -- g: out's row stride | w << 8 | h << 16 | log2 denominator << 24
 to weigh_one (src ptr i32, out ptr i32, g u64, wt i32, o i32)
     new os = g & 255
     new w = (g >> 8) & 255
+    if w % 4 is 0
+        weigh1_neon(src as u64, out as u64, g, wt, o)
+        give
     new h = (g >> 16) & 255
     new denom = (g >> 24) as u32
     new round i32 = 0
@@ -562,6 +640,9 @@ to weigh_one (src ptr i32, out ptr i32, g u64, wt i32, o i32)
 to weigh_two (a ptr i32, b ptr i32, out ptr i32, g u64, w0 i32, w1 i32, o i32)
     new os = g & 255
     new w = (g >> 8) & 255
+    if w % 4 is 0
+        weigh2_neon(a as u64, b as u64, out as u64, g, w0, w1, o)
+        give
     new h = (g >> 16) & 255
     new denom = (g >> 24) as u32
     new round = (1 as i32) << denom

@@ -5,11 +5,15 @@ use h264state
 use h264tables
 
 to far (p ptr h264state.mbinfo, pl u64, pb u64, q ptr h264state.mbinfo, ql u64, qb u64) gives bool
-    new dx = h264state.abs(p.mv[(pl * 16 + pb) * 2] as i32 - q.mv[(ql * 16 + qb) * 2] as i32)
-    new dy = h264state.abs(p.mv[(pl * 16 + pb) * 2 + 1] as i32 - q.mv[(ql * 16 + qb) * 2 + 1] as i32)
-    give dx >= 4 or dy >= 4
+    new kp = (pl * 16 + pb) * 2
+    new kq = (ql * 16 + qb) * 2
+    new dx = p.mv[kp] as i32 - q.mv[kq] as i32
+    new dy = p.mv[kp + 1] as i32 - q.mv[kq + 1] as i32
+    give dx >= 4 or dx <= -4 or dy >= 4 or dy <= -4
 
--- bS between block pb of P and block qb of Q.
+-- bS between block pb of P and block qb of Q (8.7.2.1). A list a block does not
+-- use has picture id 0, so the two blocks use the same pictures when their id pairs
+-- match either way round.
 to strength (p ptr h264state.mbinfo, pb u64, q ptr h264state.mbinfo, qb u64, mb_edge bool) gives u32
     if p.intra or q.intra
         if mb_edge
@@ -17,48 +21,380 @@ to strength (p ptr h264state.mbinfo, pb u64, q ptr h264state.mbinfo, qb u64, mb_
         give 3
     if (p.nz >> pb as u32) & 1 is 1 or (q.nz >> qb as u32) & 1 is 1
         give 2
-    new pr [2] u32
-    new pl [2] u64
-    new np u64 = 0
-    new qr [2] u32
-    new ql [2] u64
-    new nq u64 = 0
-    for each l in 0 until 2
-        if p.ref[l * 4 + pb / 4] >= 0
-            pr[np] = p.refpic[l * 4 + pb / 4]
-            pl[np] = l
-            np += 1
-        if q.ref[l * 4 + qb / 4] >= 0
-            qr[nq] = q.refpic[l * 4 + qb / 4]
-            ql[nq] = l
-            nq += 1
-    if np is not nq
-        give 1
-    if np is 1
-        if pr[0] is not qr[0]
-            give 1
-        if far(p, pl[0], pb, q, ql[0], qb)
-            give 1
-        give 0
-    if np is 0
-        give 0
-    new straight = pr[0] is qr[0] and pr[1] is qr[1]
-    new crossed = pr[0] is qr[1] and pr[1] is qr[0]
+    new p8 = pb / 4
+    new q8 = qb / 4
+    new pr0 = p.refpic[p8]
+    new pr1 = p.refpic[4 + p8]
+    new qr0 = q.refpic[q8]
+    new qr1 = q.refpic[4 + q8]
+    new straight = pr0 is qr0 and pr1 is qr1
+    new crossed = pr0 is qr1 and pr1 is qr0
     if not straight and not crossed
         give 1
-    if pr[0] is not pr[1]
-        if straight
-            if far(p, pl[0], pb, q, ql[0], qb) or far(p, pl[1], pb, q, ql[1], qb)
-                give 1
+    if pr0 is 0 or pr1 is 0
+        if pr0 is 0 and pr1 is 0
             give 0
-        if far(p, pl[0], pb, q, ql[1], qb) or far(p, pl[1], pb, q, ql[0], qb)
+        -- one list each
+        new lp u64 = 0
+        if pr0 is 0
+            lp = 1
+        new lq u64 = 0
+        if qr0 is 0
+            lq = 1
+        if far(p, lp, pb, q, lq, qb)
             give 1
         give 0
-    new a = far(p, pl[0], pb, q, ql[0], qb) or far(p, pl[1], pb, q, ql[1], qb)
-    new b = far(p, pl[0], pb, q, ql[1], qb) or far(p, pl[1], pb, q, ql[0], qb)
-    if a and b
+    if pr0 is not pr1
+        if straight
+            if far(p, 0, pb, q, 0, qb) or far(p, 1, pb, q, 1, qb)
+                give 1
+            give 0
+        if far(p, 0, pb, q, 1, qb) or far(p, 1, pb, q, 0, qb)
+            give 1
+        give 0
+    -- both lists from the same picture: either pairing may hold
+    if (far(p, 0, pb, q, 0, qb) or far(p, 1, pb, q, 1, qb)) and (far(p, 0, pb, q, 1, qb) or far(p, 1, pb, q, 0, qb))
         give 1
     give 0
+
+-- NEON: the luma filter for bS 1-3 on 16 lines at once (8.7.2.3), for a horizontal
+-- edge (rows above and below s are each 16 samples of the 16 lines) or a vertical
+-- one (16 rows, each line's 8 samples, turned to columns and back). k: alpha, beta,
+-- then from byte 16 each line's tc0, then 0xFF for each line to filter.
+to luma_rows_neon (s u64, stride u64, k u64)
+    asm
+        "ldrb w16, [{k}]"
+        "dup v16.16b, w16"
+        "ldrb w16, [{k}, #1]"
+        "dup v17.16b, w16"
+        "add x16, {k}, #16"
+        "ld1 {v18.16b, v19.16b}, [x16]"
+        "mov x17, #3"
+        "mul x17, x17, {stride}"
+        "sub x16, {s}, x17"
+        "ld1 {v0.16b}, [x16], {stride}"
+        "ld1 {v1.16b}, [x16], {stride}"
+        "ld1 {v2.16b}, [x16], {stride}"
+        "ld1 {v3.16b}, [x16], {stride}"
+        "ld1 {v4.16b}, [x16], {stride}"
+        "ld1 {v5.16b}, [x16], {stride}"
+        "uabd v20.16b, v2.16b, v3.16b"
+        "cmhi v20.16b, v16.16b, v20.16b"
+        "uabd v21.16b, v1.16b, v2.16b"
+        "cmhi v21.16b, v17.16b, v21.16b"
+        "and v20.16b, v20.16b, v21.16b"
+        "uabd v21.16b, v4.16b, v3.16b"
+        "cmhi v21.16b, v17.16b, v21.16b"
+        "and v20.16b, v20.16b, v21.16b"
+        "and v20.16b, v20.16b, v19.16b"
+        "uabd v22.16b, v0.16b, v2.16b"
+        "cmhi v22.16b, v17.16b, v22.16b"
+        "and v22.16b, v22.16b, v20.16b"
+        "uabd v23.16b, v5.16b, v3.16b"
+        "cmhi v23.16b, v17.16b, v23.16b"
+        "and v23.16b, v23.16b, v20.16b"
+        "sub v24.16b, v18.16b, v22.16b"
+        "sub v24.16b, v24.16b, v23.16b"
+        "urhadd v25.16b, v2.16b, v3.16b"
+        "usubl v26.8h, v3.8b, v2.8b"
+        "shl v26.8h, v26.8h, #2"
+        "usubl v27.8h, v1.8b, v4.8b"
+        "add v26.8h, v26.8h, v27.8h"
+        "srshr v26.8h, v26.8h, #3"
+        "uxtl v27.8h, v24.8b"
+        "smin v26.8h, v26.8h, v27.8h"
+        "neg v27.8h, v27.8h"
+        "smax v26.8h, v26.8h, v27.8h"
+        "uxtl v28.8h, v2.8b"
+        "add v28.8h, v28.8h, v26.8h"
+        "sqxtun v30.8b, v28.8h"
+        "uxtl v28.8h, v3.8b"
+        "sub v28.8h, v28.8h, v26.8h"
+        "sqxtun v31.8b, v28.8h"
+        "uaddl v28.8h, v0.8b, v25.8b"
+        "uxtl v29.8h, v1.8b"
+        "shl v29.8h, v29.8h, #1"
+        "sub v28.8h, v28.8h, v29.8h"
+        "sshr v28.8h, v28.8h, #1"
+        "uxtl v29.8h, v18.8b"
+        "smin v28.8h, v28.8h, v29.8h"
+        "neg v29.8h, v29.8h"
+        "smax v28.8h, v28.8h, v29.8h"
+        "uxtl v29.8h, v1.8b"
+        "add v28.8h, v28.8h, v29.8h"
+        "xtn v6.8b, v28.8h"
+        "uaddl v28.8h, v5.8b, v25.8b"
+        "uxtl v29.8h, v4.8b"
+        "shl v29.8h, v29.8h, #1"
+        "sub v28.8h, v28.8h, v29.8h"
+        "sshr v28.8h, v28.8h, #1"
+        "uxtl v29.8h, v18.8b"
+        "smin v28.8h, v28.8h, v29.8h"
+        "neg v29.8h, v29.8h"
+        "smax v28.8h, v28.8h, v29.8h"
+        "uxtl v29.8h, v4.8b"
+        "add v28.8h, v28.8h, v29.8h"
+        "xtn v7.8b, v28.8h"
+        "usubl2 v26.8h, v3.16b, v2.16b"
+        "shl v26.8h, v26.8h, #2"
+        "usubl2 v27.8h, v1.16b, v4.16b"
+        "add v26.8h, v26.8h, v27.8h"
+        "srshr v26.8h, v26.8h, #3"
+        "uxtl2 v27.8h, v24.16b"
+        "smin v26.8h, v26.8h, v27.8h"
+        "neg v27.8h, v27.8h"
+        "smax v26.8h, v26.8h, v27.8h"
+        "uxtl2 v28.8h, v2.16b"
+        "add v28.8h, v28.8h, v26.8h"
+        "sqxtun2 v30.16b, v28.8h"
+        "uxtl2 v28.8h, v3.16b"
+        "sub v28.8h, v28.8h, v26.8h"
+        "sqxtun2 v31.16b, v28.8h"
+        "uaddl2 v28.8h, v0.16b, v25.16b"
+        "uxtl2 v29.8h, v1.16b"
+        "shl v29.8h, v29.8h, #1"
+        "sub v28.8h, v28.8h, v29.8h"
+        "sshr v28.8h, v28.8h, #1"
+        "uxtl2 v29.8h, v18.16b"
+        "smin v28.8h, v28.8h, v29.8h"
+        "neg v29.8h, v29.8h"
+        "smax v28.8h, v28.8h, v29.8h"
+        "uxtl2 v29.8h, v1.16b"
+        "add v28.8h, v28.8h, v29.8h"
+        "xtn2 v6.16b, v28.8h"
+        "uaddl2 v28.8h, v5.16b, v25.16b"
+        "uxtl2 v29.8h, v4.16b"
+        "shl v29.8h, v29.8h, #1"
+        "sub v28.8h, v28.8h, v29.8h"
+        "sshr v28.8h, v28.8h, #1"
+        "uxtl2 v29.8h, v18.16b"
+        "smin v28.8h, v28.8h, v29.8h"
+        "neg v29.8h, v29.8h"
+        "smax v28.8h, v28.8h, v29.8h"
+        "uxtl2 v29.8h, v4.16b"
+        "add v28.8h, v28.8h, v29.8h"
+        "xtn2 v7.16b, v28.8h"
+        "bit v2.16b, v30.16b, v20.16b"
+        "bit v3.16b, v31.16b, v20.16b"
+        "bit v1.16b, v6.16b, v22.16b"
+        "bit v4.16b, v7.16b, v23.16b"
+        "sub x16, {s}, {stride}"
+        "sub x16, x16, {stride}"
+        "st1 {v1.16b}, [x16], {stride}"
+        "st1 {v2.16b}, [x16], {stride}"
+        "st1 {v3.16b}, [x16], {stride}"
+        "st1 {v4.16b}, [x16], {stride}"
+
+to luma_columns_neon (s u64, stride u64, k u64)
+    asm
+        "sub x16, {s}, #4"
+        "lsl x17, {stride}, #3"
+        "add x17, x16, x17"
+        "ld1 {v0.8b}, [x16], {stride}"
+        "ld1 {v16.8b}, [x17], {stride}"
+        "zip1 v0.2d, v0.2d, v16.2d"
+        "ld1 {v1.8b}, [x16], {stride}"
+        "ld1 {v16.8b}, [x17], {stride}"
+        "zip1 v1.2d, v1.2d, v16.2d"
+        "ld1 {v2.8b}, [x16], {stride}"
+        "ld1 {v16.8b}, [x17], {stride}"
+        "zip1 v2.2d, v2.2d, v16.2d"
+        "ld1 {v3.8b}, [x16], {stride}"
+        "ld1 {v16.8b}, [x17], {stride}"
+        "zip1 v3.2d, v3.2d, v16.2d"
+        "ld1 {v4.8b}, [x16], {stride}"
+        "ld1 {v16.8b}, [x17], {stride}"
+        "zip1 v4.2d, v4.2d, v16.2d"
+        "ld1 {v5.8b}, [x16], {stride}"
+        "ld1 {v16.8b}, [x17], {stride}"
+        "zip1 v5.2d, v5.2d, v16.2d"
+        "ld1 {v6.8b}, [x16], {stride}"
+        "ld1 {v16.8b}, [x17], {stride}"
+        "zip1 v6.2d, v6.2d, v16.2d"
+        "ld1 {v7.8b}, [x16], {stride}"
+        "ld1 {v16.8b}, [x17], {stride}"
+        "zip1 v7.2d, v7.2d, v16.2d"
+        "trn1 v16.16b, v0.16b, v1.16b"
+        "trn2 v17.16b, v0.16b, v1.16b"
+        "trn1 v18.16b, v2.16b, v3.16b"
+        "trn2 v19.16b, v2.16b, v3.16b"
+        "trn1 v20.16b, v4.16b, v5.16b"
+        "trn2 v21.16b, v4.16b, v5.16b"
+        "trn1 v22.16b, v6.16b, v7.16b"
+        "trn2 v23.16b, v6.16b, v7.16b"
+        "trn1 v24.8h, v16.8h, v18.8h"
+        "trn2 v26.8h, v16.8h, v18.8h"
+        "trn1 v25.8h, v17.8h, v19.8h"
+        "trn2 v27.8h, v17.8h, v19.8h"
+        "trn1 v28.8h, v20.8h, v22.8h"
+        "trn2 v30.8h, v20.8h, v22.8h"
+        "trn1 v29.8h, v21.8h, v23.8h"
+        "trn2 v31.8h, v21.8h, v23.8h"
+        "trn1 v8.4s, v24.4s, v28.4s"
+        "trn2 v12.4s, v24.4s, v28.4s"
+        "trn1 v9.4s, v25.4s, v29.4s"
+        "trn2 v13.4s, v25.4s, v29.4s"
+        "trn1 v10.4s, v26.4s, v30.4s"
+        "trn2 v14.4s, v26.4s, v30.4s"
+        "trn1 v11.4s, v27.4s, v31.4s"
+        "trn2 v15.4s, v27.4s, v31.4s"
+        "ldrb w16, [{k}]"
+        "dup v16.16b, w16"
+        "ldrb w16, [{k}, #1]"
+        "dup v17.16b, w16"
+        "add x16, {k}, #16"
+        "ld1 {v18.16b, v19.16b}, [x16]"
+        "uabd v20.16b, v11.16b, v12.16b"
+        "cmhi v20.16b, v16.16b, v20.16b"
+        "uabd v21.16b, v10.16b, v11.16b"
+        "cmhi v21.16b, v17.16b, v21.16b"
+        "and v20.16b, v20.16b, v21.16b"
+        "uabd v21.16b, v13.16b, v12.16b"
+        "cmhi v21.16b, v17.16b, v21.16b"
+        "and v20.16b, v20.16b, v21.16b"
+        "and v20.16b, v20.16b, v19.16b"
+        "uabd v22.16b, v9.16b, v11.16b"
+        "cmhi v22.16b, v17.16b, v22.16b"
+        "and v22.16b, v22.16b, v20.16b"
+        "uabd v23.16b, v14.16b, v12.16b"
+        "cmhi v23.16b, v17.16b, v23.16b"
+        "and v23.16b, v23.16b, v20.16b"
+        "sub v24.16b, v18.16b, v22.16b"
+        "sub v24.16b, v24.16b, v23.16b"
+        "urhadd v25.16b, v11.16b, v12.16b"
+        "usubl v26.8h, v12.8b, v11.8b"
+        "shl v26.8h, v26.8h, #2"
+        "usubl v27.8h, v10.8b, v13.8b"
+        "add v26.8h, v26.8h, v27.8h"
+        "srshr v26.8h, v26.8h, #3"
+        "uxtl v27.8h, v24.8b"
+        "smin v26.8h, v26.8h, v27.8h"
+        "neg v27.8h, v27.8h"
+        "smax v26.8h, v26.8h, v27.8h"
+        "uxtl v28.8h, v11.8b"
+        "add v28.8h, v28.8h, v26.8h"
+        "sqxtun v30.8b, v28.8h"
+        "uxtl v28.8h, v12.8b"
+        "sub v28.8h, v28.8h, v26.8h"
+        "sqxtun v31.8b, v28.8h"
+        "uaddl v28.8h, v9.8b, v25.8b"
+        "uxtl v29.8h, v10.8b"
+        "shl v29.8h, v29.8h, #1"
+        "sub v28.8h, v28.8h, v29.8h"
+        "sshr v28.8h, v28.8h, #1"
+        "uxtl v29.8h, v18.8b"
+        "smin v28.8h, v28.8h, v29.8h"
+        "neg v29.8h, v29.8h"
+        "smax v28.8h, v28.8h, v29.8h"
+        "uxtl v29.8h, v10.8b"
+        "add v28.8h, v28.8h, v29.8h"
+        "xtn v6.8b, v28.8h"
+        "uaddl v28.8h, v14.8b, v25.8b"
+        "uxtl v29.8h, v13.8b"
+        "shl v29.8h, v29.8h, #1"
+        "sub v28.8h, v28.8h, v29.8h"
+        "sshr v28.8h, v28.8h, #1"
+        "uxtl v29.8h, v18.8b"
+        "smin v28.8h, v28.8h, v29.8h"
+        "neg v29.8h, v29.8h"
+        "smax v28.8h, v28.8h, v29.8h"
+        "uxtl v29.8h, v13.8b"
+        "add v28.8h, v28.8h, v29.8h"
+        "xtn v7.8b, v28.8h"
+        "usubl2 v26.8h, v12.16b, v11.16b"
+        "shl v26.8h, v26.8h, #2"
+        "usubl2 v27.8h, v10.16b, v13.16b"
+        "add v26.8h, v26.8h, v27.8h"
+        "srshr v26.8h, v26.8h, #3"
+        "uxtl2 v27.8h, v24.16b"
+        "smin v26.8h, v26.8h, v27.8h"
+        "neg v27.8h, v27.8h"
+        "smax v26.8h, v26.8h, v27.8h"
+        "uxtl2 v28.8h, v11.16b"
+        "add v28.8h, v28.8h, v26.8h"
+        "sqxtun2 v30.16b, v28.8h"
+        "uxtl2 v28.8h, v12.16b"
+        "sub v28.8h, v28.8h, v26.8h"
+        "sqxtun2 v31.16b, v28.8h"
+        "uaddl2 v28.8h, v9.16b, v25.16b"
+        "uxtl2 v29.8h, v10.16b"
+        "shl v29.8h, v29.8h, #1"
+        "sub v28.8h, v28.8h, v29.8h"
+        "sshr v28.8h, v28.8h, #1"
+        "uxtl2 v29.8h, v18.16b"
+        "smin v28.8h, v28.8h, v29.8h"
+        "neg v29.8h, v29.8h"
+        "smax v28.8h, v28.8h, v29.8h"
+        "uxtl2 v29.8h, v10.16b"
+        "add v28.8h, v28.8h, v29.8h"
+        "xtn2 v6.16b, v28.8h"
+        "uaddl2 v28.8h, v14.16b, v25.16b"
+        "uxtl2 v29.8h, v13.16b"
+        "shl v29.8h, v29.8h, #1"
+        "sub v28.8h, v28.8h, v29.8h"
+        "sshr v28.8h, v28.8h, #1"
+        "uxtl2 v29.8h, v18.16b"
+        "smin v28.8h, v28.8h, v29.8h"
+        "neg v29.8h, v29.8h"
+        "smax v28.8h, v28.8h, v29.8h"
+        "uxtl2 v29.8h, v13.16b"
+        "add v28.8h, v28.8h, v29.8h"
+        "xtn2 v7.16b, v28.8h"
+        "bit v11.16b, v30.16b, v20.16b"
+        "bit v12.16b, v31.16b, v20.16b"
+        "bit v10.16b, v6.16b, v22.16b"
+        "bit v13.16b, v7.16b, v23.16b"
+        "trn1 v16.16b, v8.16b, v9.16b"
+        "trn2 v17.16b, v8.16b, v9.16b"
+        "trn1 v18.16b, v10.16b, v11.16b"
+        "trn2 v19.16b, v10.16b, v11.16b"
+        "trn1 v20.16b, v12.16b, v13.16b"
+        "trn2 v21.16b, v12.16b, v13.16b"
+        "trn1 v22.16b, v14.16b, v15.16b"
+        "trn2 v23.16b, v14.16b, v15.16b"
+        "trn1 v24.8h, v16.8h, v18.8h"
+        "trn2 v26.8h, v16.8h, v18.8h"
+        "trn1 v25.8h, v17.8h, v19.8h"
+        "trn2 v27.8h, v17.8h, v19.8h"
+        "trn1 v28.8h, v20.8h, v22.8h"
+        "trn2 v30.8h, v20.8h, v22.8h"
+        "trn1 v29.8h, v21.8h, v23.8h"
+        "trn2 v31.8h, v21.8h, v23.8h"
+        "trn1 v0.4s, v24.4s, v28.4s"
+        "trn2 v4.4s, v24.4s, v28.4s"
+        "trn1 v1.4s, v25.4s, v29.4s"
+        "trn2 v5.4s, v25.4s, v29.4s"
+        "trn1 v2.4s, v26.4s, v30.4s"
+        "trn2 v6.4s, v26.4s, v30.4s"
+        "trn1 v3.4s, v27.4s, v31.4s"
+        "trn2 v7.4s, v27.4s, v31.4s"
+        "sub x16, {s}, #4"
+        "lsl x17, {stride}, #3"
+        "add x17, x16, x17"
+        "ext v16.16b, v0.16b, v0.16b, #8"
+        "st1 {v0.8b}, [x16], {stride}"
+        "st1 {v16.8b}, [x17], {stride}"
+        "ext v16.16b, v1.16b, v1.16b, #8"
+        "st1 {v1.8b}, [x16], {stride}"
+        "st1 {v16.8b}, [x17], {stride}"
+        "ext v16.16b, v2.16b, v2.16b, #8"
+        "st1 {v2.8b}, [x16], {stride}"
+        "st1 {v16.8b}, [x17], {stride}"
+        "ext v16.16b, v3.16b, v3.16b, #8"
+        "st1 {v3.8b}, [x16], {stride}"
+        "st1 {v16.8b}, [x17], {stride}"
+        "ext v16.16b, v4.16b, v4.16b, #8"
+        "st1 {v4.8b}, [x16], {stride}"
+        "st1 {v16.8b}, [x17], {stride}"
+        "ext v16.16b, v5.16b, v5.16b, #8"
+        "st1 {v5.8b}, [x16], {stride}"
+        "st1 {v16.8b}, [x17], {stride}"
+        "ext v16.16b, v6.16b, v6.16b, #8"
+        "st1 {v6.8b}, [x16], {stride}"
+        "st1 {v16.8b}, [x17], {stride}"
+        "ext v16.16b, v7.16b, v7.16b, #8"
+        "st1 {v7.8b}, [x16], {stride}"
+        "st1 {v16.8b}, [x17], {stride}"
 
 -- One edge: `n` lines starting at `s`, `along` apart, each filtered across with
 -- `step`: p[-k * step] and q[k * step] (8.7.2).
@@ -82,6 +418,21 @@ to edge (ss ptr h264state.slicestate, s ptr u8, along i64, step i64, np u64, bs 
     new alpha = h264tables.alpha[(ia + 12) as u64] as i32
     new beta = h264tables.beta[(ib + 12) as u64] as i32
     new tcs = (addr of h264tables.tc0[0]) + ((ia + 12) as u64) * 4
+    if luma and n is 16 and bs[0] < 4 and bs[1] < 4 and bs[2] < 4 and bs[3] < 4
+        -- all 16 lines at once
+        new prm [48] u8
+        prm[0] = alpha as u8
+        prm[1] = beta as u8
+        for each k in 0 until 16
+            new b = bs[k >> 2]
+            if b is not 0
+                prm[16 + k] = tcs[b as u64] as u8
+                prm[32 + k] = 0xFF
+        if step is 1
+            luma_columns_neon(s as u64, along as u64, addr of prm[0] as u64)
+        else
+            luma_rows_neon(s as u64, step as u64, addr of prm[0] as u64)
+        give
     for each k in 0 until n
         new b = bs[k >> shift]
         if b is 0
@@ -213,11 +564,11 @@ to row (d ptr h264state.decoder, y u64)
                     new qb u64 = 0
                     new pb u64 = 0
                     if dir is 0
-                        qb = h264state.block_at(e, k)
-                        pb = h264state.block_at((e + 3) % 4, k)
+                        qb = h264state.blk_at[k * 4 + e] as u64
+                        pb = h264state.blk_at[k * 4 + (e + 3) % 4] as u64
                     else
-                        qb = h264state.block_at(k, e)
-                        pb = h264state.block_at(k, (e + 3) % 4)
+                        qb = h264state.blk_at[e * 4 + k] as u64
+                        pb = h264state.blk_at[((e + 3) % 4) * 4 + k] as u64
                     bs[k] = strength(p, pb, q, qb, e is 0)
                 if bs[0] | bs[1] | bs[2] | bs[3] is 0
                     skip

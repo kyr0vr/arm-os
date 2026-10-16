@@ -63,6 +63,10 @@ to disk_name (l ptr line.line)
         line.add(l, " (not answering, command ")
         line.number(l, sdhci.failed_at as u64)
         line.byte(l, ')')
+    else if sdhci.fast
+        line.add(l, ", 50 MHz")
+    else
+        line.add(l, ", 25 MHz")
 
 -- ---------------------------------------------------------------- USB, on RP1
 --
