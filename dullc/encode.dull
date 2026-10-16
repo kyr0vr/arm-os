@@ -8,6 +8,7 @@ use text
 use buf
 use vec
 use asmtext
+use neon
 
 fixed is_x u64 = 0x100
 fixed is_sp u64 = 0x200
@@ -177,6 +178,9 @@ to count (ops ptr vec.vec) gives u64
     give asmtext.op_count(ops)
 
 to encode (mnemonic string, ops ptr vec.vec) gives u64
+    new vector = neon.instruction(mnemonic, ops)
+    if vector is not nothing
+        give vector else 0
     new mn = asmtext.lower(mnemonic)
     if text.starts_with(mn, "b.")
         new c = cond_code(mn[2 until mn.len])

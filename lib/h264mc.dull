@@ -48,8 +48,142 @@ to luma (pic ptr h264state.picture, x0 i64, y0 i64, wh u64, mvx i32, mvy i32, ou
         for each j in 0 until w
             o[j] = (o[j] + q[j] + 1) >> 1
 
+-- NEON versions of `across`, `down` and `full` for blocks 16, 8 or 4 wide: `chunks`
+-- groups of 8 per row (one for 4 wide, with `half`: only 4 kept), out rows 16 i32s
+-- apart. The 6-tap sums fit in 16 bits; a rounding, saturating shift by 5 gives
+-- clip((v + 16) >> 5), and urhadd the (a + b + 1) >> 1 average.
+to across_neon (src u64, s u64, out u64, chunks u64, h u64, k i32, half u64)
+    asm
+        "movi v28.8h, #20"
+        "movi v29.8h, #5"
+        "1:"
+        "mov x16, {src}"
+        "mov x17, {out}"
+        "mov x3, {chunks}"
+        "2:"
+        "ld1 {v0.16b}, [x16]"
+        "add x16, x16, #8"
+        "ext v1.16b, v0.16b, v0.16b, #1"
+        "ext v2.16b, v0.16b, v0.16b, #2"
+        "ext v3.16b, v0.16b, v0.16b, #3"
+        "ext v4.16b, v0.16b, v0.16b, #4"
+        "ext v5.16b, v0.16b, v0.16b, #5"
+        "uaddl v6.8h, v0.8b, v5.8b"
+        "uaddl v7.8h, v1.8b, v4.8b"
+        "uaddl v8.8h, v2.8b, v3.8b"
+        "mla v6.8h, v8.8h, v28.8h"
+        "mls v6.8h, v7.8h, v29.8h"
+        "sqrshrun v9.8b, v6.8h, #5"
+        "cmp {k}, #1"
+        "b.ne 3f"
+        "urhadd v9.8b, v9.8b, v2.8b"
+        "3:"
+        "cmp {k}, #3"
+        "b.ne 4f"
+        "urhadd v9.8b, v9.8b, v3.8b"
+        "4:"
+        "uxtl v9.8h, v9.8b"
+        "uxtl v10.4s, v9.4h"
+        "uxtl2 v11.4s, v9.8h"
+        "cbnz {half}, 5f"
+        "st1 {v10.4s, v11.4s}, [x17], #32"
+        "b 6f"
+        "5:"
+        "st1 {v10.4s}, [x17]"
+        "6:"
+        "subs x3, x3, #1"
+        "b.ne 2b"
+        "add {src}, {src}, {s}"
+        "add {out}, {out}, #64"
+        "subs {h}, {h}, #1"
+        "b.ne 1b"
+
+to down_neon (src u64, s u64, out u64, chunks u64, h u64, k i32, half u64)
+    asm
+        "movi v28.8h, #20"
+        "movi v29.8h, #5"
+        "1:"
+        "mov x4, {src}"
+        "mov x17, {out}"
+        "mov x3, {chunks}"
+        "2:"
+        "mov x16, x4"
+        "ld1 {v0.8b}, [x16], {s}"
+        "ld1 {v1.8b}, [x16], {s}"
+        "ld1 {v2.8b}, [x16], {s}"
+        "ld1 {v3.8b}, [x16], {s}"
+        "ld1 {v4.8b}, [x16], {s}"
+        "ld1 {v5.8b}, [x16], {s}"
+        "add x4, x4, #8"
+        "uaddl v6.8h, v0.8b, v5.8b"
+        "uaddl v7.8h, v1.8b, v4.8b"
+        "uaddl v8.8h, v2.8b, v3.8b"
+        "mla v6.8h, v8.8h, v28.8h"
+        "mls v6.8h, v7.8h, v29.8h"
+        "sqrshrun v9.8b, v6.8h, #5"
+        "cmp {k}, #1"
+        "b.ne 3f"
+        "urhadd v9.8b, v9.8b, v2.8b"
+        "3:"
+        "cmp {k}, #3"
+        "b.ne 4f"
+        "urhadd v9.8b, v9.8b, v3.8b"
+        "4:"
+        "uxtl v9.8h, v9.8b"
+        "uxtl v10.4s, v9.4h"
+        "uxtl2 v11.4s, v9.8h"
+        "cbnz {half}, 5f"
+        "st1 {v10.4s, v11.4s}, [x17], #32"
+        "b 6f"
+        "5:"
+        "st1 {v10.4s}, [x17]"
+        "6:"
+        "subs x3, x3, #1"
+        "b.ne 2b"
+        "add {src}, {src}, {s}"
+        "add {out}, {out}, #64"
+        "subs {h}, {h}, #1"
+        "b.ne 1b"
+
+to full_neon (src u64, s u64, out u64, chunks u64, h u64, half u64)
+    asm
+        "1:"
+        "mov x16, {src}"
+        "mov x17, {out}"
+        "mov x3, {chunks}"
+        "2:"
+        "ld1 {v9.8b}, [x16]"
+        "add x16, x16, #8"
+        "uxtl v9.8h, v9.8b"
+        "uxtl v10.4s, v9.4h"
+        "uxtl2 v11.4s, v9.8h"
+        "cbnz {half}, 5f"
+        "st1 {v10.4s, v11.4s}, [x17], #32"
+        "b 6f"
+        "5:"
+        "st1 {v10.4s}, [x17]"
+        "6:"
+        "subs x3, x3, #1"
+        "b.ne 2b"
+        "add {src}, {src}, {s}"
+        "add {out}, {out}, #64"
+        "subs {h}, {h}, #1"
+        "b.ne 1b"
+
+-- How a block w wide goes through the NEON versions: 8-sample groups per row (0: it
+-- does not), and whether only 4 of the last group are kept.
+to groups_of (w u64) gives u64
+    if w is 16
+        give 2
+    if w is 8 or w is 4
+        give 1
+    give 0
+
 -- Whole-sample positions: a copy.
 to full (src u64, s u64, w u64, h u64, out ptr i32)
+    if groups_of(w) > 0
+        full_neon(src, s, out as u64, groups_of(w), h, (w is 4) as u64)
+        give
     for each i in 0 until h
         new r = (src + i * s) as ptr u8
         new o = out + i * 16
@@ -59,6 +193,9 @@ to full (src u64, s u64, w u64, h u64, out ptr i32)
 -- The horizontal half sample b; fx 1 and 3 average it with the whole sample left or
 -- right of it.
 to across (src u64, s u64, w u64, h u64, fx i32, out ptr i32)
+    if groups_of(w) > 0
+        across_neon(src - 2, s, out as u64, groups_of(w), h, fx, (w is 4) as u64)
+        give
     for each i in 0 until h
         new r = (src + i * s - 2) as ptr u8
         new o = out + i * 16
@@ -78,6 +215,9 @@ to across (src u64, s u64, w u64, h u64, fx i32, out ptr i32)
 -- The vertical half sample h; fy 1 and 3 average it with the whole sample above or
 -- below it.
 to down (src u64, s u64, w u64, h u64, fy i32, out ptr i32)
+    if groups_of(w) > 0
+        down_neon(src - 2 * s, s, out as u64, groups_of(w), h, fy, (w is 4) as u64)
+        give
     for each i in 0 until h
         new r0 = (src + i * s - 2 * s) as ptr u8
         new r1 = r0 + s
@@ -165,12 +305,57 @@ to chroma (pic ptr h264state.picture, x0 i64, y0 i64, wh u64, mvx i32, mvy i32, 
     new cb = fx * (8 - fy)
     new cc = (8 - fx) * fy
     new cd = fx * fy
+    if w is 8 or w is 4
+        new src = (p as i64 + yi * s as i64 + xi) as u64
+        new wts = (ca | (cb << 8) | (cc << 16) | (cd << 24)) as u32
+        new half u64 = 0
+        if w is 4
+            half = 1
+        chroma_neon(src, s, out as u64, os * 4, h, wts, half)
+        give
     for each i in 0 until h
         new r0 = (p as i64 + (yi + i as i64) * s as i64 + xi) as ptr u8
         new r1 = r0 + s
         new o = out + i * os
         for each j in 0 until w
             o[j] = (ca * (r0[j] as i32) + cb * (r0[j + 1] as i32) + cc * (r1[j] as i32) + cd * (r1[j + 1] as i32) + 32) >> 6
+
+-- NEON: h rows of 8 chroma samples (4 with `half`), each the weighted sum of four
+-- (wts = ca | cb << 8 | cc << 16 | cd << 24) rounded >> 6, from rows `s` bytes apart
+-- into i32 rows `ob` bytes apart.
+to chroma_neon (src u64, s u64, out u64, ob u64, h u64, wts u32, half u64)
+    asm
+        "dup v20.8b, {wts}"
+        "lsr {wts}, {wts}, #8"
+        "dup v21.8b, {wts}"
+        "lsr {wts}, {wts}, #8"
+        "dup v22.8b, {wts}"
+        "lsr {wts}, {wts}, #8"
+        "dup v23.8b, {wts}"
+        "add x16, {src}, #1"
+        "ld1 {v0.8b}, [{src}], {s}"
+        "ld1 {v1.8b}, [x16], {s}"
+        "1:"
+        "ld1 {v2.8b}, [{src}], {s}"
+        "ld1 {v3.8b}, [x16], {s}"
+        "umull v4.8h, v0.8b, v20.8b"
+        "umlal v4.8h, v1.8b, v21.8b"
+        "umlal v4.8h, v2.8b, v22.8b"
+        "umlal v4.8h, v3.8b, v23.8b"
+        "rshrn v4.8b, v4.8h, #6"
+        "uxtl v4.8h, v4.8b"
+        "uxtl v5.4s, v4.4h"
+        "uxtl2 v6.4s, v4.8h"
+        "cbnz {half}, 2f"
+        "st1 {v5.4s, v6.4s}, [{out}], {ob}"
+        "b 3f"
+        "2:"
+        "st1 {v5.4s}, [{out}], {ob}"
+        "3:"
+        "mov v0.16b, v2.16b"
+        "mov v1.16b, v3.16b"
+        "subs {h}, {h}, #1"
+        "b.ne 1b"
 
 -- ---------------------------------------------------------------- one partition
 

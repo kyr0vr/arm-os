@@ -1,0 +1,409 @@
+-- Advanced SIMD (NEON) instructions: the integer vector operations the video code
+-- uses. A port of stage0/aa64/neon.py: same instructions, same bytes.
+--
+-- Vector registers are written with their arrangement: v3.16b, v0.4s. Register lists
+-- for loads and stores arrive split at their commas ({v0.16b, v1.16b}) and are joined
+-- again here.
+
+use text
+use buf
+use vec
+use asmtext
+use encode
+
+fixed arr_names [8] string = ["8b", "16b", "4h", "8h", "2s", "4s", "1d", "2d"]
+
+fixed same_names [17] string = ["add", "sub", "mul", "mla", "mls", "smax", "smin", "umax", "umin",
+    "urhadd", "uhadd", "zip1", "zip2", "uzp1", "uzp2", "trn1", "trn2"]
+fixed same_words [17] u64 = [0x0E208400, 0x2E208400, 0x0E209C00, 0x0E209400, 0x2E209400,
+    0x0E206400, 0x0E206C00, 0x2E206400, 0x2E206C00, 0x2E201400, 0x2E200400, 0x0E003800,
+    0x0E007800, 0x0E001800, 0x0E005800, 0x0E002800, 0x0E006800]
+fixed bit_names [4] string = ["and", "orr", "eor", "bic"]
+fixed bit_words [4] u64 = [0x0E201C00, 0x0EA01C00, 0x2E201C00, 0x0E601C00]
+fixed long_names [10] string = ["uaddl", "saddl", "usubl", "ssubl", "umull", "smull", "umlal",
+    "smlal", "umlsl", "smlsl"]
+fixed long_words [10] u64 = [0x2E200000, 0x0E200000, 0x2E202000, 0x0E202000, 0x2E20C000,
+    0x0E20C000, 0x2E208000, 0x0E208000, 0x2E20A000, 0x0E20A000]
+fixed wide_names [4] string = ["uaddw", "saddw", "usubw", "ssubw"]
+fixed wide_words [4] u64 = [0x2E201000, 0x0E201000, 0x2E203000, 0x0E203000]
+fixed right_names [6] string = ["ushr", "sshr", "urshr", "srshr", "usra", "ssra"]
+fixed right_words [6] u64 = [0x2F000400, 0x0F000400, 0x2F002400, 0x0F002400, 0x2F001400, 0x0F001400]
+fixed lshift_names [2] string = ["ushll", "sshll"]
+fixed lshift_words [2] u64 = [0x2F00A400, 0x0F00A400]
+fixed nshift_names [8] string = ["shrn", "rshrn", "sqshrun", "sqrshrun", "sqshrn", "sqrshrn",
+    "uqshrn", "uqrshrn"]
+fixed nshift_words [8] u64 = [0x0F008400, 0x0F008C00, 0x2F008400, 0x2F008C00, 0x0F009400,
+    0x0F009C00, 0x2F009400, 0x2F009C00]
+fixed narrow_names [4] string = ["xtn", "sqxtn", "uqxtn", "sqxtun"]
+fixed narrow_words [4] u64 = [0x0E212800, 0x0E214800, 0x2E214800, 0x2E212800]
+fixed unary_names [2] string = ["neg", "abs"]
+fixed unary_words [2] u64 = [0x2E20B800, 0x0E20B800]
+fixed struct_names [8] string = ["ld1", "ld2", "ld3", "ld4", "st1", "st2", "st3", "st4"]
+
+-- A parsed vector register: number | Q << 8 | size << 9.
+to vreg (s string) gives u64
+    new t = asmtext.lower(asmtext.strip(s))
+    new dot = text.find(t, '.') else 0
+    if t.len < 4 or t[0] is not 'v' or dot < 2
+        asmtext.fail2("expected a vector register like v0.16b, found ", s)
+    new v u64 = 0
+    for each i in 1 until dot
+        if not text.is_digit(t[i])
+            asmtext.fail2("expected a vector register like v0.16b, found ", s)
+        v = v * 10 + (t[i] - '0') as u64
+    if v > 31
+        asmtext.fail2("expected a vector register like v0.16b, found ", s)
+    new arr = t[dot + 1 until t.len]
+    for each k in 0 until 8
+        if text.same(arr_names[k], arr)
+            give v | ((k as u64 % 2) << 8) | ((k as u64 / 2) << 9)
+    asmtext.fail2("expected a vector register like v0.16b, found ", s)
+    give 0
+
+to is_vreg (s string) gives bool
+    new t = asmtext.lower(asmtext.strip(s))
+    new dot = text.find(t, '.') else 0
+    if t.len < 4 or t[0] is not 'v' or dot < 2
+        give false
+    for each i in 1 until dot
+        if not text.is_digit(t[i])
+            give false
+    new v u64 = 0
+    for each i in 1 until dot
+        v = v * 10 + (t[i] - '0') as u64
+    if v > 31
+        give false
+    new arr = t[dot + 1 until t.len]
+    for each k in 0 until 8
+        if text.same(arr_names[k], arr)
+            give true
+    give false
+
+-- A vector element like v3.s[1]: number | size << 8 | index << 12.
+to velem (s string) gives u64
+    new t = asmtext.lower(asmtext.strip(s))
+    new dot = text.find(t, '.') else 0
+    if t.len < 7 or t[0] is not 'v' or dot < 2 or dot + 3 >= t.len or t[dot + 2] is not '[' or t[t.len - 1] is not ']'
+        asmtext.fail2("expected a vector element like v0.s[1], found ", s)
+    new v u64 = 0
+    for each i in 1 until dot
+        if not text.is_digit(t[i])
+            asmtext.fail2("expected a vector element like v0.s[1], found ", s)
+        v = v * 10 + (t[i] - '0') as u64
+    new size u64 = 4
+    new c = t[dot + 1]
+    if c is 'b'
+        size = 0
+    else if c is 'h'
+        size = 1
+    else if c is 's'
+        size = 2
+    else if c is 'd'
+        size = 3
+    new index u64 = 0
+    for each i in dot + 3 until t.len - 1
+        if not text.is_digit(t[i])
+            asmtext.fail2("expected a vector element like v0.s[1], found ", s)
+        index = index * 10 + (t[i] - '0') as u64
+    if v > 31 or size > 3 or index >= (16 as u64) >> size
+        asmtext.fail2("expected a vector element like v0.s[1], found ", s)
+    give v | (size << 8) | (index << 12)
+
+to rn (r u64) gives u64
+    give r & 255
+
+to qq (r u64) gives u64
+    give (r >> 8) & 1
+
+to sz (r u64) gives u64
+    give r >> 9
+
+-- Q and size together, to compare arrangements.
+to shape_of (r u64) gives u64
+    give r >> 8
+
+to find (names ptr string, count u64, mn string) gives u64
+    for each i in 0 until count
+        if text.same(names[i], mn)
+            give i + 1
+    give 0
+
+to need (ops ptr vec.vec, n u64, mn string)
+    if asmtext.op_count(ops) is not n
+        new b buf.buf
+        buf.add(addr of b, "`")
+        buf.add(addr of b, mn)
+        buf.add(addr of b, "` takes ")
+        buf.number(addr of b, n)
+        buf.add(addr of b, " operands")
+        asmtext.fail(buf.text(addr of b))
+
+to o (ops ptr vec.vec, i u64) gives string
+    give asmtext.op(ops, i)
+
+to shift_amount (s string) gives u64
+    new t = asmtext.strip(s)
+    if t.len is 0 or t[0] is not '#'
+        asmtext.fail2("expected a shift like #3, found ", s)
+    give asmtext.eval(t[1 until t.len]) as u64
+
+-- Is `b` (an instruction without its trailing 2) one that has a `2` form?
+to has_upper (b string) gives bool
+    give find(addr of long_names[0], 10, b) > 0 or find(addr of wide_names[0], 4, b) > 0 or
+        find(addr of lshift_names[0], 2, b) > 0 or find(addr of nshift_names[0], 8, b) > 0 or
+        find(addr of narrow_names[0], 4, b) > 0 or text.same(b, "uxtl") or text.same(b, "sxtl")
+
+to fit (mn string)
+    asmtext.fail2(mn, ": the arrangements do not fit together")
+
+-- The instruction word, or nothing if `mnemonic` is not a NEON instruction here.
+to instruction (mnemonic string, ops ptr vec.vec) gives maybe u64
+    new count = asmtext.op_count(ops)
+    if count is 0
+        give nothing
+    if text.same(asmtext.lower(mnemonic), "umov")
+        need(ops, 2, "umov")
+        new r = encode.reg(o(ops, 0), false)
+        new e = velem(o(ops, 1))
+        new size = (e >> 8) & 15
+        if (size is 3) is not encode.wide(r)
+            asmtext.fail("`umov`: x for a d element, w otherwise")
+        new imm5 = (((e >> 12) << 1) | 1) << size
+        new q u64 = 0
+        if size is 3
+            q = 1
+        give 0x0E003C00 | (q << 30) | (imm5 << 16) | ((e & 255) << 5) | encode.num(r)
+    new first = asmtext.strip(o(ops, 0))
+    if not is_vreg(first) and not (first.len > 0 and first[0] is '{')
+        give nothing
+    new mn = asmtext.lower(mnemonic)
+    new base = mn
+    new upper u64 = 0
+    if mn.len > 1 and mn[mn.len - 1] is '2' and has_upper(mn[0 until mn.len - 1])
+        base = mn[0 until mn.len - 1]
+        upper = 1
+    if text.same(mn, "mov")
+        need(ops, 2, mn)
+        new d = vreg(o(ops, 0))
+        new n = vreg(o(ops, 1))
+        give 0x0EA01C00 | (qq(d) << 30) | (rn(n) << 16) | (rn(n) << 5) | rn(d)
+    new si = find(addr of same_names[0], 17, mn)
+    new bi = find(addr of bit_names[0], 4, mn)
+    if si > 0 or bi > 0
+        need(ops, 3, mn)
+        new d = vreg(o(ops, 0))
+        new n = vreg(o(ops, 1))
+        new m = vreg(o(ops, 2))
+        if shape_of(d) is not shape_of(n) or shape_of(d) is not shape_of(m)
+            asmtext.fail2(mn, " needs three registers of one arrangement")
+        if bi > 0
+            if sz(d) is not 0
+                asmtext.fail2(mn, " works on bytes (8b or 16b)")
+            give bit_words[bi - 1] | (qq(d) << 30) | (rn(m) << 16) | (rn(n) << 5) | rn(d)
+        if sz(d) is 3 and si > 2 and si < 12
+            asmtext.fail2(mn, " has no 64-bit lanes")
+        give same_words[si - 1] | (qq(d) << 30) | (sz(d) << 22) | (rn(m) << 16) | (rn(n) << 5) | rn(d)
+    new ui = find(addr of unary_names[0], 2, mn)
+    if ui > 0
+        need(ops, 2, mn)
+        new d = vreg(o(ops, 0))
+        new n = vreg(o(ops, 1))
+        if shape_of(d) is not shape_of(n)
+            asmtext.fail2(mn, " needs two registers of one arrangement")
+        give unary_words[ui - 1] | (qq(d) << 30) | (sz(d) << 22) | (rn(n) << 5) | rn(d)
+    new li = find(addr of long_names[0], 10, base)
+    new wi = find(addr of wide_names[0], 4, base)
+    if li > 0 or wi > 0
+        need(ops, 3, mn)
+        new d = vreg(o(ops, 0))
+        new n = vreg(o(ops, 1))
+        new m = vreg(o(ops, 2))
+        if qq(d) is not 1 or sz(d) is 0 or qq(m) is not upper or sz(m) is not sz(d) - 1
+            fit(mn)
+        if li > 0 and shape_of(n) is not shape_of(m)
+            fit(mn)
+        if wi > 0 and shape_of(n) is not shape_of(d)
+            fit(mn)
+        new word = 0 as u64
+        if li > 0
+            word = long_words[li - 1]
+        else
+            word = wide_words[wi - 1]
+        give word | (upper << 30) | ((sz(d) - 1) << 22) | (rn(m) << 16) | (rn(n) << 5) | rn(d)
+    new ri = find(addr of right_names[0], 6, mn)
+    if ri > 0 or text.same(mn, "shl")
+        need(ops, 3, mn)
+        new d = vreg(o(ops, 0))
+        new n = vreg(o(ops, 1))
+        if shape_of(d) is not shape_of(n)
+            asmtext.fail2(mn, " needs two registers of one arrangement")
+        new esize = (8 as u64) << sz(d)
+        new sh = shift_amount(o(ops, 2))
+        new field u64 = 0
+        new word u64 = 0x0F005400
+        if ri > 0
+            if sh < 1 or sh > esize
+                asmtext.fail2(mn, ": shift out of range")
+            field = 2 * esize - sh
+            word = right_words[ri - 1]
+        else
+            if sh >= esize
+                asmtext.fail2(mn, ": shift out of range")
+            field = esize + sh
+        give word | (qq(d) << 30) | (field << 16) | (rn(n) << 5) | rn(d)
+    new hi = find(addr of lshift_names[0], 2, base)
+    if hi > 0 or text.same(base, "uxtl") or text.same(base, "sxtl")
+        new word = lshift_words[0]
+        if text.same(base, "sshll") or text.same(base, "sxtl")
+            word = lshift_words[1]
+        new sh u64 = 0
+        if hi > 0
+            need(ops, 3, mn)
+            sh = shift_amount(o(ops, 2))
+        else
+            need(ops, 2, mn)
+        new d = vreg(o(ops, 0))
+        new n = vreg(o(ops, 1))
+        if qq(d) is not 1 or sz(d) is not sz(n) + 1 or qq(n) is not upper or sz(n) > 2
+            fit(mn)
+        new esize = (8 as u64) << sz(n)
+        if sh >= esize
+            asmtext.fail2(mn, ": shift out of range")
+        give word | (upper << 30) | ((esize + sh) << 16) | (rn(n) << 5) | rn(d)
+    new ni = find(addr of nshift_names[0], 8, base)
+    new xi = find(addr of narrow_names[0], 4, base)
+    if ni > 0 or xi > 0
+        new d = vreg(o(ops, 0))
+        new n = vreg(o(ops, 1))
+        if qq(n) is not 1 or sz(n) is not sz(d) + 1 or qq(d) is not upper or sz(d) > 2
+            fit(mn)
+        if xi > 0
+            need(ops, 2, mn)
+            give narrow_words[xi - 1] | (upper << 30) | (sz(d) << 22) | (rn(n) << 5) | rn(d)
+        need(ops, 3, mn)
+        new esize = (8 as u64) << sz(d)
+        new sh = shift_amount(o(ops, 2))
+        if sh < 1 or sh > esize
+            asmtext.fail2(mn, ": shift out of range")
+        give nshift_words[ni - 1] | (upper << 30) | ((2 * esize - sh) << 16) | (rn(n) << 5) | rn(d)
+    if text.same(mn, "ext")
+        need(ops, 4, mn)
+        new d = vreg(o(ops, 0))
+        new n = vreg(o(ops, 1))
+        new m = vreg(o(ops, 2))
+        if sz(d) is not 0 or shape_of(d) is not shape_of(n) or shape_of(d) is not shape_of(m)
+            asmtext.fail("`ext` needs three byte registers of one arrangement")
+        new k = shift_amount(o(ops, 3))
+        new limit u64 = 8
+        if qq(d) is 1
+            limit = 16
+        if k >= limit
+            asmtext.fail("ext index out of range")
+        give 0x2E000000 | (qq(d) << 30) | (rn(m) << 16) | (k << 11) | (rn(n) << 5) | rn(d)
+    if text.same(mn, "dup")
+        need(ops, 2, mn)
+        new d = vreg(o(ops, 0))
+        new r = encode.reg(o(ops, 1), false)
+        if (sz(d) is 3) is not encode.wide(r)
+            asmtext.fail("`dup` from a register: x for 64-bit lanes, w otherwise")
+        give 0x0E000C00 | (qq(d) << 30) | (((1 as u64) << sz(d)) << 16) | (encode.num(r) << 5) | rn(d)
+    if text.same(mn, "movi")
+        need(ops, 2, mn)
+        new d = vreg(o(ops, 0))
+        new v = shift_amount(o(ops, 1))
+        if v > 255 or sz(d) is 3
+            asmtext.fail("`movi` takes a byte value (0-255) for 8-, 16- or 32-bit lanes")
+        new word u64 = 0x0F000400
+        if sz(d) is 0
+            word = 0x0F00E400
+        else if sz(d) is 1
+            word = 0x0F008400
+        give word | (qq(d) << 30) | ((v >> 5) << 16) | ((v & 31) << 5) | rn(d)
+    if find(addr of struct_names[0], 8, mn) > 0
+        give structure(mn, ops)
+    give nothing
+
+-- ld1 {v0.16b, v1.16b}, [x0] / [x0], #32 / [x0], x2.
+to structure (mn string, ops ptr vec.vec) gives u64
+    new count = asmtext.op_count(ops)
+    new regs = vec.make()
+    new i u64 = 0
+    new t = asmtext.strip(o(ops, 0))
+    if t.len is 0 or t[0] is not '{'
+        asmtext.fail2(mn, " needs a register list like {v0.16b}")
+    repeat
+        new part = asmtext.strip(o(ops, i))
+        i += 1
+        new last = part.len > 0 and part[part.len - 1] is '}'
+        new a u64 = 0
+        new b = part.len
+        if part.len > 0 and part[0] is '{'
+            a = 1
+        if last
+            b = part.len - 1
+        vec.push(regs, vreg(part[a until b]))
+        if last
+            stop
+        if i >= count
+            asmtext.fail("unclosed register list")
+    new n = regs.len
+    new first = vec.get(regs, 0)
+    for each k in 0 until n
+        new r = vec.get(regs, k)
+        if shape_of(r) is not shape_of(first) or rn(r) is not (rn(first) + k) % 32
+            asmtext.fail("the registers in the list must follow on and share one arrangement")
+    new kind = mn[1]                    -- 'd' load, 't' store
+    new digit = (mn[2] - '0') as u64
+    new opcode u64 = 0
+    if digit is 1
+        if n is 1
+            opcode = 7
+        else if n is 2
+            opcode = 10
+        else if n is 3
+            opcode = 6
+        else
+            opcode = 2
+    else
+        if n is not digit
+            asmtext.fail2(mn, ": wrong number of registers")
+        if digit is 2
+            opcode = 8
+        else if digit is 3
+            opcode = 4
+        else
+            opcode = 0
+    if sz(first) is 3 and qq(first) is 0 and digit is not 1
+        asmtext.fail2(mn, " has no 1d form")
+    if i >= count
+        asmtext.fail2(mn, " needs an address like [x0]")
+    new adr = asmtext.strip(o(ops, i))
+    if adr.len < 3 or adr[0] is not '[' or adr[adr.len - 1] is not ']'
+        asmtext.fail2(mn, " needs an address like [x0]")
+    new basereg = encode.reg(adr[1 until adr.len - 1], true)
+    if not encode.wide(basereg)
+        asmtext.fail("addresses use x registers")
+    new load = kind is 'd'
+    new word = (qq(first) << 30) | (opcode << 12) | (sz(first) << 10) | (encode.num(basereg) << 5) | rn(first)
+    if i + 1 is count
+        if load
+            give word | 0x0C40_0000
+        give word | 0x0C00_0000
+    if i + 2 is not count
+        asmtext.fail2(mn, ": too many operands")
+    new post = asmtext.strip(o(ops, i + 1))
+    new bytes = n * 8
+    if qq(first) is 1
+        bytes = n * 16
+    if post.len > 0 and post[0] is '#'
+        if asmtext.eval(post[1 until post.len]) as u64 is not bytes
+            asmtext.fail2(mn, " can only step by the bytes it moves")
+        if load
+            give word | 0x0CDF_0000
+        give word | 0x0C9F_0000
+    new m = encode.reg(post, false)
+    if not encode.wide(m) or encode.num(m) is 31
+        asmtext.fail("the step register must be an x register")
+    if load
+        give word | 0x0CC0_0000 | (encode.num(m) << 16)
+    give word | 0x0C80_0000 | (encode.num(m) << 16)

@@ -139,6 +139,10 @@ class Encoder:
         mn = mn.lower()
         if mn.startswith("b.") and mn[2:] in COND:
             return self.b_cond(COND[mn[2:]], ops)
+        from . import neon
+        word = neon.encode(mn, ops, lambda t: self.ctx.imm(t))
+        if word is not None:
+            return word
         fn = getattr(self, "i_" + mn, None)
         if fn is None:
             raise AsmError(f"unknown instruction `{mn}`")

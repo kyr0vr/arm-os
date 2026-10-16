@@ -21,6 +21,15 @@ use h264par
 use helpers
 
 new handle i64
+-- The file in memory, read from the start as far as `have` (files up to max_buffered;
+-- bigger ones are read a sample at a time). Reading in big pieces, and ahead while
+-- a picture waits for its time, keeps the many small reads off the playing loop.
+fixed max_buffered u64 = 256 * 1024 * 1024
+fixed piece u64 = 256 * 1024
+new file_buf ptr u8
+new file_cap u64
+new file_len u64
+new have u64
 new movie ptr mp4.movie
 new vt ptr mp4.track
 new at_track ptr mp4.track
@@ -71,6 +80,18 @@ new placed bool
 
 -- ---------------------------------------------------------------- the file
 
+-- The next piece of the file into memory; false if there is no more (or it failed).
+to read_ahead gives bool
+    if have >= file_len
+        give false
+    new n = file_len - have
+    if n > piece
+        n = piece
+    if not read_at(have, file_buf + have, n)
+        give false
+    have += n
+    give true
+
 to read_at (offset u64, into ptr u8, count u64) gives bool
     give sys.read_open(handle, offset, into, count) is count as i64
 
@@ -85,6 +106,13 @@ to load (path ptr line.line) gives bool
         line.add(addr of message, "Cannot open the file.")
         give false
     new size = sys.file_size(handle)
+    file_len = 0
+    have = 0
+    if size <= max_buffered
+        if size > file_cap
+            file_buf = mem.alloc(size + 16)
+            file_cap = size
+        file_len = size
     new head [16] u8
     new pos u64 = 0
     new moov = 0 as ptr u8
@@ -173,6 +201,14 @@ to load (path ptr line.line) gives bool
 
 to fetch (t ptr mp4.track, i u64) gives ptr u8
     new size = t.sizes[i] as u64
+    if file_len > 0
+        new start = t.offsets[i] as u64
+        if start + size > file_len
+            give 0 as ptr u8
+        while have < start + size
+            if not read_ahead()
+                give 0 as ptr u8
+        give file_buf + start
     if size + 16 > sample_cap
         sample_cap = size + 65536
         sample = mem.alloc(sample_cap)
@@ -261,6 +297,7 @@ new tgu [256] i32
 new tgv [256] i32
 new tb [256] i32
 new level [1024] u32
+new neon_k [28] i32                     -- the same for NEON: 298, -4640, kr, -kgu, -kgv, kb, 0 (x 4)
 new xmap ptr u32                        -- source column of each screen column
 new xmap_len u64
 new rowbufs [3] u64                     -- per conversion part: one source row in RGB
@@ -283,6 +320,14 @@ to tables
         tgu[i] = 0 - kgu * v
         tgv[i] = 0 - kgv * v
         tb[i] = kb * v
+    for each l in 0 until 4
+        neon_k[l] = 298
+        neon_k[4 + l] = 128 - 16 * 298
+        neon_k[8 + l] = kr
+        neon_k[12 + l] = 0 - kgu
+        neon_k[16 + l] = 0 - kgv
+        neon_k[20 + l] = kb
+        neon_k[24 + l] = 0
     for each i in 0 until 1024
         new v = i as i32 - 320
         if v < 0
@@ -290,6 +335,7 @@ to tables
         else if v > 255
             v = 255
         level[i] = v as u32
+    check_convert()
     new w = h264.width(vd) as u64
     if dst_w as u64 > xmap_len
         xmap = mem.alloc((dst_w as u64) * 4) as ptr u32
@@ -300,6 +346,144 @@ to tables
         for each k in 0 until 3
             rowbufs[k] = mem.alloc(w * 4) as u64
         rowbuf_len = w
+
+-- NEON: n times 16 pixels from 16 Y, 8 U and 8 V samples (the same sums as the
+-- tables: c = 298 * (y - 16) + 128, then c + its share of U and V, >> 8, clamped).
+-- k: 7 x 4 i32 (see neon_k).
+to convert16 (yp u64, up u64, vp u64, out u64, n u64, k u64)
+    asm
+        "ld1 {v16.4s, v17.4s, v18.4s, v19.4s}, [{k}], #64"
+        "ld1 {v20.4s, v21.4s, v22.4s}, [{k}]"
+        "movi v23.8h, #128"
+        "movi v15.16b, #0"
+        "1:"
+        "ld1 {v0.16b}, [{yp}], #16"
+        "ld1 {v1.8b}, [{up}], #8"
+        "ld1 {v2.8b}, [{vp}], #8"
+        "uxtl v1.8h, v1.8b"
+        "uxtl v2.8h, v2.8b"
+        "sub v1.8h, v1.8h, v23.8h"
+        "sub v2.8h, v2.8h, v23.8h"
+        "zip1 v3.8h, v1.8h, v1.8h"
+        "zip2 v4.8h, v1.8h, v1.8h"
+        "zip1 v5.8h, v2.8h, v2.8h"
+        "zip2 v6.8h, v2.8h, v2.8h"
+        "uxtl v7.8h, v0.8b"
+        "uxtl2 v8.8h, v0.16b"
+        "uxtl v9.4s, v7.4h"
+        "sxtl v10.4s, v3.4h"
+        "sxtl v11.4s, v5.4h"
+        "mul v9.4s, v9.4s, v16.4s"
+        "add v9.4s, v9.4s, v17.4s"
+        "mul v12.4s, v11.4s, v18.4s"
+        "add v12.4s, v12.4s, v9.4s"
+        "mul v13.4s, v10.4s, v19.4s"
+        "mla v13.4s, v11.4s, v20.4s"
+        "add v13.4s, v13.4s, v9.4s"
+        "mul v14.4s, v10.4s, v21.4s"
+        "add v14.4s, v14.4s, v9.4s"
+        "sqshrun v26.4h, v12.4s, #8"
+        "sqshrun v28.4h, v13.4s, #8"
+        "sqshrun v30.4h, v14.4s, #8"
+        "uxtl2 v9.4s, v7.8h"
+        "sxtl2 v10.4s, v3.8h"
+        "sxtl2 v11.4s, v5.8h"
+        "mul v9.4s, v9.4s, v16.4s"
+        "add v9.4s, v9.4s, v17.4s"
+        "mul v12.4s, v11.4s, v18.4s"
+        "add v12.4s, v12.4s, v9.4s"
+        "mul v13.4s, v10.4s, v19.4s"
+        "mla v13.4s, v11.4s, v20.4s"
+        "add v13.4s, v13.4s, v9.4s"
+        "mul v14.4s, v10.4s, v21.4s"
+        "add v14.4s, v14.4s, v9.4s"
+        "sqshrun2 v26.8h, v12.4s, #8"
+        "sqshrun2 v28.8h, v13.4s, #8"
+        "sqshrun2 v30.8h, v14.4s, #8"
+        "uxtl v9.4s, v8.4h"
+        "sxtl v10.4s, v4.4h"
+        "sxtl v11.4s, v6.4h"
+        "mul v9.4s, v9.4s, v16.4s"
+        "add v9.4s, v9.4s, v17.4s"
+        "mul v12.4s, v11.4s, v18.4s"
+        "add v12.4s, v12.4s, v9.4s"
+        "mul v13.4s, v10.4s, v19.4s"
+        "mla v13.4s, v11.4s, v20.4s"
+        "add v13.4s, v13.4s, v9.4s"
+        "mul v14.4s, v10.4s, v21.4s"
+        "add v14.4s, v14.4s, v9.4s"
+        "sqshrun v27.4h, v12.4s, #8"
+        "sqshrun v29.4h, v13.4s, #8"
+        "sqshrun v31.4h, v14.4s, #8"
+        "uxtl2 v9.4s, v8.8h"
+        "sxtl2 v10.4s, v4.8h"
+        "sxtl2 v11.4s, v6.8h"
+        "mul v9.4s, v9.4s, v16.4s"
+        "add v9.4s, v9.4s, v17.4s"
+        "mul v12.4s, v11.4s, v18.4s"
+        "add v12.4s, v12.4s, v9.4s"
+        "mul v13.4s, v10.4s, v19.4s"
+        "mla v13.4s, v11.4s, v20.4s"
+        "add v13.4s, v13.4s, v9.4s"
+        "mul v14.4s, v10.4s, v21.4s"
+        "add v14.4s, v14.4s, v9.4s"
+        "sqshrun2 v27.8h, v12.4s, #8"
+        "sqshrun2 v29.8h, v13.4s, #8"
+        "sqshrun2 v31.8h, v14.4s, #8"
+        "uqxtn v12.8b, v30.8h"
+        "uqxtn2 v12.16b, v31.8h"
+        "uqxtn v13.8b, v28.8h"
+        "uqxtn2 v13.16b, v29.8h"
+        "uqxtn v14.8b, v26.8h"
+        "uqxtn2 v14.16b, v27.8h"
+        "st4 {v12.16b, v13.16b, v14.16b, v15.16b}, [{out}], #64"
+        "subs {n}, {n}, #1"
+        "b.ne 1b"
+
+-- One row of `w` pixels from Y, U and V rows into `out`: NEON for each 16, the
+-- tables for what is left.
+to convert_row (yrow ptr u8, urow ptr u8, vrow ptr u8, out ptr u32, w u64)
+    new groups = w / 16
+    if groups > 0
+        convert16(yrow as u64, urow as u64, vrow as u64, out as u64, groups, addr of neon_k[0] as u64)
+    new lv = addr of level[0]
+    for each p in groups * 8 until w / 2
+        new u = urow[p] as u64
+        new v = vrow[p] as u64
+        new rv = tr[v]
+        new guv = tgu[u] + tgv[v]
+        new bu = tb[u]
+        new c0 = ty[yrow[p * 2] as u64]
+        new c1 = ty[yrow[p * 2 + 1] as u64]
+        out[p * 2] = (lv[((c0 + rv) >> 8) as u64] << 16) | (lv[((c0 + guv) >> 8) as u64] << 8) | lv[((c0 + bu) >> 8) as u64]
+        out[p * 2 + 1] = (lv[((c1 + rv) >> 8) as u64] << 16) | (lv[((c1 + guv) >> 8) as u64] << 8) | lv[((c1 + bu) >> 8) as u64]
+
+-- NEON and the tables must give the same pixels: try 64 of them (every Y, U and V
+-- value turns up) and say so on the console if they do not.
+new checked bool
+
+to check_convert
+    if checked
+        give
+    checked = true
+    new ys [256] u8
+    new us [128] u8
+    new vs [128] u8
+    for each i in 0 until 256
+        ys[i] = ((i * 37) % 256) as u8
+    for each i in 0 until 128
+        us[i] = ((i * 53 + 7) % 256) as u8
+        vs[i] = ((i * 29 + 101) % 256) as u8
+    new a [256] u32
+    new b [256] u32
+    convert_row(addr of ys[0], addr of us[0], addr of vs[0], addr of a[0], 256)
+    -- the same with the tables only (no NEON: fewer than 16 at a time)
+    for each k in 0 until 32
+        convert_row(addr of ys[k * 8], addr of us[k * 4], addr of vs[k * 4], addr of b[k * 8], 8)
+    for each i in 0 until 256
+        if a[i] is not b[i]
+            sys.print("video: NEON colour conversion differs from the tables\n")
+            give
 
 -- YUV 4:2:0 -> RGB into the surface, scaled to the video rectangle: by the decoder's
 -- lanes, while this core goes on (`converted` waits for them).
@@ -333,17 +517,8 @@ to convert_part (arg u64, part u64, parts u64)
         new vrow = pic.v + ((cy + sy) / 2) * pic.cstride + cx / 2
         new out = gfx.pixels + ((dst_y as u64) + oy) * (gfx.width as u64) + dst_x as u64
         if dst_w as u64 is w and cx % 2 is 0
-            -- one to one: two pixels share their chroma
-            for each p in 0 until w / 2
-                new u = urow[p] as u64
-                new v = vrow[p] as u64
-                new rv = tr[v]
-                new guv = tgu[u] + tgv[v]
-                new bu = tb[u]
-                new c0 = ty[yrow[p * 2] as u64]
-                new c1 = ty[yrow[p * 2 + 1] as u64]
-                out[p * 2] = (lv[((c0 + rv) >> 8) as u64] << 16) | (lv[((c0 + guv) >> 8) as u64] << 8) | lv[((c0 + bu) >> 8) as u64]
-                out[p * 2 + 1] = (lv[((c1 + rv) >> 8) as u64] << 16) | (lv[((c1 + guv) >> 8) as u64] << 8) | lv[((c1 + bu) >> 8) as u64]
+            -- one to one
+            convert_row(yrow, urow, vrow, out, w)
         else if oy > first and sy is last_sy
             -- the same source row as the screen row above: copy it
             new above = out - gfx.width as u64
@@ -352,16 +527,7 @@ to convert_part (arg u64, part u64, parts u64)
         else
             -- each source pixel once, then stretched across the screen row
             new rb = rowbufs[part] as ptr u32
-            for each p in 0 until w / 2
-                new u = urow[p] as u64
-                new v = vrow[p] as u64
-                new rv = tr[v]
-                new guv = tgu[u] + tgv[v]
-                new bu = tb[u]
-                new c0 = ty[yrow[p * 2] as u64]
-                new c1 = ty[yrow[p * 2 + 1] as u64]
-                rb[p * 2] = (lv[((c0 + rv) >> 8) as u64] << 16) | (lv[((c0 + guv) >> 8) as u64] << 8) | lv[((c0 + bu) >> 8) as u64]
-                rb[p * 2 + 1] = (lv[((c1 + rv) >> 8) as u64] << 16) | (lv[((c1 + guv) >> 8) as u64] << 8) | lv[((c1 + bu) >> 8) as u64]
+            convert_row(yrow, urow, vrow, rb, w)
             for each ox in 0 until dst_w as u64
                 out[ox] = rb[xmap[ox] as u64]
         last_sy = sy
@@ -642,6 +808,8 @@ to play (path ptr line.line)
                 per = decode_ms / decoded + 2
             if ready_ms > now_ms() + per
                 decode_one(0, false)
+        if ready and ready_ms > now_ms() + 25 and file_len > 0 and have < file_len
+            read_ahead()
         if ready and ready_ms <= now_ms()
             if sys.time() < overlay_until
                 draw_overlay()
@@ -745,7 +913,9 @@ to main gives u64
         -- one file, straight away (the report goes to the serial console)
         new one line.line
         line.add(addr of one, args[5 until args.len])
+        sys.profile_start()
         play(addr of one)
+        sys.profile_stop()
         give 0
     files.setup("Video", ".mp4")
     new path line.line

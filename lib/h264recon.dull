@@ -119,6 +119,12 @@ to idct8 (c ptr i32)
 -- Add a w x w residual (row stride w) to the prediction (row stride `ps`) into the
 -- picture at `dst`.
 to add_block (dst ptr u8, stride u64, pred ptr i32, ps u64, res ptr i32, w u64)
+    if w is 8
+        add8(dst as u64, stride, pred as u64, ps * 4, res as u64)
+        give
+    if w is 4
+        add4(dst as u64, stride, pred as u64, ps * 4, res as u64)
+        give
     for each y in 0 until w
         new o = dst + y * stride
         new p = pred + y * ps
@@ -139,6 +145,42 @@ to add_block (dst ptr u8, stride u64, pred ptr i32, ps u64, res ptr i32, w u64)
                 else if v > 255
                     v = 255
                 o[x] = v as u8
+
+-- NEON add_block for 8 x 8 and 4 x 4: pred rows `pb` bytes apart, res (if not 0)
+-- rows packed, the sums clamped to 0..255 by saturating narrowing.
+to add8 (dst u64, stride u64, pred u64, pb u64, res u64)
+    asm
+        "mov x17, #8"
+        "1:"
+        "ld1 {v0.4s, v1.4s}, [{pred}], {pb}"
+        "cbz {res}, 2f"
+        "ld1 {v2.4s, v3.4s}, [{res}], #32"
+        "add v0.4s, v0.4s, v2.4s"
+        "add v1.4s, v1.4s, v3.4s"
+        "2:"
+        "sqxtn v0.4h, v0.4s"
+        "sqxtn2 v0.8h, v1.4s"
+        "sqxtun v0.8b, v0.8h"
+        "st1 {v0.8b}, [{dst}], {stride}"
+        "subs x17, x17, #1"
+        "b.ne 1b"
+
+to add4 (dst u64, stride u64, pred u64, pb u64, res u64)
+    asm
+        "mov x17, #4"
+        "1:"
+        "ld1 {v0.4s}, [{pred}], {pb}"
+        "cbz {res}, 2f"
+        "ld1 {v2.4s}, [{res}], #16"
+        "add v0.4s, v0.4s, v2.4s"
+        "2:"
+        "sqxtn v0.4h, v0.4s"
+        "sqxtun v0.8b, v0.8h"
+        "umov w16, v0.s[0]"
+        "str w16, [{dst}]"
+        "add {dst}, {dst}, {stride}"
+        "subs x17, x17, #1"
+        "b.ne 1b"
 
 -- ---------------------------------------------------------------- intra prediction
 

@@ -46,7 +46,7 @@ def main():
             counts[name] = counts.get(name, 0) + n
             total += n
     print(f"{total} samples (1 per ms)")
-    for name, n in sorted(counts.items(), key=lambda kv: -kv[1])[:30]:
+    for name, n in sorted(counts.items(), key=lambda kv: -kv[1])[:int(os.environ.get("TOP", "30"))]:
         print(f"{100.0 * n / total:6.1f}%  {n:7d}  {name}")
 
 
