@@ -8,7 +8,9 @@
 --
 -- Lanes run on helper cores (rt/app/helpers.dull): the app starts `lane` on each
 -- with `lane_arg` and then calls `use_lanes`. Cores wait for each other by watching
--- counters in memory, with a dmb after each look and before each change.
+-- counters in memory, with a dmb after each look and before each change. Between
+-- macroblocks, and while they wait, lanes also take their part of side jobs the app
+-- hands out with `start_job` (turning a picture into screen pixels, say).
 
 use mem
 use h264state
@@ -23,6 +25,7 @@ shape lanerec
     own   ptr h264state.decoder         -- the lane's own copy (current macroblock, scratch)
     index u64
     gone  bool                          -- the lane has stopped
+    job_seen u64                        -- the last side job it did its part of
 
 -- ---------------------------------------------------------------- the parser's side
 
@@ -85,7 +88,7 @@ to finish (d ptr h264state.decoder)
         if d.solo as u64 is 0
             d.solo = mem.alloc(size_of(h264state.decoder)) as ptr h264state.decoder
         deref d.solo = deref d
-        rows(d, d.solo, 0, 1)
+        rows(d, d.solo, 0, 1, 0)
         give
     new all = d.s.mb_h as u64
     while d.deblocked < all
@@ -136,8 +139,10 @@ to lane (arg u64)
     new l = arg as ptr lanerec
     new d = l.main
     new seen = d.gen
+    l.job_seen = d.job_gen
     repeat
         while d.gen is seen and not d.quit
+            side(l as u64)
             dmb()
         if d.quit
             l.gone = true
@@ -145,19 +150,65 @@ to lane (arg u64)
             give
         seen = d.gen
         dmb()
-        rows(d, l.own, l.index, d.lane_count)
+        rows(d, l.own, l.index, d.lane_count, l as u64)
+
+-- ---------------------------------------------------------------- side jobs
+
+-- Start `function(arg, part, parts)` for parts 0 .. parts-1, one on each lane, and
+-- go on (`end_job` waits for it). `function` is the address of a `to f (arg u64,
+-- part u64, parts u64)` of the app. With no lanes it runs here, whole, at once.
+to start_job (d ptr h264state.decoder, function u64, arg u64)
+    if d.lane_count is 0
+        call(function, arg, 0, 1)
+        give
+    d.job_fn = function
+    d.job_arg = arg
+    dmb()
+    d.job_gen += 1
+    dmb()
+
+-- Wait until the lanes have done their parts of the last job.
+to end_job (d ptr h264state.decoder)
+    for each i in 0 until d.lane_count
+        new l = d.lane_recs[i] as ptr lanerec
+        while l.job_seen is not d.job_gen
+            dmb()
+    dmb()
+
+-- A lane's part of a new side job, if there is one (`lr`: its lanerec, 0 if none).
+to side (lr u64)
+    if lr is 0
+        give
+    new l = lr as ptr lanerec
+    new d = l.main
+    new g = d.job_gen
+    if l.job_seen is g
+        give
+    dmb()
+    call(d.job_fn, d.job_arg, l.index, d.lane_count)
+    dmb()
+    l.job_seen = g
+
+to call (function u64, arg u64, part u64, parts u64)
+    asm
+        "mov x0, {arg}"
+        "mov x1, {part}"
+        "mov x2, {parts}"
+        "blr {function}"
 
 -- ---------------------------------------------------------------- rebuilding
 
 -- Rows first, first + step ... of the picture, each rebuilt and the one above it
 -- deblocked (the last one deblocked too).
-to rows (d ptr h264state.decoder, w ptr h264state.decoder, first u64, step u64)
+-- `lr`: the lane's lanerec, or 0.
+to rows (d ptr h264state.decoder, w ptr h264state.decoder, first u64, step u64, lr u64)
     new h = w.s.mb_h as u64
     new y = first
     while y < h
-        row(d, w, y)
+        row(d, w, y, lr)
         if y >= 1
             while d.deblocked + 1 < y
+                side(lr)
                 dmb()
             dmb()
             h264deblock.row(w, y - 1)
@@ -171,17 +222,20 @@ to rows (d ptr h264state.decoder, w ptr h264state.decoder, first u64, step u64)
         y += step
 
 -- Rebuild macroblock row `y`, waiting for the parser and the row above.
-to row (d ptr h264state.decoder, w ptr h264state.decoder, y u64)
+to row (d ptr h264state.decoder, w ptr h264state.decoder, y u64, lr u64)
     new mw = w.s.mb_w as u64
     for each x in 0 until mw
         new a = y * mw + x
+        side(lr)
         while d.parsed <= a
+            side(lr)
             dmb()
         if y > 0
             new need = x + 2
             if need > mw
                 need = mw
             while d.rows_done[y - 1] < need
+                side(lr)
                 dmb()
         dmb()
         macroblock(w, a)

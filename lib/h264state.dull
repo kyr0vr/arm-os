@@ -206,6 +206,9 @@ shape decoder
     rows_cap   u64
     deblocked  u64                     -- rows deblocked
     quit       bool                    -- lanes: stop (h264par.stop_lanes)
+    job_fn     u64                     -- a side job for the lanes (h264par.run_job)
+    job_arg    u64
+    job_gen    u64
 
 to make gives ptr decoder
     new d = mem.alloc(size_of(decoder)) as ptr decoder

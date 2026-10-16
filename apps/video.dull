@@ -53,6 +53,11 @@ new dropped u64
 new skipped u64
 new decode_ms u64
 new convert_ms u64
+new present_ms u64                      -- putting pictures on the screen
+new converting bool                     -- the lanes are turning a picture into pixels
+new first_late i64                      -- how late the first picture was (ms; negative: early)
+new worst_late u64
+new sound_ms u64                        -- decoding and queueing sound
 new message line.line
 new name line.line
 new overlay_until u64
@@ -162,6 +167,8 @@ to load (path ptr line.line) gives bool
     skipped = 0
     decode_ms = 0
     convert_ms = 0
+    present_ms = 0
+    sound_ms = 0
     give true
 
 to fetch (t ptr mp4.track, i u64) gives ptr u8
@@ -256,6 +263,8 @@ new tb [256] i32
 new level [1024] u32
 new xmap ptr u32                        -- source column of each screen column
 new xmap_len u64
+new rowbufs [3] u64                     -- per conversion part: one source row in RGB
+new rowbuf_len u64
 
 to tables
     new kr i32 = 409
@@ -287,15 +296,37 @@ to tables
         xmap_len = dst_w as u64
     for each ox in 0 until dst_w as u64
         xmap[ox] = (ox * w / (dst_w as u64)) as u32
+    if w > rowbuf_len
+        for each k in 0 until 3
+            rowbufs[k] = mem.alloc(w * 4) as u64
+        rowbuf_len = w
 
--- YUV 4:2:0 -> RGB into the surface, scaled to the video rectangle.
+-- YUV 4:2:0 -> RGB into the surface, scaled to the video rectangle: by the decoder's
+-- lanes, while this core goes on (`converted` waits for them).
 to convert (pic ptr h264state.picture)
+    new f u64 = 0
+    asm
+        "adrp {f}, video.convert_part"
+        "add {f}, {f}, :lo12:video.convert_part"
+    h264par.start_job(vd, f, pic as u64)
+    converting = true
+
+to converted
+    if converting
+        h264par.end_job(vd)
+        converting = false
+
+-- Rows part * dst_h / parts .. (part + 1) * dst_h / parts of `convert`.
+to convert_part (arg u64, part u64, parts u64)
+    new pic = arg as ptr h264state.picture
     new h = h264.height(vd) as u64
     new w = h264.width(vd) as u64
     new cx = h264.crop_x(vd) as u64
     new cy = h264.crop_y(vd) as u64
     new lv = addr of level[0]
-    for each oy in 0 until dst_h as u64
+    new first = part * (dst_h as u64) / parts
+    new last_sy u64 = 0
+    for each oy in first until (part + 1) * (dst_h as u64) / parts
         new sy = oy * h / (dst_h as u64)
         new yrow = pic.y + (cy + sy) * pic.stride + cx
         new urow = pic.u + ((cy + sy) / 2) * pic.cstride + cx / 2
@@ -313,13 +344,27 @@ to convert (pic ptr h264state.picture)
                 new c1 = ty[yrow[p * 2 + 1] as u64]
                 out[p * 2] = (lv[((c0 + rv) >> 8) as u64] << 16) | (lv[((c0 + guv) >> 8) as u64] << 8) | lv[((c0 + bu) >> 8) as u64]
                 out[p * 2 + 1] = (lv[((c1 + rv) >> 8) as u64] << 16) | (lv[((c1 + guv) >> 8) as u64] << 8) | lv[((c1 + bu) >> 8) as u64]
-        else
+        else if oy > first and sy is last_sy
+            -- the same source row as the screen row above: copy it
+            new above = out - gfx.width as u64
             for each ox in 0 until dst_w as u64
-                new sx = xmap[ox] as u64
-                new u = urow[sx / 2] as u64
-                new v = vrow[sx / 2] as u64
-                new c = ty[yrow[sx] as u64]
-                out[ox] = (lv[((c + tr[v]) >> 8) as u64] << 16) | (lv[((c + tgu[u] + tgv[v]) >> 8) as u64] << 8) | lv[((c + tb[u]) >> 8) as u64]
+                out[ox] = above[ox]
+        else
+            -- each source pixel once, then stretched across the screen row
+            new rb = rowbufs[part] as ptr u32
+            for each p in 0 until w / 2
+                new u = urow[p] as u64
+                new v = vrow[p] as u64
+                new rv = tr[v]
+                new guv = tgu[u] + tgv[v]
+                new bu = tb[u]
+                new c0 = ty[yrow[p * 2] as u64]
+                new c1 = ty[yrow[p * 2 + 1] as u64]
+                rb[p * 2] = (lv[((c0 + rv) >> 8) as u64] << 16) | (lv[((c0 + guv) >> 8) as u64] << 8) | lv[((c0 + bu) >> 8) as u64]
+                rb[p * 2 + 1] = (lv[((c1 + rv) >> 8) as u64] << 16) | (lv[((c1 + guv) >> 8) as u64] << 8) | lv[((c1 + bu) >> 8) as u64]
+            for each ox in 0 until dst_w as u64
+                out[ox] = rb[xmap[ox] as u64]
+        last_sy = sy
 
 -- Is the slice NAL in this sample a non-reference one (safe to skip)?
 to droppable (data ptr u8, size u64) gives bool
@@ -345,7 +390,13 @@ to next_picture (late_ms u64, bench bool) gives bool
         new pic = h264.frame(vd, vnext >= vt.count)
         if pic as u64 is not 0
             new pts = pop_pending()
-            if not bench and pts + 40 < now_ms()
+            if not bench
+                new lateness = now_ms() as i64 - pts as i64
+                if decoded + skipped <= 1 + npending
+                    first_late = lateness
+                if lateness > 0 and lateness as u64 > worst_late
+                    worst_late = lateness as u64
+            if not bench and pts + 100 < now_ms()
                 dropped += 1
                 skip
             new t0 = sys.time()
@@ -359,32 +410,39 @@ to next_picture (late_ms u64, bench bool) gives bool
             last_pic = pic
             ready_ms = pts
             give true
-        if vnext >= vt.count
+        if not decode_one(late_ms, bench)
             give false
-        new i = vnext
-        vnext += 1
-        new data = fetch(vt, i)
-        if data as u64 is 0
-            skip
-        new size = vt.sizes[i] as u64
-        if not bench and late_ms > 100 and droppable(data, size)
-            skipped += 1
-            skip
-        push_pending(ms_of(vt, vt.times[i] + vt.shift[i] as u64))
-        new t0 = sys.time()
-        new ls = mp4.nal_length_size(vt)
-        new q u64 = 0
-        while q + ls <= size
-            new len u64 = 0
-            for each k in 0 until ls
-                len = (len << 8) | data[q + k] as u64
-            q += ls
-            if q + len > size
-                stop
-            h264.nal(vd, data + q, len)
-            q += len
-        decode_ms += sys.time() - t0
-        decoded += 1
+
+-- Decode the next video sample (or skip it when late and nothing needs it). False
+-- when there are no more.
+to decode_one (late_ms u64, bench bool) gives bool
+    if vnext >= vt.count
+        give false
+    new i = vnext
+    vnext += 1
+    new data = fetch(vt, i)
+    if data as u64 is 0
+        give true
+    new size = vt.sizes[i] as u64
+    if not bench and late_ms > 100 and droppable(data, size)
+        skipped += 1
+        give true
+    push_pending(ms_of(vt, vt.times[i] + vt.shift[i] as u64))
+    new t0 = sys.time()
+    new ls = mp4.nal_length_size(vt)
+    new q u64 = 0
+    while q + ls <= size
+        new len u64 = 0
+        for each k in 0 until ls
+            len = (len << 8) | data[q + k] as u64
+        q += ls
+        if q + len > size
+            stop
+        h264.nal(vd, data + q, len)
+        q += len
+    decode_ms += sys.time() - t0
+    decoded += 1
+    give true
 
 -- ---------------------------------------------------------------- the overlay
 
@@ -409,6 +467,7 @@ to length_ms gives u64
 fixed bar_h u32 = 120
 
 to draw_overlay
+    converted()                         -- the lanes may be writing the surface
     new y = gfx.height - bar_h
     gfx.fill(0, y, gfx.width, bar_h, ui.bg)
     new total = length_ms()
@@ -446,6 +505,7 @@ to hide_overlay
 
 -- Jump to the key frame at or before `target` ms.
 to seek (target u64)
+    converted()
     new best u64 = 0
     for each i in 0 until vt.count
         if vt.sync[i] is 1 and ms_of(vt, vt.times[i]) <= target
@@ -477,18 +537,35 @@ to report (label string)
     line.number(addr of l, dropped)
     line.add(addr of l, " late, ")
     line.number(addr of l, skipped)
-    line.add(addr of l, " skipped; ")
-    if decoded > 0
-        line.number(addr of l, decode_ms / decoded)
-        line.add(addr of l, " ms to decode and ")
-    if shown > 0
-        line.number(addr of l, convert_ms / shown)
-        line.add(addr of l, " ms to show a frame")
-    line.add(addr of l, "; sound ")
+    line.add(addr of l, " skipped; sound ")
     line.number(addr of l, audio_frames)
     line.add(addr of l, " frames from ")
     line.number(addr of l, anext)
     line.add(addr of l, " packets")
+    line.byte(addr of l, 10)
+    sys.write(line.text(addr of l), sys.muted)
+    -- where the time went, per frame
+    line.clear(addr of l)
+    line.add(addr of l, label)
+    line.add(addr of l, ": ms per frame: decode ")
+    if decoded > 0
+        line.number(addr of l, decode_ms / decoded)
+    if shown > 0
+        line.add(addr of l, ", convert ")
+        line.number(addr of l, convert_ms / shown)
+        line.add(addr of l, ", present ")
+        line.number(addr of l, present_ms / shown)
+    if decoded > 0
+        line.add(addr of l, ", sound ")
+        line.number(addr of l, sound_ms / decoded)
+    line.add(addr of l, "; first picture ")
+    if first_late < 0
+        line.byte(addr of l, '-')
+        line.number(addr of l, (0 - first_late) as u64)
+    else
+        line.number(addr of l, first_late as u64)
+    line.add(addr of l, " ms late, worst ")
+    line.number(addr of l, worst_late)
     line.byte(addr of l, 10)
     sys.write(line.text(addr of l), sys.muted)
 
@@ -506,11 +583,19 @@ to play (path ptr line.line)
     gfx.present_all()
     placed = false
     paused = false
+    -- the first picture before any sound, so the two start together
+    next_picture(0, false)
     wall_start = sys.time()
     overlay_until = sys.time() + 3000
     repeat
+        new a0 = sys.time()
         feed_audio()
-        new k = keys.within(2)
+        sound_ms += sys.time() - a0
+        -- a key, without waiting long while there is decoding to do
+        new wait_ms u64 = 2
+        if not ready or (npending < 4 and vnext < vt.count)
+            wait_ms = 0
+        new k = keys.within(wait_ms)
         if k is ' ' as u32 or k is keys.enter or k is keys.left_down
             paused = not paused
             if paused
@@ -549,12 +634,24 @@ to play (path ptr line.line)
                     ended = true
                     stop
                 skip
+        else if ready and npending < 4 and vnext < vt.count
+            -- while the next picture waits for its time, decode ahead (the
+            -- lanes are turning it into pixels meanwhile)
+            new per u64 = 20
+            if decoded > 0
+                per = decode_ms / decoded + 2
+            if ready_ms > now_ms() + per
+                decode_one(0, false)
         if ready and ready_ms <= now_ms()
             if sys.time() < overlay_until
                 draw_overlay()
+            new p0 = sys.time()
+            converted()
             gfx.present(dst_x, dst_y, dst_w, dst_h)
+            present_ms += sys.time() - p0
             shown += 1
             ready = false
+    converted()
     sys.audio_drop()
     sys.close(handle)
     report("video")
