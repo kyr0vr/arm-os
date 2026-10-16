@@ -1,34 +1,39 @@
 -- The CABAC arithmetic decoder of H.264 (9.3.1.2 and 9.3.3.2 of the standard).
+--
+-- The standard keeps a 9-bit offset and takes one bit of the stream into it at each
+-- step of renormalisation. Here the offset sits at the top of `cv` with `cs` bits of
+-- the stream already below it, so renormalising is only counting those off; two
+-- more bytes come in whenever fewer than 8 are left. Comparing cv with range << cs
+-- is comparing the offset with the range.
 
 use h264state
 use h264tables
 
-to bit (d ptr h264state.decoder) gives u32
-    new pos = d.bit >> 3
-    new v u32 = 0
-    if pos < d.size
-        new shift = (7 - (d.bit & 7)) as u32
-        v = ((d.data[pos] as u32) >> shift) & 1
-    d.bit += 1
-    give v
+new norm [256] u8                       -- how far a range below 256 shifts to reach 256
 
--- The next n (0-8) bits, zeros past the end of the data.
-to bits (d ptr h264state.decoder, n u32) gives u32
-    new pos = d.bit >> 3
-    new w u32 = 0
+-- Two more bytes of the slice data into cv (zeros past the end).
+to refill (d ptr h264state.decoder)
+    new pos = d.cp
+    new w u64 = 0
     if pos + 1 < d.size
-        w = ((d.data[pos] as u32) << 8) | d.data[pos + 1] as u32
+        w = ((d.data[pos] as u64) << 8) | d.data[pos + 1] as u64
     else if pos < d.size
-        w = (d.data[pos] as u32) << 8
-    w = (w << (d.bit & 7) as u32) & 0xFFFF
-    d.bit += n as u64
-    give w >> ((16 as u32) - n)
+        w = (d.data[pos] as u64) << 8
+    d.cv = (d.cv << 16) | w
+    d.cs += 16
+    d.cp = pos + 2
 
 -- Start decoding the slice data at bit `pos` (rounded up to a byte) of `data`.
 to start (d ptr h264state.decoder, data ptr u8, size u64, pos u64, init_type u64, slice_qp i32)
+    if norm[1] is 0
+        for each r in 1 until 256
+            new sh u8 = 0
+            while (r << sh as u64) < 256
+                sh += 1
+            norm[r] = sh
     d.data = data
     d.size = size
-    d.bit = (pos + 7) & 0xFFFF_FFFF_FFFF_FFF8
+    d.cp = (pos + 7) / 8
     new q = h264state.clip(slice_qp, 0, 51) as i64
     for each i in 0 until 460
         new m = h264tables.ctx_init[(i * 4 + init_type) * 2] as i64
@@ -45,18 +50,23 @@ to start (d ptr h264state.decoder, data ptr u8, size u64, pos u64, init_type u64
             d.state[i] = (pre - 64) as u8
             d.mps[i] = 1
     d.range = 510
-    d.offset = 0
-    for each k in 0 until 9
-        d.offset = (d.offset << 1) | bit(d)
+    -- the offset is the first 9 bits: of 16 taken in, 7 are left below it
+    d.cv = 0
+    d.cs = 0
+    refill(d)
+    d.cs = 7
 
 to decision (d ptr h264state.decoder, ctx u64) gives u32
     new s = d.state[ctx] as u64
     new lps = h264tables.range_lps[s * 4 + ((d.range >> 6) & 3) as u64] as u32
     d.range -= lps
+    if d.cs < 8
+        refill(d)
+    new scaled = (d.range as u64) << d.cs as u64
     new b u32 = 0
-    if d.offset >= d.range
+    if d.cv >= scaled
         b = 1 - d.mps[ctx] as u32
-        d.offset -= d.range
+        d.cv -= scaled
         d.range = lps
         if s is 0
             d.mps[ctx] = 1 - d.mps[ctx]
@@ -65,27 +75,29 @@ to decision (d ptr h264state.decoder, ctx u64) gives u32
         b = d.mps[ctx] as u32
         d.state[ctx] = h264tables.next_state[s * 2 + 1]
     if d.range < 256
-        new r = d.range
-        new sh u32 = 0
-        while r < 256
-            r = r << 1
-            sh += 1
-        d.range = r
-        d.offset = (d.offset << sh) | bits(d, sh)
+        new sh = norm[d.range as u64]
+        d.range = d.range << sh as u32
+        d.cs -= sh as u32
     give b
 
 to bypass (d ptr h264state.decoder) gives u32
-    d.offset = (d.offset << 1) | bit(d)
-    if d.offset >= d.range
-        d.offset -= d.range
+    if d.cs < 8
+        refill(d)
+    d.cs -= 1
+    new scaled = (d.range as u64) << d.cs as u64
+    if d.cv >= scaled
+        d.cv -= scaled
         give 1
     give 0
 
 to terminate (d ptr h264state.decoder) gives u32
     d.range -= 2
-    if d.offset >= d.range
+    if d.cs < 8
+        refill(d)
+    if d.cv >= (d.range as u64) << d.cs as u64
         give 1
-    while d.range < 256
-        d.range = d.range << 1
-        d.offset = (d.offset << 1) | bit(d)
+    if d.range < 256
+        new sh = norm[d.range as u64]
+        d.range = d.range << sh as u32
+        d.cs -= sh as u32
     give 0

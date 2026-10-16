@@ -30,6 +30,7 @@ new file_buf ptr u8
 new file_cap u64
 new file_len u64
 new have u64
+new read_ms u64                         -- time spent reading the card
 new movie ptr mp4.movie
 new vt ptr mp4.track
 new at_track ptr mp4.track
@@ -87,8 +88,10 @@ to read_ahead gives bool
     new n = file_len - have
     if n > piece
         n = piece
+    new t0 = sys.time()
     if not read_at(have, file_buf + have, n)
         give false
+    read_ms += sys.time() - t0
     have += n
     give true
 
@@ -732,6 +735,11 @@ to report (label string)
         line.number(addr of l, first_late as u64)
     line.add(addr of l, " ms late, worst ")
     line.number(addr of l, worst_late)
+    line.add(addr of l, "; card ")
+    line.number(addr of l, have / 1024)
+    line.add(addr of l, " KB in ")
+    line.number(addr of l, read_ms)
+    line.add(addr of l, " ms")
     line.byte(addr of l, 10)
     sys.write(line.text(addr of l), sys.muted)
 

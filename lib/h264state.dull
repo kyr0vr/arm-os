@@ -169,10 +169,11 @@ shape decoder
     state      [460] u8
     mps        [460] u8
     range      u32
-    offset     u32
+    cv         u64                     -- the 9-bit offset, with `cs` more bits below it
+    cs         u32
+    cp         u64                     -- the next byte to take into cv
     data       ptr u8
     size       u64
-    bit        u64
     -- the current macroblock
     mba       u64
     mbx        u64                     -- in samples

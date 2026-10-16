@@ -838,14 +838,21 @@ to start_mb (d ptr h264state.decoder, a u64)
     m.nzc[0] = 0
     m.nzc[1] = 0
     m.direct = 0
+    -- 8 bytes at a time: modes all 2, refs all -1, the rest 0
+    new modes = (addr of m.modes[0]) as ptr u64
+    modes[0] = 0x0202_0202_0202_0202
+    modes[1] = 0x0202_0202_0202_0202
+    new refs = (addr of m.ref[0]) as ptr u64
+    refs[0] = 0xFFFF_FFFF_FFFF_FFFF
+    new pics = (addr of m.refpic[0]) as ptr u64
+    for each k in 0 until 4
+        pics[k] = 0
+    new mvs = (addr of m.mv[0]) as ptr u64
     for each k in 0 until 16
-        m.modes[k] = 2
+        mvs[k] = 0
+    new mvds = (addr of m.mvd[0]) as ptr u64
     for each k in 0 until 8
-        m.ref[k] = -1
-        m.refpic[k] = 0
-    for each k in 0 until 64
-        m.mv[k] = 0
-        m.mvd[k] = 0
+        mvds[k] = 0
     h264par.point(d, a)
 
 to set_qp (d ptr h264state.decoder, m ptr h264state.mbinfo)
