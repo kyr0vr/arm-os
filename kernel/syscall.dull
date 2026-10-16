@@ -51,6 +51,7 @@ fixed call_close u64 = 31
 fixed call_file_size u64 = 32
 fixed call_profile u64 = 33
 fixed call_helper u64 = 34
+fixed call_direct u64 = 36
 
 -- Open files: a FAT entry and where it was last read, owned by a process.
 shape opened
@@ -206,6 +207,8 @@ to answer (n u64, a u64, b u64, c u64, d u64, e u64) gives u64
         if a >= max_handles or not handles[a].used or handles[a].owner is not proc.me().pid
             give bad
         give handles[a].entry.size as u64
+    if n is call_direct
+        give gui.direct(a)
     if n is call_helper
         give helper.start(proc.me().pid, proc.me().l1, a, b, c)
     if n is call_profile

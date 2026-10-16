@@ -70,6 +70,7 @@ shape process
     surface    u64                     -- physical address of its screen surface, 0 if none
     pointer    bool                    -- wants pointer events with its keys
     rank       u64                     -- foreground order: the highest live one is in front
+    direct     bool                    -- it draws straight onto the screen (kernel/gui.dull)
     name       line.line
     args       line.line
 
@@ -114,6 +115,11 @@ to user_page_entry (pa u64) gives u64
     -- never executed by the kernel
     give pa | 3 | (mmu.normal << 2) | (1 << 6) | (3 << 8) | (1 << 10) | (1 << 11) | (1 << 53)
 
+-- The same for memory the process uses but does not own (the screen): not cached,
+-- never run, and left alone when the process ends (software bit 55).
+to borrowed_page_entry (pa u64) gives u64
+    give pa | 3 | (mmu.no_cache << 2) | (1 << 6) | (3 << 8) | (1 << 10) | (1 << 11) | (1 << 53) | (1 << 54) | (1 << 55)
+
 to new_space (p ptr process) gives bool
     new t1 = pages.alloc() else give false
     new t2 = pages.alloc() else give false
@@ -139,6 +145,17 @@ to add_page (p ptr process, va u64) gives u64
     l3[(va >> 12) & 511] = user_page_entry(page as u64)
     p.user_pages += 1
     give page as u64
+
+-- Put page table entry `entry` at `va` (no new page; a table if needed).
+to set_entry (p ptr process, va u64, entry u64) gives bool
+    new l2 = p.l2 as ptr u64
+    new i2 = (va >> 21) & 511
+    if l2[i2] is 0
+        new t = pages.alloc() else give false
+        l2[i2] = (t as u64) | table_bits
+    new l3 = (l2[i2] & address_mask) as ptr u64
+    l3[(va >> 12) & 511] = entry
+    give true
 
 -- Map the existing physical page `pa` at `va` (it is freed with the process).
 to map_page (p ptr process, va u64, pa u64) gives bool
@@ -178,7 +195,7 @@ to free_space (p ptr process)
         if l2[i2] is not 0
             new l3 = (l2[i2] & address_mask) as ptr u64
             for each i3 in 0 until 512
-                if l3[i3] is not 0
+                if l3[i3] is not 0 and (l3[i3] >> 55) & 1 is 0
                     pages.free((l3[i3] & address_mask) as ptr u8)
             pages.free(l3 as ptr u8)
     pages.free(p.l2 as ptr u8)

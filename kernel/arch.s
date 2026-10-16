@@ -300,6 +300,16 @@ arch_tlb_flush:
     isb
     ret
 
+// arch_tlb_flush_all(): forget all cached translations on every core (after editing
+// the page tables of a process whose helpers run elsewhere).
+.global arch_tlb_flush_all
+arch_tlb_flush_all:
+    dsb     ishst
+    tlbi    vmalle1is
+    dsb     ish
+    isb
+    ret
+
 // arch_switch_space(ttbr0): use another set of page tables (a process's).
 .global arch_switch_space
 arch_switch_space:

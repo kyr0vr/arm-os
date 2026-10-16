@@ -264,6 +264,24 @@ to text_centered (cx u32, y u32, s string, style u8, color u32)
 
 -- ---------------------------------------------------------------- the screen
 
+-- Draw straight onto the screen (on) instead of the surface, or stop: `pixels`
+-- moves there and back. False if the kernel would not (then nothing changes).
+new surface_pixels ptr u32
+
+to direct (wanted bool) gives bool
+    if wanted
+        new va = sys.call(36, 1, 0, 0, 0, 0)
+        if va is 0
+            give false
+        if surface_pixels as u64 is 0
+            surface_pixels = pixels
+        pixels = va as ptr u32
+        give true
+    sys.call(36, 0, 0, 0, 0, 0)
+    if surface_pixels as u64 is not 0
+        pixels = surface_pixels
+    give true
+
 to present (x u32, y u32, w u32, h u32)
     new a = (x as u64) | ((y as u64) << 32)
     new b = (w as u64) | ((h as u64) << 32)

@@ -80,6 +80,7 @@ the app's memory ends (with `.bss`) and its entry point. Apps are linked at
 | 30 | read_open(handle, buffer, count) | 31 | close(handle) |
 | 32 | file_size(handle) | 33 | profile(1 start, 2 stop and print) |
 | 34 | helper(entry, arg, stack) - a core number, 0 if none | 35 | helper_done() - helper cores only |
+| 36 | direct(on) - draw straight onto the screen (front app only): its address, or 0 | | |
 
 Helper cores (`rt/app/helpers.dull`) run a function of the app on core 1 or 2, in the
 app's memory, until it returns or the app ends. They cannot make other calls; they

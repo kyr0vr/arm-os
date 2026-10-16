@@ -42,6 +42,7 @@ new x i64
 new y i64
 new visible bool               -- after the first mouse movement
 new buttons u8
+new suspended bool             -- an app draws straight onto the screen: no pointer
 
 to start (s ptr fb.screen)
     screen = s
@@ -62,7 +63,7 @@ to put (px i64, py i64, color u32)
     screen.base[(py as u64) * (screen.pitch as u64) / 4 + (px as u64)] = v
 
 to draw
-    if not visible or screen as u64 is 0
+    if not visible or screen as u64 is 0 or suspended
         give
     for each row in 0 until shape_h as u64
         new line = arrow[row]
@@ -74,7 +75,7 @@ to draw
                 put(x + col as i64, y + row as i64, fill_color)
 
 to erase
-    if not visible or source as u64 is 0 or x >= screen.width as i64 or y >= screen.height as i64
+    if not visible or suspended or source as u64 is 0 or x >= screen.width as i64 or y >= screen.height as i64
         give
     text.present(source, screen, x as u32, y as u32, shape_w, shape_h)
 

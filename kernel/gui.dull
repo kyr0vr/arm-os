@@ -15,6 +15,9 @@ use pages
 use cursor
 
 fixed surface_va u64 = 0x40_3000_0000  -- where an app sees its surface
+fixed direct_va u64 = 0x40_3800_0000   -- where it sees the screen itself (`direct`)
+
+elsewhere to arch_tlb_flush_all
 
 new shown u64                          -- physical address of the surface on screen (0: the console)
 new fresh u64                          -- a new surface: its app will present it itself
@@ -47,6 +50,11 @@ to show_front
     if not tty.has_screen
         give
     new i = front()
+    -- an app that drew straight onto the screen and is no longer in front goes back to
+    -- its surface
+    for each k in 1 until proc.slots
+        if proc.table[k].direct and k is not i
+            undirect(k)
     new want u64 = 0
     if i is not 0
         want = proc.table[i].surface
@@ -67,6 +75,54 @@ to show_front
         else
             console.start(tty.canvas, tty.screen)
         cursor.show_over(tty.canvas)
+
+-- Let the calling app draw straight onto the screen (on), or stop (off). Only the app
+-- in front, with a surface, on a screen laid out like it (32-bit, no gaps between
+-- rows). Gives where the screen is mapped (the same size as the surface), or 0.
+-- While an app is in front and drawing directly, `present` has nothing to copy and
+-- the pointer is not drawn.
+to direct (wanted u64) gives u64
+    new slot = proc.current
+    new p = proc.me()
+    if wanted is 0
+        if p.direct
+            undirect(slot)
+        give 0
+    if p.direct
+        give direct_va
+    if not tty.has_screen or p.surface is 0 or front() is not slot or tty.screen.order is not 0
+        give 0
+    if tty.screen.pitch is not tty.screen.width * 4
+        give 0
+    new bytes = (tty.screen.width as u64) * (tty.screen.height as u64) * 4
+    new base = tty.screen.base as u64
+    for each k in 0 until (bytes + 4095) / 4096
+        if not proc.set_entry(p, direct_va + k * 4096, proc.borrowed_page_entry(base + k * 4096))
+            give 0
+    arch_tlb_flush_all()
+    p.direct = true
+    cursor.suspended = true
+    give direct_va
+
+-- Point slot `k`'s screen mapping at its own surface again (its drawing lands there)
+-- and show what is in front.
+to undirect (k u64)
+    new p = addr of proc.table[k]
+    if p.l2 is 0                             -- it has ended: nothing mapped any more
+        p.direct = false
+        cursor.suspended = false
+        shown = 0xFFFF_FFFF_FFFF_FFFF
+        proc.front_changed = true
+        give
+    new bytes = (tty.screen.width as u64) * (tty.screen.height as u64) * 4
+    for each n in 0 until (bytes + 4095) / 4096
+        new pa = p.surface + n * 4096
+        proc.set_entry(p, direct_va + n * 4096, proc.user_page_entry(pa) | (1 << 55))
+    arch_tlb_flush_all()
+    p.direct = false
+    cursor.suspended = false
+    shown = 0xFFFF_FFFF_FFFF_FFFF            -- repaint whatever is in front
+    proc.front_changed = true
 
 -- The calling app's surface: writes its width and height to `size`, gives the
 -- address it is mapped at (0 if there is no screen or no memory).
@@ -113,7 +169,7 @@ to draw_text (xy u64, bytes ptr u8, count u64, color u32, style u8) gives u32
 -- a = x | y << 32, b = width | height << 32.
 to present (a u64, b u64)
     new p = proc.me()
-    if p.surface is 0 or p.surface is not shown
+    if p.surface is 0 or p.surface is not shown or p.direct
         give
     new c text.canvas
     canvas_of(p.surface, addr of c)

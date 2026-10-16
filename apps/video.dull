@@ -785,6 +785,9 @@ to play (path ptr line.line)
         give
     gfx.fill(0, 0, gfx.width, gfx.height, 0)
     gfx.present_all()
+    -- straight onto the screen if the kernel lets us: no copy for each picture
+    gfx.direct(true)
+    gfx.fill(0, 0, gfx.width, gfx.height, 0)
     placed = false
     paused = false
     -- the first picture before any sound, so the two start together
@@ -864,6 +867,7 @@ to play (path ptr line.line)
             shown += 1
             ready = false
     converted()
+    gfx.direct(false)
     sys.audio_drop()
     sys.close(handle)
     report("video")
